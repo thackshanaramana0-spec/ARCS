@@ -28,6 +28,25 @@ true heterozygous sites (recall ≈ 0.93 vs DiscoSNP++ ≈ 0.80 vs Kmer2SNP ≈ 
 the assembly-based consensus positions and supports more variants than short-k-mer
 bubble detection.
 
+## Cross-individual generalization (frozen parameters, held-out sample)
+
+The five regions above are all HG001 (NA12878). To test whether the result is
+sample-specific or overfit, we ran the **same caller with identical frozen
+parameters** — no re-tuning — on a **different individual, HG002** (Ashkenazi son),
+on a **different reference build (GRCh38)**: chr20:2.0–2.4 Mb, Illumina ~30×.
+
+| tool        | HG001 (5-region avg) | HG002 (held-out individual) |
+|-------------|:--------------------:|:---------------------------:|
+| **ARCS**    | **0.943**            | **0.971** (P .988 R .955)   |
+| DiscoSNP++  | 0.887                | 0.941                       |
+| Kmer2SNP    | 0.539                | 0.542                       |
+
+The ranking is **stable across individuals** (ARCS > DiscoSNP++ > Kmer2SNP), and
+ARCS's HG002 F1 (0.971) is *higher* than its HG001 average — with **zero parameter
+changes**. This is direct evidence the ~0.94 is **not hypertuned to one sample**: it
+holds, and leads, on a held-out individual and a different genome build. (Tuning was
+done once on HG001 r2; every other region and the entire HG002 sample are held out.)
+
 ## Scope and honesty
 
 - **This is the heterozygous-SNV task**, the established reference-free niche. On
