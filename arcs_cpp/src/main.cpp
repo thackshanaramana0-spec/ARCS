@@ -2,10 +2,21 @@
 #include "encoder.h"
 #include "decoder.h"
 #include "akc.h"
+#include "chain_encoder.h"
+#include "caller.h"
+#include "fastq_io.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <chrono>
+
+#ifdef _WIN32
+  #define SET_ENV(k, v) _putenv_s((k), (v))
+#else
+  #define SET_ENV(k, v) setenv((k), (v), 1)
+#endif
 
 static void print_usage(const char* prog) {
     fprintf(stderr,
@@ -16,7 +27,8 @@ static void print_usage(const char* prog) {
         "  %s decompress <input.arcs>       <output.fastq>\n"
         "  %s compress_pe <r1.fastq[.gz]> <r2.fastq[.gz]> <output.arcs>\n"
         "  %s info        <input.arcs>\n"
-        "  %s akc         <input.fastq[.gz]>   (show AKC score only)\n\n"
+        "  %s akc         <input.fastq[.gz]>   (show AKC score only)\n"
+        "  %s call        <reads.fastq[.gz]> <out.vcf>   (reference-free SNV calling)\n\n"
         "Options (set before subcommand):\n"
         "  --k <int>        k-mer size (default: auto)\n"
         "  --w <int>        minimizer window (default: 10)\n"
@@ -31,7 +43,7 @@ static void print_usage(const char* prog) {
         "  --chunk-size N   chunked MST mode: compress N reads at a time\n"
         "                   (reduces peak RAM from O(n*L) to O(N*L); default: off)\n"
         "                   recommended: --chunk-size 5000000 for whole-genome files\n",
-        prog, prog, prog, prog, prog
+        prog, prog, prog, prog, prog, prog
     );
 }
 
@@ -166,6 +178,26 @@ int main(int argc, char** argv) {
                names[(int)result.regime],
                result.use_bsc ? "yes" : "no");
         return 0;
+
+    } else if (cmd == "call") {
+        // Reference-free SNV calling: assemble reads → build pileup from ARCS's own
+        // placements → internal k-mer filter → VCF (contig coords). No external
+        // aligner, no external k-mer tool.
+        if (i + 1 >= argc) { fprintf(stderr, "call: need <reads.fastq[.gz]> <out.vcf>\n"); return 1; }
+        std::string reads_path = argv[i++];
+        std::string vcf_path   = argv[i++];
+        // Assembly config that yields the validated calling consensus (matches the
+        // reference pipeline) unless the user overrode it via the environment.
+        if (!getenv("ARCS_MERGE_CONTIGS")) SET_ENV("ARCS_MERGE_CONTIGS", "1");
+        if (!getenv("ARCS_DEDUP_MAXMM"))   SET_ENV("ARCS_DEDUP_MAXMM", "20");
+        if (!getenv("ARCS_DEDUP_OVERR"))   SET_ENV("ARCS_DEDUP_OVERR", "0.40");
+        std::vector<Read> reads;
+        { FASTQReader rdr(reads_path); Read r; while (rdr.next(r)) reads.push_back(std::move(r)); }
+        fprintf(stderr, "[CALL] loaded %zu reads; assembling...\n", reads.size());
+        CallData cd;
+        (void)build_multicontig_pg(reads, &cd);
+        int nc = run_variant_call(reads, cd, vcf_path);
+        return nc < 0 ? 1 : 0;
 
     } else {
         fprintf(stderr, "Unknown command: %s\n", cmd.c_str());

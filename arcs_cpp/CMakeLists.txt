@@ -66,6 +66,7 @@ set(ARCS_SOURCES
     src/qual_cm.cpp
     src/encoder.cpp
     src/decoder.cpp
+    src/caller.cpp
 )
 
 # ── Main binary ───────────────────────────────────────────────────────────────

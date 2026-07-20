@@ -985,7 +985,7 @@ struct FlatPlaceIndex {
 // ── Multi-contig greedy assembler ────────────────────────────────────────────
 // See chain_encoder.h. Two phases: (1) place every read into an independently
 // growing contig; (2) concatenate contigs into the pg and emit per-read streams.
-ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads) {
+ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData* call_out) {
     ChainEncodeResult r;
     const int n = (int)reads.size();
     const int L = reads.empty() ? 0 : (int)reads[0].seq.size();
@@ -1582,6 +1582,22 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads) {
             fclose(cf);
             fprintf(stderr, "[CONTIGS-DUMP] wrote %zu contigs to %s\n", contigs.size(), cp);
         }
+    }
+
+    // ── Expose placements for in-process reference-free calling (arcs call) ──────
+    // Same (post-merge) data ARCS_PILEUP_SAM emits, handed to the C++ caller so it
+    // needs no external aligner. Indexed by original read index.
+    if (call_out) {
+        call_out->contigs = contigs;
+        call_out->read_cid.assign((size_t)n, 0);
+        call_out->read_pos.assign((size_t)n, 0);
+        call_out->read_rc.assign((size_t)n, 0);
+        for (int oi = 0; oi < n; ++oi) {
+            call_out->read_cid[(size_t)oi] = pl_cid[oi];
+            call_out->read_pos[(size_t)oi] = pl_pos[oi];
+            call_out->read_rc[(size_t)oi]  = pl_rc[oi];
+        }
+        call_out->valid = true;
     }
 
     // ── Self-contained pileup SAM: read→consensus alignments from the placements ──

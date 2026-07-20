@@ -106,7 +106,20 @@ ChainEncodeResult build_dedup_pg(const std::vector<Read>& reads);
 // approximate-mapping pipeline in the reference; produces the same
 // ChainEncodeResult pg_* fields, so serialization/quality/decoder are unchanged.
 // Lossless by the same RC-involutive argument as build_dedup_pg.
-ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads);
+// Reference-free variant calling needs the read→consensus placement the assembler
+// already computes (contig id + position + strand per read). When a CallData* is
+// passed, build_multicontig_pg fills it with the final (post-merge) contigs and
+// per-original-read placement — the same data ARCS_PILEUP_SAM emits — so the
+// caller can build its pileup with no external aligner. Off (nullptr) by default.
+struct CallData {
+    std::vector<std::string> contigs;   // consensus contigs (post-merge)
+    std::vector<uint32_t>    read_cid;  // [orig read idx] → contig id
+    std::vector<uint32_t>    read_pos;  // [orig read idx] → start position in contig (contig frame)
+    std::vector<uint8_t>     read_rc;   // [orig read idx] → reverse-complement flag
+    bool valid = false;
+};
+ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads,
+                                       CallData* call_out = nullptr);
 
 // ── Chain decoder ─────────────────────────────────────────────────────────────
 class ChainSequenceDecoder {
