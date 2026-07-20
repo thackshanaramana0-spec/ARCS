@@ -11,6 +11,26 @@ aligner or k-mer tool (`arcs call reads.fq out.vcf`). DiscoSNP++ and Kmer2SNP ar
 dedicated reference-free callers, each given its best reasonable configuration
 (DiscoSNP++ default `-c 3`; Kmer2SNP coverage band chosen by sweep).
 
+### What each competitor was designed for (scope of a fair comparison)
+
+- **Kmer2SNP** (Yang et al., 2020) is by design a **reference-free heterozygous-SNP
+  caller for diploid organisms** — its method keys on heterozygous k-mers whose
+  frequency is ~half the homozygous peak (one of two haplotypes). So the
+  heterozygous-SNV task below is *exactly* its intended use case: an apples-to-apples
+  comparison, not a task it was never meant for.
+- **DiscoSNP++** (Peterlongo et al., 2017) is **broader than ARCS**: it calls SNPs
+  **and small indels**, works at **any ploidy** (its bubble detection is free of
+  similarity/ploidy parameters), and has a RAD-seq population-genomics variant
+  (DiscoSnp-RAD). It was validated on **diploid human** data (chr1, 1000 Genomes),
+  matching our setup. On the heterozygous-SNV slice measured here the comparison is
+  fair, but note DiscoSNP++ *additionally* does indels and homozygous/polyploid
+  variants that ARCS does not — it is a more general tool that ARCS leads only on
+  this specific (large and important) slice.
+
+**ARCS's own scope** is the same as Kmer2SNP's: reference-free **heterozygous SNVs
+in diploid** data (the variant type that forms a bubble in a self-assembled diploid
+consensus). We do not claim indels, homozygous variants, or polyploidy.
+
 ## Heterozygous-SNV F1 (rtg vcfeval)
 
 | region            | ARCS  | DiscoSNP++ | Kmer2SNP |
