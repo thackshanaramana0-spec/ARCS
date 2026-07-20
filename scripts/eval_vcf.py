@@ -47,7 +47,9 @@ for line in open(VCF):
     gg=c2g(rn,cp)
     if gg is not None: g.add(gg)
 gc=set(p for p in g if inc(p));hc=set(p for p in th if inc(p))
-def near(p,S):return any((p+d) in S for d in range(-3,4))
+import os
+W=int(os.environ.get("EVAL_WIN","3"))
+def near(p,S):return any((p+d) in S for d in range(-W,W+1))
 tp=sum(1 for p in hc if near(p,gc));good=sum(1 for p in gc if near(p,tv))
 P=good/max(len(gc),1);R=tp/max(len(hc),1);F=2*P*R/max(P+R,1e-9)
 print(f"ARCS-call(cpp) het={len(hc)} calls={len(gc)} TP={tp} | P={P:.3f} R={R:.3f} F1={F:.3f}")

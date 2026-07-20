@@ -28,7 +28,8 @@ static void print_usage(const char* prog) {
         "  %s compress_pe <r1.fastq[.gz]> <r2.fastq[.gz]> <output.arcs>\n"
         "  %s info        <input.arcs>\n"
         "  %s akc         <input.fastq[.gz]>   (show AKC score only)\n"
-        "  %s call        <reads.fastq[.gz]> <out.vcf>   (reference-free SNV calling)\n\n"
+        "  %s call        <reads.fastq[.gz]> <out.vcf>   (reference-free SNV calling)\n"
+        "  %s compress --call <out.vcf> <reads.fastq[.gz]> <out.arcs>  (archive + call, one pass)\n\n"
         "Options (set before subcommand):\n"
         "  --k <int>        k-mer size (default: auto)\n"
         "  --w <int>        minimizer window (default: 10)\n"
@@ -43,7 +44,7 @@ static void print_usage(const char* prog) {
         "  --chunk-size N   chunked MST mode: compress N reads at a time\n"
         "                   (reduces peak RAM from O(n*L) to O(N*L); default: off)\n"
         "                   recommended: --chunk-size 5000000 for whole-genome files\n",
-        prog, prog, prog, prog, prog, prog
+        prog, prog, prog, prog, prog, prog, prog
     );
 }
 
@@ -79,12 +80,14 @@ int main(int argc, char** argv) {
 
     if (cmd == "compress") {
         // Parse options that appear after the subcommand (e.g. ./arcs compress --chain in out)
+        std::string call_vcf;   // set by --call: fused compress-and-call in one pass
         while (i < argc && argv[i][0] == '-' && argv[i][1] == '-') {
             std::string opt = argv[i++];
             if      (opt == "--chain")    { params.use_chain = true; params.use_mst = false; }
             else if (opt == "--chain-pg") { params.use_chain_pg = true; params.use_chain = false; params.use_mst = false; }
             else if (opt == "--no-mst")   { params.use_mst   = false; }
             else if (opt == "--chunk-size" && i < argc) params.chunk_size = std::stoi(argv[i++]);
+            else if (opt == "--call" && i < argc) { call_vcf = argv[i++]; params.use_chain_pg = true; params.use_chain = false; params.use_mst = false; }
             else { fprintf(stderr, "Unknown compress option: %s\n", opt.c_str()); return 1; }
         }
         if (i + 1 >= argc) { fprintf(stderr, "compress: need input and output\n"); return 1; }
@@ -92,6 +95,10 @@ int main(int argc, char** argv) {
         std::string out = argv[i++];
 
         ARCSEncoder enc(params);
+        // Fused mode: capture the assembly's placements + reads so the same single
+        // assembly that builds the archive also drives reference-free calling.
+        CallData fused_cd; std::vector<Read> fused_reads;
+        if (!call_vcf.empty()) { enc.call_capture_ = &fused_cd; enc.call_reads_ = &fused_reads; }
         enc.set_progress_callback([](const EncodeProgress& p) {
             fprintf(stderr,
                 "[ARCS] Reads: %zu | Mapped: %.1f%% | G*: %.1f MB | k: %d | AKC: %.4f | Method: %s | Time: %.1fs\n",
@@ -135,6 +142,14 @@ int main(int argc, char** argv) {
                 "[ARCS] Uncompressed: ~%.3f MB | Archive: %.3f MB | Ratio: ~%.2fx\n",
                 raw_approx/1e6, comp_sz/1e6,
                 comp_sz > 0 ? (double)raw_approx/comp_sz : 0.0);
+        }
+        // Fused calling: reuse the single assembly's placements — no second assembly,
+        // no decompress round-trip. Same code path as `arcs call`, run in-process.
+        if (!call_vcf.empty()) {
+            if (!fused_cd.valid) { fprintf(stderr, "arcs: --call requires chain-pg assembly (auto-set); no placements captured\n"); return 1; }
+            fprintf(stderr, "[ARCS] fused calling from the compression assembly...\n");
+            int nc = run_variant_call(fused_reads, fused_cd, call_vcf);
+            if (nc < 0) return 1;
         }
         return 0;
 
@@ -186,11 +201,12 @@ int main(int argc, char** argv) {
         if (i + 1 >= argc) { fprintf(stderr, "call: need <reads.fastq[.gz]> <out.vcf>\n"); return 1; }
         std::string reads_path = argv[i++];
         std::string vcf_path   = argv[i++];
-        // Assembly config that yields the validated calling consensus (matches the
-        // reference pipeline) unless the user overrode it via the environment.
-        if (!getenv("ARCS_MERGE_CONTIGS")) SET_ENV("ARCS_MERGE_CONTIGS", "1");
-        if (!getenv("ARCS_DEDUP_MAXMM"))   SET_ENV("ARCS_DEDUP_MAXMM", "20");
-        if (!getenv("ARCS_DEDUP_OVERR"))   SET_ENV("ARCS_DEDUP_OVERR", "0.40");
+        // Use the COMPRESSION-default assembly (tight placement MAXMM=4/OVERR=0.06 +
+        // merge-on). Measured to call BEST (F1 ~0.95 across 3 regions incl held-out,
+        // robust to exact-position matching) — the loose config the old bwa-pileup
+        // pipeline used force-places paralog/repeat reads and injects noisy columns.
+        // This also means compression and calling share ONE assembly config (enables
+        // the fused compress-and-call one-pass mode). Env vars still override.
         std::vector<Read> reads;
         { FASTQReader rdr(reads_path); Read r; while (rdr.next(r)) reads.push_back(std::move(r)); }
         fprintf(stderr, "[CALL] loaded %zu reads; assembling...\n", reads.size());

@@ -40,6 +40,14 @@ public:
     // Set progress callback (optional)
     void set_progress_callback(ProgressCallback cb) { progress_cb_ = cb; }
 
+    // Fused compress-and-call: when set (chain-pg mode), the assembler's read→
+    // consensus placements are captured here so a single assembly pass serves BOTH
+    // the archive and reference-free variant calling — no second assembly, no
+    // decompress round-trip. The reads are also captured (calling needs them).
+    // Filled during compress(); consumed by the caller afterwards.
+    struct CallData* call_capture_ = nullptr;
+    std::vector<Read>* call_reads_ = nullptr;
+
     // Compress single-end FASTQ
     EncodeProgress compress(const std::string& input_path,
                             const std::string& output_path);

@@ -1423,7 +1423,7 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
     } else if (getenv("ARCS_CHAINPG_DEDUP")) {
         result = build_dedup_pg(reads);
     } else {
-        result = build_multicontig_pg(reads);
+        result = build_multicontig_pg(reads, call_capture_);
     }
     ARCS_CHECK(result.has_pg, "chain-pg: pg not built");
 
@@ -1960,7 +1960,10 @@ EncodeProgress ARCSEncoder::compress(const std::string& input_path,
     // and HURTS ratio, so we only auto-enable it above a size threshold, with a large
     // chunk (250k reads) that preserves ratio. Never overrides an explicit
     // --chunk-size; disable with ARCS_NO_AUTOCHUNK. Only for the chain-pg path.
-    if (params_.chunk_size == 0 && params_.use_chain_pg && !getenv("ARCS_NO_AUTOCHUNK")) {
+    // Fused calling needs a single whole-input assembly (chunking would only capture
+    // one chunk's placements), so autochunk is suppressed when call_capture_ is set.
+    if (params_.chunk_size == 0 && params_.use_chain_pg && !getenv("ARCS_NO_AUTOCHUNK")
+        && call_capture_ == nullptr) {
         FILE* fsz = fopen(input_path.c_str(), "rb");
         if (fsz) {
             fseek(fsz, 0, SEEK_END); long long bytes = ftello(fsz); fclose(fsz);
@@ -1995,6 +1998,11 @@ EncodeProgress ARCSEncoder::compress(const std::string& input_path,
     if (TOP_TIMING) { auto t=std::chrono::steady_clock::now(); fprintf(stderr,"[ENC] load_reads: %.2fs\n", std::chrono::duration<double>(t-_tt).count()); _tt=t; }
     prog.total_reads = reads.size();
     ARCS_CHECK(!reads.empty(), "No reads in input file");
+
+    // Fused compress-and-call: hand the loaded reads to the caller (it needs the
+    // original sequences+quality for the pileup). Placements are captured during
+    // the chain-pg assembly below via call_capture_.
+    if (call_reads_) *call_reads_ = reads;
 
     // 1b. Lossy quality binning (if requested via --lossy / --lossy8 / --lossy2)
     // Applied before any quality encoding so all paths (MST rANS, LZMA, amplicon)
