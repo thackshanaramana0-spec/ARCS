@@ -1584,6 +1584,51 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads) {
         }
     }
 
+    // ── Self-contained pileup SAM: read→consensus alignments from the placements ──
+    // ARCS already computes each read's placement (contig, position, strand) during
+    // compression. Emitting it as a SAM gives the reference-free variant caller its
+    // read-vs-consensus pileup WITHOUT any external aligner (bwa) — the "zero-cost
+    // byproduct" made literal. Contig names match ARCS_CONTIGS_DUMP (contig_N) so the
+    // same FASTA serves for downstream coordinate mapping. Placement is ungapped, so
+    // CIGAR is {len}M; SEQ/QUAL are emitted in contig (forward) frame. MAPQ=60 (placed).
+    // Off unless ARCS_PILEUP_SAM=<path>. Recomputes nothing that affects the archive.
+    if (const char* sp = getenv("ARCS_PILEUP_SAM")) {
+        FILE* sf = fopen(sp, "w");
+        if (sf) {
+            for (size_t c = 0; c < contigs.size(); ++c)
+                fprintf(sf, "@SQ\tSN:contig_%zu\tLN:%zu\n", c, contigs[c].size());
+            for (int oi = 0; oi < n; ++oi) {
+                const std::string& os = reads[(size_t)oi].seq;
+                const std::string& qs = reads[(size_t)oi].qual;
+                const int rl = (int)os.size();
+                const bool rcf = pl_rc[oi] != 0;
+                std::string sseq = rcf ? reverse_complement(os) : os;       // contig frame
+                std::string squal = qs;
+                if (rcf) std::reverse(squal.begin(), squal.end());          // quality follows read
+                if ((int)squal.size() != rl) squal.assign((size_t)rl, 'I'); // length guard
+                // MAPQ from placement mismatch count: ARCS placement is ungapped and can
+                // force-place reads a gapped aligner would soft-clip or reject, injecting
+                // spurious pileup columns. Mismatch count IS the placement confidence
+                // (bwa-mapq analog); mapping it to MAPQ lets the caller's existing mapq<20
+                // filter drop the noisy tail. Linear/principled (NOT tuned per region).
+                const std::string& cc = contigs[pl_cid[oi]];
+                uint32_t cs = pl_pos[oi]; int mm = 0;
+                for (int j = 0; j < rl; ++j) {
+                    uint32_t p = cs + (uint32_t)j;
+                    if (p >= cc.size()) { mm = rl; break; }        // ran off contig end → untrusted
+                    char a = sseq[(size_t)j];
+                    if (encode_base(a) < 4 && cc[p] != a) ++mm;
+                }
+                int mapq = 60 - 6 * mm; if (mapq < 0) mapq = 0;    // mm>6 → mapq<20 (filtered)
+                fprintf(sf, "r%d\t%d\tcontig_%u\t%u\t%d\t%dM\t*\t0\t0\t%s\t%s\n",
+                        oi, rcf ? 16 : 0, pl_cid[oi], pl_pos[oi] + 1u, mapq, rl,
+                        sseq.c_str(), squal.c_str());
+            }
+            fclose(sf);
+            fprintf(stderr, "[PILEUP-SAM] wrote %d read alignments to %s\n", n, sp);
+        }
+    }
+
     // ── Instrumentation: pileup / consensus-confidence dump (measurement only) ──
     // Writes per-(read,position) TSV: quality, column-agreement, depth, mismatch,
     // pos-in-read. Lets us measure whether consensus confidence predicts quality
