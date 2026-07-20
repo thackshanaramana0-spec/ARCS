@@ -1,0 +1,45 @@
+#pragma once
+// ARCS-DNA: pseudogenome-native DNA compressor.
+// Uses pre-seeded FCM (orders 6 + 12), RC-aware context mixing,
+// adaptive log-loss weights, and rANS coding.
+// No subprocess. No temp files. Embedded directly in ARCS.
+//
+// Genuinely different from GeCo3:
+//   - Pre-seeding from reads (GeCo3 is blind to reads)
+//   - rANS coder (GeCo3 uses range/arithmetic)
+//   - Adaptive log-loss mixing (GeCo3 uses gamma)
+//   - Sparse order-12 table (GeCo3 uses fixed arrays)
+//   - Chain-start structural priors
+#include <string>
+#include <vector>
+#include <cstdint>
+
+// Compress a raw DNA pseudogenome string.
+// reads:        original reads (used to pre-seed context model)
+// chain_order:  chain_order[i] = original read index at chain position i
+// pg_pos:       pg_pos[i] = start position in pg of chain position i
+// Returns compressed bytes (self-contained; includes pg_len header).
+std::vector<uint8_t> dna_encode(
+    const std::string&              pg,
+    const std::vector<std::string>& reads,
+    const std::vector<uint32_t>&    chain_order,
+    const std::vector<uint32_t>&    pg_pos);
+
+// Decompress bytes produced by dna_encode.
+// pg_len is embedded in the first 8 bytes of data.
+std::string dna_decode(const std::vector<uint8_t>& data);
+
+// ── Cross-stream quality: pseudogenome "surprise" signal (idea B) ─────────────
+// Computes, for each base of the pseudogenome, a quantized local-predictability
+// ("surprise") bucket in [0, nbuckets): a low-order causal finite-context model
+// scans the pg once and, before observing each base, records how confidently it
+// predicted that base from the preceding `order` bases. Bucket 0 = highly
+// predictable (e.g. homopolymer / low-complexity), higher = less predictable.
+//
+// It is a pure deterministic function of `pg` only, so the decoder reproduces it
+// bit-identically from the decoded pseudogenome — no bytes are stored. Used as an
+// extra quality-coder context (sequencer confidence tends to vary with local
+// sequence composition). See rans_model.h::N_QUAL_SURPRISE_BINS.
+std::vector<uint8_t> compute_pg_surprise(const std::string& pg,
+                                         int order    = 4,
+                                         int nbuckets = 4);
