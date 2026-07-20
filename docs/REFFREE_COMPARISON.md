@@ -52,8 +52,23 @@ done once on HG001 r2; every other region and the entire HG002 sample are held o
 Beyond the 5 HG001 regions, the frozen caller was tested across four additional
 axes to check the ~0.94 is a robust property, not a single-condition artifact:
 
-**Cross-individual** (held-out sample, GRCh38) — ARCS 0.971 vs DiscoSNP++ 0.941 vs
-Kmer2SNP 0.542. Ranking stable, ARCS leads (see above).
+**Cross-individual** — the caller was run with frozen parameters on **five GIAB
+individuals across three ancestries** (European, Ashkenazi, Han Chinese), each on
+chr20:2.0–2.4 Mb at ~30×, scored by the same rtg-het pipeline:
+
+| individual | ancestry            | ARCS  | DiscoSNP++ | Kmer2SNP |
+|------------|---------------------|:-----:|:----------:|:--------:|
+| HG001      | European (5-reg avg)| 0.943 | 0.887      | 0.539    |
+| HG002      | Ashkenazi son       | 0.971 | 0.941      | 0.542    |
+| HG003      | Ashkenazi father    | 0.972 | 0.920      | 0.550    |
+| HG004      | Ashkenazi mother    | 0.967 | 0.921      | 0.547    |
+| HG005      | Han Chinese son     | 0.932 | 0.891      | 0.487    |
+| **average**|                     |**0.957**| 0.912    | 0.533    |
+
+**ARCS leads on every individual and every ancestry**, with a single frozen
+parameter set (tuned once on HG001 r2 — all four other individuals are fully held
+out). Precision is ≥0.995 on the Ashkenazi trio and 1.000 on HG005; the margin over
+DiscoSNP++ is again driven by recall.
 
 **Difficulty strata** (HG001 calls re-scored inside GIAB stratification BEDs):
 
