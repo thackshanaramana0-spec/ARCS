@@ -115,8 +115,14 @@ private:
         ContextModel& quality_model
     ) const;
 
-    // Encode read names (first token only). Returns LZMA-compressed bytes.
-    std::vector<uint8_t> encode_names(const std::vector<Read>& reads) const;
+    // Encode read names. Returns compressed bytes.
+    // chain_order: if provided (chain-pg path), enables paired-end name dedup (format 0x06).
+    //   chain_order[k] = original read index at SCS position k.
+    // orig_reads: original reads before SCS reorder (needed for base-name extraction).
+    std::vector<uint8_t> encode_names(
+        const std::vector<Read>& reads,
+        const std::vector<uint32_t>* chain_order = nullptr,
+        const std::vector<Read>*     orig_reads  = nullptr) const;
 
     // Encode strand flags (1 bit per read). Returns bytes.
     std::vector<uint8_t> encode_strands(const std::vector<MapResult>& mappings) const;

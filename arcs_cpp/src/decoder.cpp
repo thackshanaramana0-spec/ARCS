@@ -256,6 +256,86 @@ static std::vector<std::string> decode_names_blob(
             }
         }
     }
+    // Format 0x06: paired-end name dedup.
+    // Layout: [0x06][sfmt u8][n_pairs u32][part1_lz_len u32][part1_lz]
+    //         [part2_lz_len u32][part2_lz][pidx_lz_len u32][pidx_lz]
+    //         [mate_bits ceil(N/8) bytes]
+    // sfmt 0x01 (Illumina XY-packed): part1=base template LZMA, part2=XY binary LZMA
+    //   Reconstruct: prefix[i] + ':' + X[i] + ':' + Y[i] + suffix(mate)
+    // sfmt 0x00 (plain): part1=base names LZMA (newline-delimited), part2 unused (len=0)
+    //   Reconstruct: base_names[pidx[k]] + suffix(mate)
+    // pidx_lz: LZMA of N uint32_t LE pair indices; mate_bits: bit k = mate of SCS pos k.
+    if (blob[0] == 0x06 && blob.size() >= 18) {
+        const uint8_t* p = blob.data() + 1;
+        const uint8_t* e = blob.data() + blob.size();
+        auto gu32 = [&]() -> uint32_t {
+            if (p + 4 > e) return 0;
+            uint32_t v = (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);
+            p += 4; return v;
+        };
+        uint8_t sfmt = *p++;
+        uint32_t n_pairs = gu32();
+        uint32_t p1l = gu32(); if (p + p1l > e) return names;
+        auto part1 = lzma_decompress(p, p1l); p += p1l;
+        uint32_t p2l = gu32(); if (p + p2l > e) return names;
+        auto part2 = (p2l > 0) ? lzma_decompress(p, p2l) : std::vector<uint8_t>{};
+        p += p2l;
+        uint32_t pil = gu32(); if (p + pil > e) return names;
+        auto pidx_raw = lzma_decompress(p, pil); p += pil;
+        size_t n_total = (size_t)n_pairs * 2;
+        size_t nbytes  = (n_total + 7) / 8;
+        if (p + nbytes > e || pidx_raw.size() < n_total * 4) return names;
+        const uint8_t* mbits = p;
+        // Reconstruct N names in SCS order.
+        names.resize(n_total);
+        if (sfmt == 0x01) {
+            // Illumina XY-packed: part1=template stream, part2=XY binary stream.
+            std::string tmpl(part1.begin(), part1.end());
+            // Parse N/2 templates into (prefix, no mate) entries.
+            std::vector<std::string> prefixes; prefixes.reserve(n_pairs);
+            size_t pos = 0;
+            while (prefixes.size() < n_pairs && pos < tmpl.size()) {
+                size_t nl = tmpl.find('\n', pos);
+                if (nl == std::string::npos) break;
+                std::string line = tmpl.substr(pos, nl - pos);
+                size_t sep = line.find('\x01');
+                prefixes.push_back(sep == std::string::npos ? line : line.substr(0, sep));
+                pos = nl + 1;
+            }
+            // XY: 8 bytes each, N/2 entries.
+            const uint8_t* xp = part2.data();
+            size_t xn = part2.size();
+            for (size_t k = 0; k < n_total; ++k) {
+                uint32_t pidx = (uint32_t)pidx_raw[k*4]|((uint32_t)pidx_raw[k*4+1]<<8)
+                              | ((uint32_t)pidx_raw[k*4+2]<<16)|((uint32_t)pidx_raw[k*4+3]<<24);
+                uint8_t mate = (mbits[k/8] >> (k%8)) & 1u;
+                if (pidx >= (uint32_t)prefixes.size() || pidx*8+8 > xn) continue;
+                const uint8_t* xb = xp + pidx * 8;
+                uint32_t X=(uint32_t)xb[0]|((uint32_t)xb[1]<<8)|((uint32_t)xb[2]<<16)|((uint32_t)xb[3]<<24);
+                uint32_t Y=(uint32_t)xb[4]|((uint32_t)xb[5]<<8)|((uint32_t)xb[6]<<16)|((uint32_t)xb[7]<<24);
+                names[k] = prefixes[pidx] + ':' + std::to_string(X) + ':' + std::to_string(Y)
+                         + (mate ? "/2" : "/1");
+            }
+        } else {
+            // Sub-format 0x00: plain LZMA base names.
+            std::vector<std::string> base_names; base_names.reserve(n_pairs);
+            size_t pos = 0;
+            while (base_names.size() < n_pairs && pos < part1.size()) {
+                size_t nl = pos;
+                while (nl < part1.size() && part1[nl] != '\n') ++nl;
+                base_names.emplace_back((const char*)part1.data() + pos, nl - pos);
+                pos = (nl < part1.size()) ? nl + 1 : nl + 1;
+            }
+            for (size_t k = 0; k < n_total; ++k) {
+                uint32_t pidx = (uint32_t)pidx_raw[k*4]|((uint32_t)pidx_raw[k*4+1]<<8)
+                              | ((uint32_t)pidx_raw[k*4+2]<<16)|((uint32_t)pidx_raw[k*4+3]<<24);
+                uint8_t mate = (mbits[k/8] >> (k%8)) & 1u;
+                if (pidx < (uint32_t)base_names.size())
+                    names[k] = base_names[pidx] + (mate ? "/2" : "/1");
+            }
+        }
+        return names;
+    }
     auto raw = lzma_decompress(blob.data(), blob.size());
     std::string s(raw.begin(), raw.end());
     std::istringstream ss(s);

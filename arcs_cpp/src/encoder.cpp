@@ -425,7 +425,10 @@ static std::vector<uint8_t> build_columnar_names(const std::vector<Read>& reads)
 }
 
 // ── Encode names ──────────────────────────────────────────────────────────────
-std::vector<uint8_t> ARCSEncoder::encode_names(const std::vector<Read>& reads) const {
+std::vector<uint8_t> ARCSEncoder::encode_names(
+        const std::vector<Read>& reads,
+        const std::vector<uint32_t>* chain_order_ptr,
+        const std::vector<Read>*     orig_reads_ptr) const {
     size_t n = reads.size();
 
     // If all names are PREFIX.N for consecutive N, store 16 bytes instead of ~22 KB.
@@ -506,14 +509,13 @@ std::vector<uint8_t> ARCSEncoder::encode_names(const std::vector<Read>& reads) c
             xy.push_back(xv & 0xFF); xy.push_back((xv>>8)&0xFF); xy.push_back((xv>>16)&0xFF); xy.push_back((xv>>24)&0xFF);
             xy.push_back(yv & 0xFF); xy.push_back((yv>>8)&0xFF); xy.push_back((yv>>16)&0xFF); xy.push_back((yv>>24)&0xFF);
         }
-        // Best tokenized candidate = smaller of Illumina-XY (0x03) and columnar (0x04/
-        // 0x05). These candidates are INDEPENDENT — the 0x03 template+XY LZMA passes,
-        // the columnar builder, and the plain baseline share only read-only inputs — so
-        // run them CONCURRENTLY (names encode is the compress long-pole on human WGS,
-        // e.g. DS7 ~64s serial). Keep-smaller output is byte-identical → ZERO ratio cost.
+        // Best tokenized candidate = smaller of Illumina-XY (0x03), columnar (0x04/0x05),
+        // and paired-end dedup (0x06). These candidates are INDEPENDENT — share only
+        // read-only inputs — so run them CONCURRENTLY. Keep-smaller output is byte-
+        // identical → ZERO ratio cost. Disable with ARCS_ENC_NOPAR.
         const bool nm_par = (getenv("ARCS_ENC_NOPAR") == nullptr);
-        std::future<std::vector<uint8_t>> f03, fcol, fplain;
-        std::vector<uint8_t> tok03, cand04, plain_lz;
+        std::future<std::vector<uint8_t>> f03, fcol, fplain, f06;
+        std::vector<uint8_t> tok03, cand04, plain_lz, cand06;
         auto build03 = [&]() -> std::vector<uint8_t> {
             if (!tok_ok) return {};
             std::vector<uint8_t> t_raw(templ.begin(), templ.end());
@@ -538,25 +540,148 @@ std::vector<uint8_t> ARCSEncoder::encode_names(const std::vector<Read>& reads) c
             // of names was ~57 s on DS7. Verified byte-identical across all 8 datasets.
             return lzma_compress(praw, 1);
         };
+        // ── Format 0x06: paired-end name dedup ───────────────────────────────
+        // When chain_order is available (chain-pg path), each SCS position k came from
+        // original read chain_order[k]. For interleaved paired-end data (orig[2i] and
+        // orig[2i+1] are mates with the same base name /1 vs /2), we store:
+        //   sub-format 0x01 (Illumina): N/2 base templates (prefix up to :X:Y, LZMA)
+        //     + N/2 XY binary pairs (LZMA) — same trick as 0x03 but for N/2 pairs only
+        //   sub-format 0x00 (plain):    N/2 base names as newline-delimited LZMA strings
+        //   Both: N pair indices (co[k]/2, LZMA) + ceil(N/8) mate bits
+        // Layout: [0x06][u8 sfmt][u32 n_pairs][u32 part1_lz_len][part1_lz][u32 part2_lz_len]
+        //         [part2_lz][u32 pidx_lz_len][pidx_lz][mate_bits]
+        //   sfmt 0x01: part1=template LZMA, part2=XY binary LZMA (same as 0x03 style)
+        //   sfmt 0x00: part1=base-name LZMA (plain strings), part2 unused (len=0)
+        // Keep-smaller vs all other formats — never regresses.
+        auto build06 = [&]() -> std::vector<uint8_t> {
+            if (!chain_order_ptr || !orig_reads_ptr) return {};
+            const auto& co   = *chain_order_ptr;
+            const auto& orig = *orig_reads_ptr;
+            if (n < 4 || n % 2 != 0 || co.size() != n || orig.size() < n) return {};
+            // Detect: sample first 200 original pairs; require >90% to match base name.
+            auto strip_mate = [](const std::string& nm) -> size_t {
+                size_t t = nm.size();
+                if (t >= 2 && nm[t-2] == '/' && (nm[t-1] == '1' || nm[t-1] == '2')) t -= 2;
+                return t;  // length of base (without /1 /2)
+            };
+            size_t sample_n = std::min(n, (size_t)200);
+            int matches = 0, total = 0;
+            for (size_t i = 0; i + 1 < sample_n; i += 2) {
+                size_t b0 = strip_mate(orig[i].name);
+                size_t b1 = strip_mate(orig[i+1].name);
+                if (b0 == b1 && orig[i].name.substr(0, b0) == orig[i+1].name.substr(0, b1))
+                    ++matches;
+                ++total;
+            }
+            if (total == 0 || matches < total * 9 / 10) return {};
+            size_t n_pairs = n / 2;
+            // Build pair_idx + mate_bits (shared by both sub-formats).
+            std::vector<uint8_t> pidx_raw; pidx_raw.reserve(n * 4);
+            size_t nbytes = (n + 7) / 8;
+            std::vector<uint8_t> mbits(nbytes, 0);
+            for (size_t k = 0; k < n; ++k) {
+                uint32_t p = co[k] / 2;
+                pidx_raw.push_back(p&0xFF); pidx_raw.push_back((p>>8)&0xFF);
+                pidx_raw.push_back((p>>16)&0xFF); pidx_raw.push_back((p>>24)&0xFF);
+                if (co[k] & 1) mbits[k/8] |= (uint8_t)(1u << (k%8));
+            }
+            auto pidx_lz = lzma_compress(pidx_raw, 9);
+            auto emit = [&](uint8_t sfmt,
+                            const std::vector<uint8_t>& part1_lz,
+                            const std::vector<uint8_t>& part2_lz) -> std::vector<uint8_t> {
+                auto pu32 = [](std::vector<uint8_t>& o, uint32_t v) {
+                    o.push_back(v&0xFF); o.push_back((v>>8)&0xFF);
+                    o.push_back((v>>16)&0xFF); o.push_back((v>>24)&0xFF);
+                };
+                std::vector<uint8_t> o;
+                o.push_back(0x06); o.push_back(sfmt);
+                pu32(o, (uint32_t)n_pairs);
+                pu32(o, (uint32_t)part1_lz.size()); o.insert(o.end(), part1_lz.begin(), part1_lz.end());
+                pu32(o, (uint32_t)part2_lz.size()); o.insert(o.end(), part2_lz.begin(), part2_lz.end());
+                pu32(o, (uint32_t)pidx_lz.size());  o.insert(o.end(), pidx_lz.begin(), pidx_lz.end());
+                o.insert(o.end(), mbits.begin(), mbits.end());
+                return o;
+            };
+            // ── Sub-format 0x01: Illumina XY-packed ──────────────────────────
+            // Same binary XY trick as 0x03 but applied to N/2 base names only.
+            // Base template = prefix up to :X (no :X:Y, no mate suffix) + \x01\n.
+            if (tok_ok) {
+                auto all_digits = [](const char* s, const char* e) -> bool {
+                    if (s == e) return false;
+                    for (const char* p = s; p < e; ++p) if (*p < '0' || *p > '9') return false;
+                    return true;
+                };
+                std::string btmpl; btmpl.reserve(n_pairs * 12);
+                std::vector<uint8_t> bxy; bxy.reserve(n_pairs * 8);
+                bool ok = true;
+                for (size_t i = 0; i < n_pairs && ok; ++i) {
+                    const std::string& nm = orig[2*i].name;
+                    size_t ce = strip_mate(nm);
+                    size_t cY = nm.rfind(':', ce - 1);
+                    if (cY == std::string::npos || cY == 0) { ok = false; break; }
+                    size_t cX = nm.rfind(':', cY - 1);
+                    if (cX == std::string::npos) { ok = false; break; }
+                    const char* Xs = nm.data()+cX+1; const char* Xe = nm.data()+cY;
+                    const char* Ys = nm.data()+cY+1; const char* Ye = nm.data()+ce;
+                    if (!all_digits(Xs,Xe)||!all_digits(Ys,Ye)) { ok=false; break; }
+                    if ((Xe-Xs>1&&*Xs=='0')||(Ye-Ys>1&&*Ys=='0')) { ok=false; break; }
+                    unsigned long X=strtoul(std::string(Xs,Xe).c_str(),nullptr,10);
+                    unsigned long Y=strtoul(std::string(Ys,Ye).c_str(),nullptr,10);
+                    if (X>0xFFFFFFFFul||Y>0xFFFFFFFFul) { ok=false; break; }
+                    btmpl.append(nm, 0, cX); btmpl.push_back('\x01'); btmpl.push_back('\n');
+                    uint32_t xv=(uint32_t)X, yv=(uint32_t)Y;
+                    bxy.push_back(xv&0xFF); bxy.push_back((xv>>8)&0xFF); bxy.push_back((xv>>16)&0xFF); bxy.push_back((xv>>24)&0xFF);
+                    bxy.push_back(yv&0xFF); bxy.push_back((yv>>8)&0xFF); bxy.push_back((yv>>16)&0xFF); bxy.push_back((yv>>24)&0xFF);
+                }
+                if (ok) {
+                    std::vector<uint8_t> tr(btmpl.begin(), btmpl.end());
+                    auto tmpl_lz = lzma_compress(tr, 9);
+                    auto xy_lz   = lzma_compress(bxy, 9);
+                    return emit(0x01, tmpl_lz, xy_lz);
+                }
+            }
+            // ── Sub-format 0x00: plain LZMA base names ────────────────────────
+            // Fallback for non-Illumina paired data where 0x03 doesn't apply.
+            std::string base_raw; base_raw.reserve(n_pairs * 15);
+            for (size_t i = 0; i < n_pairs; ++i) {
+                size_t b = strip_mate(orig[2*i].name);
+                base_raw.append(orig[2*i].name, 0, b);
+                base_raw += '\n';
+            }
+            std::vector<uint8_t> braw(base_raw.begin(), base_raw.end());
+            auto base_lz = lzma_compress(braw, 9);
+            std::vector<uint8_t> empty_part2;
+            return emit(0x00, base_lz, empty_part2);
+        };
         const bool NM_TIMING = getenv("ARCS_NAMES_TIMING") != nullptr;
         auto _nt = [&](const char* w, std::chrono::steady_clock::time_point a){ if(NM_TIMING) fprintf(stderr,"[NAMES] %s: %.2fs\n", w, std::chrono::duration<double>(std::chrono::steady_clock::now()-a).count()); };
         if (NM_TIMING) {
             auto a=std::chrono::steady_clock::now(); tok03=build03(); _nt("0x03 template+XY", a);
             a=std::chrono::steady_clock::now(); cand04=build_columnar_names(reads); _nt("columnar 0x04/0x05", a);
             a=std::chrono::steady_clock::now(); plain_lz=build_plain(); _nt("plain-LZMA floor", a);
+            a=std::chrono::steady_clock::now(); cand06=build06(); _nt("0x06 paired-dedup", a);
         } else if (nm_par) {
             f03    = std::async(std::launch::async, build03);
             fcol   = std::async(std::launch::async, [&]{ return build_columnar_names(reads); });
             fplain = std::async(std::launch::async, build_plain);
-            tok03 = f03.get(); cand04 = fcol.get(); plain_lz = fplain.get();
+            f06    = std::async(std::launch::async, build06);
+            tok03 = f03.get(); cand04 = fcol.get(); plain_lz = fplain.get(); cand06 = f06.get();
         } else {
-            tok03 = build03(); cand04 = build_columnar_names(reads); plain_lz = build_plain();
+            tok03 = build03(); cand04 = build_columnar_names(reads); plain_lz = build_plain(); cand06 = build06();
         }
         std::vector<uint8_t> best_tok = std::move(tok03);
+        const char* best_fmt = "0x03";
         if (!cand04.empty() && (best_tok.empty() || cand04.size() < best_tok.size()))
-            best_tok = std::move(cand04);
+            { best_tok = std::move(cand04); best_fmt = "0x04/0x05"; }
+        if (!cand06.empty() && (best_tok.empty() || cand06.size() < best_tok.size()))
+            { best_tok = std::move(cand06); best_fmt = "0x06(PE-dedup)"; }
         // Keep-smaller vs plain LZMA baseline (never regress).
-        if (!best_tok.empty() && best_tok.size() < plain_lz.size() + 1) return best_tok;
+        if (!best_tok.empty() && best_tok.size() < plain_lz.size() + 1) {
+            if (NM_TIMING || getenv("ARCS_NAMES_DEBUG"))
+                fprintf(stderr, "[NAMES] chosen=%s %zu B (plain=%zu B)\n",
+                        best_fmt, best_tok.size(), plain_lz.size());
+            return best_tok;
+        }
     }
 
     // Fallback: LZMA-compressed newline-delimited names.
@@ -1475,14 +1600,14 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
         fut_pg    = std::async(std::launch::async, [&]{
             return compress_pg(result.pg, reads, result.chain_order, result.pg_pos); });
         fut_names = std::async(std::launch::async, [&]{
-            return encode_names(chain_name_reads); });
+            return encode_names(chain_name_reads, &result.chain_order, &reads); });
     } else {
         // Serial path (ARCS_ENC_NOPAR): time pg and names separately so the compress
         // critical path can be attributed (the async path bundles them).
         auto _t0 = std::chrono::steady_clock::now();
         pg_blob   = compress_pg(result.pg, reads, result.chain_order, result.pg_pos);
         auto _t1 = std::chrono::steady_clock::now();
-        name_blob = encode_names(chain_name_reads);
+        name_blob = encode_names(chain_name_reads, &result.chain_order, &reads);
         auto _t2 = std::chrono::steady_clock::now();
         if (ENC_TIMING) {
             fprintf(stderr, "[ENC]   pg_encode(serial):    %.2fs\n", std::chrono::duration<double>(_t1-_t0).count());
