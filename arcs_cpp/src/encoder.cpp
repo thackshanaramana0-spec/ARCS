@@ -543,15 +543,19 @@ std::vector<uint8_t> ARCSEncoder::encode_names(
         // ── Format 0x06: paired-end name dedup ───────────────────────────────
         // When chain_order is available (chain-pg path), each SCS position k came from
         // original read chain_order[k]. For interleaved paired-end data (orig[2i] and
-        // orig[2i+1] are mates with the same base name /1 vs /2), we store:
-        //   sub-format 0x01 (Illumina): N/2 base templates (prefix up to :X:Y, LZMA)
-        //     + N/2 XY binary pairs (LZMA) — same trick as 0x03 but for N/2 pairs only
-        //   sub-format 0x00 (plain):    N/2 base names as newline-delimited LZMA strings
-        //   Both: N pair indices (co[k]/2, LZMA) + ceil(N/8) mate bits
-        // Layout: [0x06][u8 sfmt][u32 n_pairs][u32 part1_lz_len][part1_lz][u32 part2_lz_len]
-        //         [part2_lz][u32 pidx_lz_len][pidx_lz][mate_bits]
-        //   sfmt 0x01: part1=template LZMA, part2=XY binary LZMA (same as 0x03 style)
-        //   sfmt 0x00: part1=base-name LZMA (plain strings), part2 unused (len=0)
+        // orig[2i+1] are mates sharing the same base name, differing only by /1 vs /2),
+        // we halve name storage by exploiting that R1 pair indices are IMPLICIT:
+        //
+        //   The i-th R1 in SCS order has pair_rank=i (no storage needed).
+        //   Only R2 pair ranks are stored: r2rank[j] = R1-SCS-rank of the j-th R2's mate.
+        //   Since mates map nearby in the genome, r2rank is near-monotonic → LZMA wins.
+        //   Base names/XY stored in R1-SCS-rank order to align with the implicit index.
+        //
+        // Layout: [0x06][sfmt][n_pairs u32]
+        //         [part1_lz_len u32][part1_lz]    -- sfmt 0x01: base templates; 0x00: base names
+        //         [part2_lz_len u32][part2_lz]    -- sfmt 0x01: XY binary (N/2×8B); 0x00: empty
+        //         [r2rank_lz_len u32][r2rank_lz]  -- N/2 × u32 LE R2 pair ranks, LZMA
+        //         [mate_bits ceil(N/8) bytes]      -- bit k = mate of SCS pos k
         // Keep-smaller vs all other formats — never regresses.
         auto build06 = [&]() -> std::vector<uint8_t> {
             if (!chain_order_ptr || !orig_reads_ptr) return {};
@@ -562,30 +566,39 @@ std::vector<uint8_t> ARCSEncoder::encode_names(
             auto strip_mate = [](const std::string& nm) -> size_t {
                 size_t t = nm.size();
                 if (t >= 2 && nm[t-2] == '/' && (nm[t-1] == '1' || nm[t-1] == '2')) t -= 2;
-                return t;  // length of base (without /1 /2)
+                return t;
             };
             size_t sample_n = std::min(n, (size_t)200);
             int matches = 0, total = 0;
             for (size_t i = 0; i + 1 < sample_n; i += 2) {
-                size_t b0 = strip_mate(orig[i].name);
-                size_t b1 = strip_mate(orig[i+1].name);
-                if (b0 == b1 && orig[i].name.substr(0, b0) == orig[i+1].name.substr(0, b1))
+                size_t b0 = strip_mate(orig[i].name), b1 = strip_mate(orig[i+1].name);
+                if (b0 == b1 && orig[i].name.compare(0, b0, orig[i+1].name, 0, b1) == 0)
                     ++matches;
                 ++total;
             }
             if (total == 0 || matches < total * 9 / 10) return {};
             size_t n_pairs = n / 2;
-            // Build pair_idx + mate_bits (shared by both sub-formats).
-            std::vector<uint8_t> pidx_raw; pidx_raw.reserve(n * 4);
+            // ── Pass 1: compute R1-SCS-rank for each original pair index ─────
+            // r1_rank[pair_orig_idx] = rank of that pair's R1 among all R1s in SCS order
+            std::vector<uint32_t> r1_rank(n_pairs, UINT32_MAX);
+            uint32_t r1_cnt = 0;
+            for (size_t k = 0; k < n; ++k)
+                if ((co[k] & 1) == 0) r1_rank[co[k] / 2] = r1_cnt++;
+            // ── Pass 2: build mate_bits + r2_pair_rank ───────────────────────
+            // mate_bits[k] = co[k]%2. r2rank[j] = R1-SCS-rank of the j-th R2's mate.
             size_t nbytes = (n + 7) / 8;
             std::vector<uint8_t> mbits(nbytes, 0);
+            std::vector<uint8_t> r2rank_raw; r2rank_raw.reserve(n_pairs * 4);
             for (size_t k = 0; k < n; ++k) {
-                uint32_t p = co[k] / 2;
-                pidx_raw.push_back(p&0xFF); pidx_raw.push_back((p>>8)&0xFF);
-                pidx_raw.push_back((p>>16)&0xFF); pidx_raw.push_back((p>>24)&0xFF);
-                if (co[k] & 1) mbits[k/8] |= (uint8_t)(1u << (k%8));
+                if (co[k] & 1) {
+                    mbits[k/8] |= (uint8_t)(1u << (k%8));
+                    uint32_t rk = r1_rank[co[k] / 2];
+                    r2rank_raw.push_back(rk&0xFF); r2rank_raw.push_back((rk>>8)&0xFF);
+                    r2rank_raw.push_back((rk>>16)&0xFF); r2rank_raw.push_back((rk>>24)&0xFF);
+                }
             }
-            auto pidx_lz = lzma_compress(pidx_raw, 9);
+            auto r2rank_lz = lzma_compress(r2rank_raw, 9);
+            auto mbits_lz = lzma_compress(mbits, 9);
             auto emit = [&](uint8_t sfmt,
                             const std::vector<uint8_t>& part1_lz,
                             const std::vector<uint8_t>& part2_lz) -> std::vector<uint8_t> {
@@ -598,23 +611,26 @@ std::vector<uint8_t> ARCSEncoder::encode_names(
                 pu32(o, (uint32_t)n_pairs);
                 pu32(o, (uint32_t)part1_lz.size()); o.insert(o.end(), part1_lz.begin(), part1_lz.end());
                 pu32(o, (uint32_t)part2_lz.size()); o.insert(o.end(), part2_lz.begin(), part2_lz.end());
-                pu32(o, (uint32_t)pidx_lz.size());  o.insert(o.end(), pidx_lz.begin(), pidx_lz.end());
-                o.insert(o.end(), mbits.begin(), mbits.end());
+                pu32(o, (uint32_t)r2rank_lz.size()); o.insert(o.end(), r2rank_lz.begin(), r2rank_lz.end());
+                pu32(o, (uint32_t)mbits_lz.size()); o.insert(o.end(), mbits_lz.begin(), mbits_lz.end());
                 return o;
             };
             // ── Sub-format 0x01: Illumina XY-packed ──────────────────────────
-            // Same binary XY trick as 0x03 but applied to N/2 base names only.
-            // Base template = prefix up to :X (no :X:Y, no mate suffix) + \x01\n.
+            // Binary XY trick (same as 0x03) for N/2 base names.
+            // Stored in R1-SCS-rank order so decoder can look up by pair_rank.
             if (tok_ok) {
                 auto all_digits = [](const char* s, const char* e) -> bool {
                     if (s == e) return false;
                     for (const char* p = s; p < e; ++p) if (*p < '0' || *p > '9') return false;
                     return true;
                 };
-                std::string btmpl; btmpl.reserve(n_pairs * 12);
-                std::vector<uint8_t> bxy; bxy.reserve(n_pairs * 8);
+                // Slot arrays indexed by R1-rank.
+                std::vector<std::string> tmpl_slots(n_pairs);
+                std::vector<uint32_t>    X_slots(n_pairs, 0), Y_slots(n_pairs, 0);
                 bool ok = true;
                 for (size_t i = 0; i < n_pairs && ok; ++i) {
+                    uint32_t rk = r1_rank[i];
+                    if (rk == UINT32_MAX) { ok = false; break; }
                     const std::string& nm = orig[2*i].name;
                     size_t ce = strip_mate(nm);
                     size_t cY = nm.rfind(':', ce - 1);
@@ -628,12 +644,18 @@ std::vector<uint8_t> ARCSEncoder::encode_names(
                     unsigned long X=strtoul(std::string(Xs,Xe).c_str(),nullptr,10);
                     unsigned long Y=strtoul(std::string(Ys,Ye).c_str(),nullptr,10);
                     if (X>0xFFFFFFFFul||Y>0xFFFFFFFFul) { ok=false; break; }
-                    btmpl.append(nm, 0, cX); btmpl.push_back('\x01'); btmpl.push_back('\n');
-                    uint32_t xv=(uint32_t)X, yv=(uint32_t)Y;
-                    bxy.push_back(xv&0xFF); bxy.push_back((xv>>8)&0xFF); bxy.push_back((xv>>16)&0xFF); bxy.push_back((xv>>24)&0xFF);
-                    bxy.push_back(yv&0xFF); bxy.push_back((yv>>8)&0xFF); bxy.push_back((yv>>16)&0xFF); bxy.push_back((yv>>24)&0xFF);
+                    tmpl_slots[rk] = nm.substr(0, cX) + '\x01';
+                    X_slots[rk] = (uint32_t)X; Y_slots[rk] = (uint32_t)Y;
                 }
                 if (ok) {
+                    std::string btmpl; btmpl.reserve(n_pairs * 12);
+                    std::vector<uint8_t> bxy; bxy.reserve(n_pairs * 8);
+                    for (size_t r = 0; r < n_pairs; ++r) {
+                        btmpl += tmpl_slots[r]; btmpl += '\n';
+                        uint32_t xv=X_slots[r], yv=Y_slots[r];
+                        bxy.push_back(xv&0xFF); bxy.push_back((xv>>8)&0xFF); bxy.push_back((xv>>16)&0xFF); bxy.push_back((xv>>24)&0xFF);
+                        bxy.push_back(yv&0xFF); bxy.push_back((yv>>8)&0xFF); bxy.push_back((yv>>16)&0xFF); bxy.push_back((yv>>24)&0xFF);
+                    }
                     std::vector<uint8_t> tr(btmpl.begin(), btmpl.end());
                     auto tmpl_lz = lzma_compress(tr, 9);
                     auto xy_lz   = lzma_compress(bxy, 9);
@@ -641,13 +663,18 @@ std::vector<uint8_t> ARCSEncoder::encode_names(
                 }
             }
             // ── Sub-format 0x00: plain LZMA base names ────────────────────────
-            // Fallback for non-Illumina paired data where 0x03 doesn't apply.
-            std::string base_raw; base_raw.reserve(n_pairs * 15);
-            for (size_t i = 0; i < n_pairs; ++i) {
+            // Stored in R1-SCS-rank order.
+            std::vector<std::string> base_slots(n_pairs);
+            bool slots_ok = true;
+            for (size_t i = 0; i < n_pairs && slots_ok; ++i) {
+                uint32_t rk = r1_rank[i];
+                if (rk == UINT32_MAX) { slots_ok = false; break; }
                 size_t b = strip_mate(orig[2*i].name);
-                base_raw.append(orig[2*i].name, 0, b);
-                base_raw += '\n';
+                base_slots[rk] = orig[2*i].name.substr(0, b);
             }
+            if (!slots_ok) return {};
+            std::string base_raw; base_raw.reserve(n_pairs * 15);
+            for (size_t r = 0; r < n_pairs; ++r) { base_raw += base_slots[r]; base_raw += '\n'; }
             std::vector<uint8_t> braw(base_raw.begin(), base_raw.end());
             auto base_lz = lzma_compress(braw, 9);
             std::vector<uint8_t> empty_part2;
@@ -1274,8 +1301,11 @@ void ARCSEncoder::encode_wgs_mst(const std::vector<Read>& reads,
     // Compress delta bytes with LZMA
     auto delta_compressed = lzma_compress(mst_result.delta_bytes, 9);
 
-    // Encode names
-    auto name_bytes = encode_names(reads);
+    // Encode names — identity chain_order enables format 0x06 PE dedup on MST path
+    // (MST stores reads in original file order, so chain_order = 0,1,...,n-1).
+    std::vector<uint32_t> mst_co((size_t)n);
+    std::iota(mst_co.begin(), mst_co.end(), 0u);
+    auto name_bytes = encode_names(reads, &mst_co, &reads);
 
     // Note: DFS order is reconstructible from MST_TREE blob during decoding.
     // No need to store it separately — save ~200KB per archive.

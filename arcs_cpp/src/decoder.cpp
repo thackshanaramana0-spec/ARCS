@@ -256,15 +256,14 @@ static std::vector<std::string> decode_names_blob(
             }
         }
     }
-    // Format 0x06: paired-end name dedup.
+    // Format 0x06: paired-end name dedup (R1-rank implicit scheme).
     // Layout: [0x06][sfmt u8][n_pairs u32][part1_lz_len u32][part1_lz]
-    //         [part2_lz_len u32][part2_lz][pidx_lz_len u32][pidx_lz]
-    //         [mate_bits ceil(N/8) bytes]
-    // sfmt 0x01 (Illumina XY-packed): part1=base template LZMA, part2=XY binary LZMA
-    //   Reconstruct: prefix[i] + ':' + X[i] + ':' + Y[i] + suffix(mate)
-    // sfmt 0x00 (plain): part1=base names LZMA (newline-delimited), part2 unused (len=0)
-    //   Reconstruct: base_names[pidx[k]] + suffix(mate)
-    // pidx_lz: LZMA of N uint32_t LE pair indices; mate_bits: bit k = mate of SCS pos k.
+    //         [part2_lz_len u32][part2_lz][r2rank_lz_len u32][r2rank_lz]
+    //         [mbits_lz_len u32][mbits_lz]
+    // sfmt 0x01: part1=base template LZMA (R1-SCS-rank order), part2=XY binary LZMA
+    // sfmt 0x00: part1=base names LZMA (R1-SCS-rank order), part2 unused (len=0)
+    // r2rank: N/2 uint32_t LE — R1-SCS-rank of each R2's mate (near-monotonic → small LZMA)
+    // mate_bits: LZMA of ceil(N/8) bytes; bit k = 1 if SCS pos k is R2.
     if (blob[0] == 0x06 && blob.size() >= 18) {
         const uint8_t* p = blob.data() + 1;
         const uint8_t* e = blob.data() + blob.size();
@@ -280,18 +279,24 @@ static std::vector<std::string> decode_names_blob(
         uint32_t p2l = gu32(); if (p + p2l > e) return names;
         auto part2 = (p2l > 0) ? lzma_decompress(p, p2l) : std::vector<uint8_t>{};
         p += p2l;
-        uint32_t pil = gu32(); if (p + pil > e) return names;
-        auto pidx_raw = lzma_decompress(p, pil); p += pil;
+        uint32_t r2rl = gu32(); if (p + r2rl > e) return names;
+        auto r2rank_raw = lzma_decompress(p, r2rl); p += r2rl;
+        uint32_t mbl = gu32(); if (p + mbl > e) return names;
+        auto mbits_raw = lzma_decompress(p, mbl); p += mbl;
         size_t n_total = (size_t)n_pairs * 2;
         size_t nbytes  = (n_total + 7) / 8;
-        if (p + nbytes > e || pidx_raw.size() < n_total * 4) return names;
-        const uint8_t* mbits = p;
+        if (r2rank_raw.size() < n_pairs * 4 || mbits_raw.size() < nbytes) return names;
+        const uint8_t* mbits = mbits_raw.data();
+        // Decode r2rank into a flat array for fast lookup.
+        std::vector<uint32_t> r2rank(n_pairs);
+        for (size_t j = 0; j < n_pairs; ++j)
+            r2rank[j] = (uint32_t)r2rank_raw[j*4]|((uint32_t)r2rank_raw[j*4+1]<<8)
+                      | ((uint32_t)r2rank_raw[j*4+2]<<16)|((uint32_t)r2rank_raw[j*4+3]<<24);
         // Reconstruct N names in SCS order.
         names.resize(n_total);
         if (sfmt == 0x01) {
-            // Illumina XY-packed: part1=template stream, part2=XY binary stream.
+            // Illumina XY-packed (R1-SCS-rank order).
             std::string tmpl(part1.begin(), part1.end());
-            // Parse N/2 templates into (prefix, no mate) entries.
             std::vector<std::string> prefixes; prefixes.reserve(n_pairs);
             size_t pos = 0;
             while (prefixes.size() < n_pairs && pos < tmpl.size()) {
@@ -302,22 +307,21 @@ static std::vector<std::string> decode_names_blob(
                 prefixes.push_back(sep == std::string::npos ? line : line.substr(0, sep));
                 pos = nl + 1;
             }
-            // XY: 8 bytes each, N/2 entries.
             const uint8_t* xp = part2.data();
             size_t xn = part2.size();
+            uint32_t r1_cnt = 0, r2_cnt = 0;
             for (size_t k = 0; k < n_total; ++k) {
-                uint32_t pidx = (uint32_t)pidx_raw[k*4]|((uint32_t)pidx_raw[k*4+1]<<8)
-                              | ((uint32_t)pidx_raw[k*4+2]<<16)|((uint32_t)pidx_raw[k*4+3]<<24);
                 uint8_t mate = (mbits[k/8] >> (k%8)) & 1u;
-                if (pidx >= (uint32_t)prefixes.size() || pidx*8+8 > xn) continue;
-                const uint8_t* xb = xp + pidx * 8;
+                uint32_t pr = (mate == 0) ? r1_cnt++ : r2rank[r2_cnt++];
+                if (pr >= (uint32_t)prefixes.size() || pr*8+8 > xn) continue;
+                const uint8_t* xb = xp + pr * 8;
                 uint32_t X=(uint32_t)xb[0]|((uint32_t)xb[1]<<8)|((uint32_t)xb[2]<<16)|((uint32_t)xb[3]<<24);
                 uint32_t Y=(uint32_t)xb[4]|((uint32_t)xb[5]<<8)|((uint32_t)xb[6]<<16)|((uint32_t)xb[7]<<24);
-                names[k] = prefixes[pidx] + ':' + std::to_string(X) + ':' + std::to_string(Y)
+                names[k] = prefixes[pr] + ':' + std::to_string(X) + ':' + std::to_string(Y)
                          + (mate ? "/2" : "/1");
             }
         } else {
-            // Sub-format 0x00: plain LZMA base names.
+            // Sub-format 0x00: plain LZMA base names (R1-SCS-rank order).
             std::vector<std::string> base_names; base_names.reserve(n_pairs);
             size_t pos = 0;
             while (base_names.size() < n_pairs && pos < part1.size()) {
@@ -326,12 +330,12 @@ static std::vector<std::string> decode_names_blob(
                 base_names.emplace_back((const char*)part1.data() + pos, nl - pos);
                 pos = (nl < part1.size()) ? nl + 1 : nl + 1;
             }
+            uint32_t r1_cnt = 0, r2_cnt = 0;
             for (size_t k = 0; k < n_total; ++k) {
-                uint32_t pidx = (uint32_t)pidx_raw[k*4]|((uint32_t)pidx_raw[k*4+1]<<8)
-                              | ((uint32_t)pidx_raw[k*4+2]<<16)|((uint32_t)pidx_raw[k*4+3]<<24);
                 uint8_t mate = (mbits[k/8] >> (k%8)) & 1u;
-                if (pidx < (uint32_t)base_names.size())
-                    names[k] = base_names[pidx] + (mate ? "/2" : "/1");
+                uint32_t pr = (mate == 0) ? r1_cnt++ : r2rank[r2_cnt++];
+                if (pr < (uint32_t)base_names.size())
+                    names[k] = base_names[pr] + (mate ? "/2" : "/1");
             }
         }
         return names;
