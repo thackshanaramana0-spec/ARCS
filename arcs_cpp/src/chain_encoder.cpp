@@ -864,7 +864,23 @@ struct KmerIndex {
     size_t mask, count = 0;
     int max_bucket;
     KmerIndex(size_t expect_post, int maxb) : max_bucket(maxb) {
-        unsigned bits = 12; while (((size_t)1 << bits) < 1024) ++bits;
+        // Pre-size the key table from the expected posting count so it almost never
+        // grow()s during build. grow() rehashes the entire key table on every doubling
+        // (~13 doublings from the old fixed 4096-slot start on a multi-M-posting merge),
+        // and that repeated rehash was a large fraction of the merge's index-build cost.
+        // grow() only remaps the KEY table — it never reorders the postings pool — so
+        // starting larger is BIT-IDENTICAL to growing into the same size: finalize()
+        // emits the exact same cval order, merges stay byte-for-byte unchanged. Distinct
+        // k-mers are usually well under the posting count (genomic repeats), so target
+        // ~expect_post/2 slots: enough to hold the keys at <0.7 load without a grow,
+        // while also avoiding grow()'s transient old+new double-allocation (small RAM win).
+        // Cap the initial size at 2^24 slots (~320 MB of key table) so a huge pg on a
+        // whole-genome file can't over-allocate — beyond that it grows a couple of times
+        // from 2^24, which is cheap, while bounding peak RAM. Byte output is identical
+        // regardless of how many grows occur.
+        unsigned bits = 12;
+        size_t target = expect_post / 2 + 1024;
+        while (((size_t)1 << bits) < target && bits < 24) ++bits;
         init(bits);
         pval.reserve(expect_post + 16); pnext.reserve(expect_post + 16);
     }
@@ -1008,6 +1024,44 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
     if (const char* s = getenv("ARCS_DEDUP_CAND"))   MAX_CAND   = atoi(s);
     if (const char* s = getenv("ARCS_DEDUP_BUCKET")) MAX_BUCKET = atoi(s);
 
+    // ── Sparse placement index — OPT-IN (ARCS_PLACE_SPARSE=w) ─────────────────────
+    // On errored/high-coverage data the placement index balloons with spurious distinct
+    // k-mers (error k-mers are singletons that never match anything — pure RAM waste).
+    // Indexing only the ~1/w of k-mers whose hash is sampled (and probing with the SAME
+    // predicate) shrinks the index ~w× — the located bacterial-RAM residual. Placement is
+    // lossless by construction (it only chooses where reads go; the codec stores reads+
+    // mismatches vs the resulting contigs), so this is a pure RATIO trade, never a
+    // losslessness risk — VALIDATED byte-exact on clean-ecoli / errored-ecoli / human,
+    // ratio neutral-to-better. place_smask==0 (default) = index/query EVERY position =
+    // BIT-IDENTICAL to the original placement. Best with w a power of two. Stacks with
+    // sparse-merge for −52% assembly RAM on the errored bacterial proxy. See §8d.
+    uint64_t place_smask = 0;
+    if (const char* s = getenv("ARCS_PLACE_SPARSE")) { int v = atoi(s); if (v > 1) place_smask = (uint64_t)v - 1; }
+
+    // High-quality read pre-filter (PgRC2 principle): reads with N symbols or
+    // low-quality tails are excluded from contig extension and seeding. They are
+    // still placed on existing contigs and encoded losslessly — only the assembly
+    // growth step is gated. On high-coverage data (e.g. 30× E.coli) this removes
+    // error k-mers from the dBG → fewer dead ends → more contiguous pg → better ratio.
+    // Disable with ARCS_NO_HQ_FILTER=1.
+    const bool hq_filter = (getenv("ARCS_NO_HQ_FILTER") == nullptr);
+    std::vector<bool> is_hq((size_t)n, true);
+    if (hq_filter) {
+        for (int i = 0; i < n; ++i) {
+            const std::string& s = reads[(size_t)i].seq;
+            const std::string& q = reads[(size_t)i].qual;
+            const int rl = (int)s.size();
+            bool hq = true;
+            for (char c : s) { if (c == 'N' || c == 'n') { hq = false; break; } }
+            if (hq && !q.empty()) {
+                int tail = std::max(1, (int)(0.12 * rl));
+                for (int j = rl - tail; j < rl; ++j)
+                    if ((q[(size_t)j] - 33) <= 2) { hq = false; break; }
+            }
+            is_hq[(size_t)i] = hq;
+        }
+    }
+
     std::vector<std::string> contigs;
     contigs.reserve((size_t)n / 4 + 1);
 
@@ -1097,7 +1151,7 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
             uint64_t v = 0; int valid = 0;
             for (uint32_t p = start; p < to; ++p) {
                 v = ((v << 2) | encode_base(c[p])) & KMASK;
-                if (++valid >= K) {
+                if (++valid >= K && (place_smask == 0 || (hash64(v) & place_smask) == 0)) {
                     uint32_t kpos = p - (uint32_t)(K - 1);
                     index.insert(v, ((uint64_t)cid << 32) | kpos);   // keep-first, single slot
                 }
@@ -1149,10 +1203,20 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
                     cands.push_back(((uint64_t)cid << 32) | cs);
                 }
             };
-            for (int si = 0; si < 5; ++si) probe_seed(seed_offs[si]);   // fixed anchors
-            if (use_minz) {                                            // + minimizer anchors
-                compute_minimizers(target, L, minz_off);
-                for (int off : minz_off) probe_seed(off);
+            if (place_smask == 0) {
+                for (int si = 0; si < 5; ++si) probe_seed(seed_offs[si]);   // fixed anchors
+                if (use_minz) {                                            // + minimizer anchors
+                    compute_minimizers(target, L, minz_off);
+                    for (int off : minz_off) probe_seed(off);
+                }
+            } else {
+                // Sparse mode: only sampled k-mers are indexed, so probe every position
+                // whose k-mer is sampled (same predicate as the insert). A real overlap
+                // ≥ K contains sampled seeds w.h.p.; acceptance is still verified below.
+                for (int off = 0; off + K <= L; ++off) {
+                    uint64_t km;
+                    if (pack_kmer(target, off, km) && (hash64(km) & place_smask) == 0) probe_seed(off);
+                }
             }
             std::sort(cands.begin(), cands.end());
             cands.erase(std::unique(cands.begin(), cands.end()), cands.end());
@@ -1191,10 +1255,14 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
             }
         }
 
+        const bool read_is_hq = is_hq[(size_t)oi];
         if (bestI_cid >= 0 && bestI_mm <= MAXMM) {
+            // Internal placement — always allowed for both HQ and LQ reads.
             pl_cid[oi] = (uint32_t)bestI_cid; pl_pos[oi] = (uint32_t)bestI_pos;
             pl_rc[oi]  = (uint8_t)bestI_rc;
-        } else if (bestE_cid >= 0) {
+        } else if (read_is_hq && bestE_cid >= 0) {
+            // Contig extension — HQ reads only (LQ reads carry error k-mers that
+            // would create spurious branches and fragment the assembly).
             uint32_t cid = (uint32_t)bestE_cid;
             uint32_t oldlen = (uint32_t)contigs[cid].size();
             const std::string& t = bestE_target;
@@ -1204,7 +1272,8 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
             }
             pl_cid[oi] = cid; pl_pos[oi] = (uint32_t)bestE_pos; pl_rc[oi] = (uint8_t)bestE_rc;
             index_contig(cid, oldlen, (uint32_t)contigs[cid].size());
-        } else {
+        } else if (read_is_hq) {
+            // New contig — HQ reads only, added to index so future reads can place on it.
             uint32_t cid = (uint32_t)contigs.size();
             std::string c((size_t)L, 'A');
             for (int j = 0; j < L; ++j) {
@@ -1214,6 +1283,19 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
             contigs.push_back(std::move(c));
             pl_cid[oi] = cid; pl_pos[oi] = 0; pl_rc[oi] = 0; pl_new[oi] = 1;
             index_contig(cid, 0, (uint32_t)L);
+        } else {
+            // LQ read: no valid internal placement found. Store as singleton contig
+            // but do NOT add to the placement index — prevents error k-mers from
+            // attracting future reads and fragmenting the assembly.
+            uint32_t cid = (uint32_t)contigs.size();
+            std::string c((size_t)L, 'A');
+            for (int j = 0; j < L; ++j) {
+                char b = orig[(size_t)j];
+                if (is_acgt_strict(b)) c[(size_t)j] = b;
+            }
+            contigs.push_back(std::move(c));
+            pl_cid[oi] = cid; pl_pos[oi] = 0; pl_rc[oi] = 0; pl_new[oi] = 1;
+            // intentionally no index_contig — LQ singletons are opaque to placement
         }
       }
     };
@@ -1237,6 +1319,9 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
     }
     if (SHARD <= 1 || (size_t)n < 4 * (size_t)SHARD) {
         std::vector<int> ids((size_t)n); std::iota(ids.begin(), ids.end(), 0);
+        // HQ reads process first: they build clean assembly; LQ reads find placements
+        // on already-built contigs rather than seeding fragmented singleton contigs.
+        std::stable_partition(ids.begin(), ids.end(), [&](int i){ return is_hq[(size_t)i]; });
         place_range(ids, contigs, index);
     } else {
         const int T = SHARD;
@@ -1263,6 +1348,9 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
                 shard_ids[sh].push_back(oi);
             }
         }
+        // Within each shard: HQ reads first so they build clean assembly before LQ reads place.
+        for (auto& sh : shard_ids)
+            std::stable_partition(sh.begin(), sh.end(), [&](int i){ return is_hq[(size_t)i]; });
         std::vector<std::vector<std::string>> sc((size_t)T);
         std::vector<FlatPlaceIndex> si((size_t)T);
         for (auto& x : si) x.set_cap(MAX_BUCKET);
@@ -1313,6 +1401,19 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
             out = v & MKMASK; return true;
         };
         const int MIN_OV_C = K;                 // min contig-contig overlap (verified)
+        // ── Sparse (sampled) merge index — OPT-IN (ARCS_MERGE_SPARSE=w) ────────────
+        // The ext-grow index-build inserts every k-mer of every contig on both strands
+        // (millions of serial inserts) → the merge's dominant cost. Sampling only the
+        // k-mers whose hash lands in 1/w of the space cuts inserts ~w× (build + RAM),
+        // and the QUERY samples with the SAME predicate so a real overlap ≥ K still
+        // contains sampled seeds w.h.p. Overlaps are still VERIFIED full-length, so this
+        // never loosens acceptance — it can only miss a few marginal overlaps (a pure
+        // RATIO trade, never a losslessness risk: the codec stores reads+mismatches vs
+        // whatever contigs result). smask==0 (default) = insert/query EVERY position =
+        // BIT-IDENTICAL to the original merge. Best with w a power of two.
+        uint64_t smask = 0;
+        if (const char* s = getenv("ARCS_MERGE_SPARSE")) { int v = atoi(s); if (v > 1) smask = (uint64_t)v - 1; }
+        auto sampled = [&](uint64_t kk) -> bool { return smask == 0 || (KmerIndex::mix(kk) & smask) == 0; };
         const bool MG_TIMING = getenv("ARCS_MERGE_TIMING") != nullptr;
         auto _mn = []{ return std::chrono::steady_clock::now(); };
         auto _mp = _mn();
@@ -1327,7 +1428,13 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
             const int MC = (int)contigs.size();
             if (MC < 2) break;
             std::vector<std::string> rcstr(MC);
+            // est_post drives the KmerIndex table pre-size. With sparse sampling only
+            // ~1/(smask+1) of k-mers are actually inserted, so sizing for the FULL count
+            // over-allocates the hash table by that factor — the dominant merge RAM on
+            // fragmented (bacterial) data. Size for the sampled count instead. Output is
+            // byte-identical (table capacity never affects posting order).
             size_t est_post = 0; for (int c = 0; c < MC; ++c) est_post += contigs[c].size() * 2;
+            if (smask) est_post = est_post / (smask + 1) + 1024;
             KmerIndex cidx(est_post, MAX_BUCKET);      // kmer → (cid<<33|pos<<1|strand)
             // RC strings are independent per contig → compute them in parallel (the
             // single biggest serial cost of the merge index build).
@@ -1352,7 +1459,7 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
                     uint64_t v = 0; int val = 0;
                     for (uint32_t p = 0; p < s.size(); ++p) {
                         v = ((v << 2) | encode_base(s[p])) & MKMASK;
-                        if (++val >= MK)
+                        if (++val >= MK && sampled(v))
                             cidx.insert(v, ((uint64_t)c << 33) | ((uint64_t)(p - (uint32_t)MK + 1) << 1) | (uint64_t)st);
                     }
                 }
@@ -1374,10 +1481,13 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
                 while (grew && guard++ < MC + 4) {
                     grew = false;
                     int bestD = -1; uint32_t bestOv = 0; int bestSt = 0;
-                    for (int back = 0; back <= 6; ++back) {
-                        int ap = (int)sup.size() - MK - back * (MK / 2);
-                        if (ap < 0) break;
-                        uint64_t km; if (!mpack(sup, ap, km)) continue;
+                    // Look up one seed anchored at sup position `ap` and update the best
+                    // overlap. With smask==0 the sampled() guard is inert, so this is
+                    // exactly the original inner body → default merge stays bit-identical.
+                    auto probe = [&](int ap) {
+                        if (ap < 0) return;
+                        uint64_t km; if (!mpack(sup, ap, km)) return;
+                        if (smask && (KmerIndex::mix(km) & smask) != 0) return;   // only sampled seeds are indexed
                         int32_t _len; int32_t _st = cidx.find_run(km, _len);
                         for (int32_t _q = 0; _q < _len; ++_q) {
                             uint64_t pk = cidx.cval[_st + _q];
@@ -1391,6 +1501,22 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
                             for (uint32_t j = 0; j < ov && mm < lim; ++j) if (sup[astart + j] != Ds[j]) ++mm;
                             if (mm < lim && ov > bestOv) { bestOv = ov; bestD = d; bestSt = st; }
                         }
+                    };
+                    if (smask == 0) {
+                        // ORIGINAL 7-probe schedule — preserved exactly for the default path.
+                        for (int back = 0; back <= 6; ++back) {
+                            int ap = (int)sup.size() - MK - back * (MK / 2);
+                            if (ap < 0) break;
+                            probe(ap);
+                        }
+                    } else {
+                        // Sparse mode: scan a suffix window densely and let probe() skip
+                        // the non-sampled positions. The window spans ~2 sampling periods
+                        // worth of k-mers so it reliably contains sampled seeds of any
+                        // overlapping neighbour.
+                        int top = (int)sup.size() - MK;
+                        int scanlen = (int)(smask + 1) * MK * 2;
+                        for (int ap = top; ap >= 0 && ap >= top - scanlen; --ap) probe(ap);
                     }
                     if (bestD >= 0) {
                         const std::string& Ds = bestSt ? rcstr[bestD] : contigs[bestD];

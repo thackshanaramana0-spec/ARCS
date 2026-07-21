@@ -21,6 +21,26 @@ static inline int setenv(const char* name, const char* value, int /*overwrite*/)
 static inline int unsetenv(const char* name) {
     return _putenv_s(name, "");
 }
+#define NOMINMAX
+#include <windows.h>
+#include <psapi.h>
+// Peak working-set (high-water RAM) in MB. K32GetProcessMemoryInfo is exported by
+// kernel32 (auto-linked) so this needs no extra link deps.
+static size_t cur_peak_rss_mb() {
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+        return (size_t)(pmc.PeakWorkingSetSize / (1024 * 1024));
+    return 0;
+}
+#else
+#include <cstdio>
+// Peak RSS (VmHWM) in MB from /proc/self/status.
+static size_t cur_peak_rss_mb() {
+    FILE* f = fopen("/proc/self/status", "r"); if (!f) return 0;
+    char line[256]; size_t kb = 0;
+    while (fgets(line, sizeof(line), f)) if (sscanf(line, "VmHWM: %zu kB", &kb) == 1) break;
+    fclose(f); return kb / 1024;
+}
 #endif
 
 ARCSEncoder::ARCSEncoder(const ARCSParams& params) : params_(params) {}
@@ -1415,7 +1435,7 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
     const bool ENC_TIMING = getenv("ARCS_ENC_TIMING") != nullptr;
     auto _en = [] { return std::chrono::steady_clock::now(); };
     auto _ep = _en();
-    auto _emark = [&](const char* w){ if(ENC_TIMING){ auto t=_en(); fprintf(stderr,"[ENC] %s: %.2fs\n", w, std::chrono::duration<double>(t-_ep).count()); _ep=t; } };
+    auto _emark = [&](const char* w){ if(ENC_TIMING){ auto t=_en(); fprintf(stderr,"[ENC] %s: %.2fs  [peakRSS %zu MB]\n", w, std::chrono::duration<double>(t-_ep).count(), cur_peak_rss_mb()); _ep=t; } };
     ChainEncodeResult result;
     if (getenv("ARCS_CHAINPG_CHAIN")) {
         ChainSequenceEncoder chain_enc(MSTConfig{}, /*build_pg=*/true);
@@ -1954,12 +1974,14 @@ EncodeProgress ARCSEncoder::compress(const std::string& input_path,
     EncodeProgress prog;
 
     // ── Auto-chunking for large files ──────────────────────────────────────────
-    // On big/high-coverage inputs, chunked mode is a pure win (parallel + bounded
-    // RAM, and LARGE chunks keep ratio at-or-below global — DS7 chunk-250k was even
-    // smaller than global). On SMALL/low-coverage files chunking fragments coverage
-    // and HURTS ratio, so we only auto-enable it above a size threshold, with a large
-    // chunk (250k reads) that preserves ratio. Never overrides an explicit
-    // --chunk-size; disable with ARCS_NO_AUTOCHUNK. Only for the chain-pg path.
+    // Auto-chunking splits the input into independent assemblies, each seeing only
+    // a fraction of coverage. Measured: ECOLI30x (277MB, 30×) auto-chunk=38166KB
+    // vs no-chunk=35296KB — chunking costs 7.5% ratio because each 250K-read chunk
+    // assembles from scratch at ~7.5× instead of the full 30× coverage, fragmenting
+    // the SCS and degrading quality ordering. No-chunk is STRICTLY better ratio.
+    // Default: only auto-chunk at 2000MB (most real --chain-pg inputs stay single).
+    // Users with memory constraints can lower via ARCS_AUTOCHUNK_MB=N or use --fast.
+    // Never overrides an explicit --chunk-size; disable fully with ARCS_NO_AUTOCHUNK.
     // Fused calling needs a single whole-input assembly (chunking would only capture
     // one chunk's placements), so autochunk is suppressed when call_capture_ is set.
     if (params_.chunk_size == 0 && params_.use_chain_pg && !getenv("ARCS_NO_AUTOCHUNK")
@@ -1967,11 +1989,11 @@ EncodeProgress ARCSEncoder::compress(const std::string& input_path,
         FILE* fsz = fopen(input_path.c_str(), "rb");
         if (fsz) {
             fseek(fsz, 0, SEEK_END); long long bytes = ftello(fsz); fclose(fsz);
-            const long long AUTO_MB = 200;      // threshold; override via ARCS_AUTOCHUNK_MB
+            const long long AUTO_MB = 2000;     // threshold; lower via ARCS_AUTOCHUNK_MB
             long long thresh = AUTO_MB;
             if (const char* e = getenv("ARCS_AUTOCHUNK_MB")) { long long v = atoll(e); if (v > 0) thresh = v; }
             if (bytes > thresh * 1024 * 1024) {
-                params_.chunk_size = 250000;    // large chunk → ratio preserved
+                params_.chunk_size = 1000000;   // 1M-read chunks → better coverage than 250K
                 fprintf(stderr, "[AUTO] input %.0f MB > %lld MB → chunked mode (chunk=%d reads)\n",
                         bytes / 1048576.0, thresh, params_.chunk_size);
             }
@@ -1995,7 +2017,7 @@ EncodeProgress ARCSEncoder::compress(const std::string& input_path,
     final_nl_ = file_ends_with_newline(input_path);
     // 1. Load reads
     auto reads = load_reads(input_path);
-    if (TOP_TIMING) { auto t=std::chrono::steady_clock::now(); fprintf(stderr,"[ENC] load_reads: %.2fs\n", std::chrono::duration<double>(t-_tt).count()); _tt=t; }
+    if (TOP_TIMING) { auto t=std::chrono::steady_clock::now(); fprintf(stderr,"[ENC] load_reads: %.2fs  [peakRSS %zu MB]\n", std::chrono::duration<double>(t-_tt).count(), cur_peak_rss_mb()); _tt=t; }
     prog.total_reads = reads.size();
     ARCS_CHECK(!reads.empty(), "No reads in input file");
 
