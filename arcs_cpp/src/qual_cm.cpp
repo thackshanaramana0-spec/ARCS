@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 #include <thread>
 
 namespace {
@@ -270,23 +271,22 @@ inline uint64_t lo_key(const CtxState& s, int j, int L, int qmax) {
 //             {q1,q2,pos} parent removes its cold-start cost.
 //   else    : parent = {q1,q2,pos}; coded = full quality context (q1,q2,ceil,vol,
 //             pos,is_dev) — the quality-history model used when no sequence given.
+// qmb: mate-quality bin (0=<10, 1=10-20, 2=20-30, 3=>=30, 4=no-mate/R1/SE).
+// Added ONLY to coded_k so the dense parent (lo) stays warm without the extra
+// dimension. The interpolation backoff absorbs cold-start for new qmb contexts.
 inline void keys(const CtxState& s, int j, int L, int is_dev, int qmax,
-                 const std::string* seq, uint64_t& parent_k, uint64_t& coded_k, int use_seq) {
-    // Fused key build: compute the shared sub-terms (posbin divide + the two qmax
-    // clamps) ONCE instead of recomputing them in both lo_key and ctx_key. Produces
-    // BIT-IDENTICAL keys to the split lo_key/ctx_key path (same arithmetic, same
-    // order) — zero ratio change, just fewer per-symbol ops in the hot loop.
+                 const std::string* seq, uint64_t& parent_k, uint64_t& coded_k,
+                 int use_seq, int qmb = 4) {
     const uint32_t q1c = (uint32_t)std::min(s.q1, qmax);
     const uint32_t q2c = (uint32_t)std::min(s.q2, qmax);
     const uint32_t pb  = (uint32_t)posbin(j, L);
-    // parent = low-order {q1,q2,pos,run}
     uint64_t lk = q1c;
     lk = lk * 48u + q2c;
     lk = lk * 8u  + pb;
     lk = lk * 8u  + (uint32_t)s.run;
-    parent_k = lk;
+    parent_k = lk;                               // parent unchanged — stays dense
     if (use_seq) {
-        coded_k = lk * 125u + (uint32_t)seq3(seq, j, L);
+        coded_k = (lk * 125u + (uint32_t)seq3(seq, j, L)) * 5u + (uint32_t)qmb;
     } else {
         const uint32_t ceilb = (uint32_t)std::min(s.ceil / 3, 15);
         const uint32_t volb  = (uint32_t)std::min(s.vol / 8, 3);
@@ -297,7 +297,7 @@ inline void keys(const CtxState& s, int j, int L, int is_dev, int qmax,
         k = k * 8u  + pb;
         k = k * 8u  + (uint32_t)s.run;
         k = k * 2u  + (uint32_t)(is_dev ? 1 : 0);
-        coded_k = k;
+        coded_k = k * 5u + (uint32_t)qmb;
     }
 }
 
@@ -310,23 +310,35 @@ static std::vector<uint8_t> encode_block(
     const std::vector<std::vector<uint8_t>>& rq,
     const std::vector<uint32_t>& order, size_t begin, size_t end,
     const std::vector<std::vector<bool>>& dev_sets, int L,
-    const std::vector<std::string>* seqs, int qmax, QcmCfg cfg) {
+    const std::vector<std::string>* seqs, int qmax, QcmCfg cfg, bool is_pe) {
     FreqMap tbl(15), lo(12);
     RangeEnc enc;
     uint32_t cf[QA];
+    // Track which R1 indices were processed before their R2 in this block.
+    // Encoder and decoder make the identical decision (same order, same set) → lossless.
+    std::unordered_set<uint32_t> seen;
     for (size_t oi = begin; oi < end; ++oi) {
         uint32_t idx = order[oi];
-        if (idx >= rq.size()) continue;
+        if (idx >= rq.size()) { seen.insert(idx); continue; }
         const auto& r = rq[idx];
         const bool has_dev = idx < dev_sets.size();
         const std::string* seq = (seqs && idx < seqs->size()) ? &(*seqs)[idx] : nullptr;
         const int RL = (int)r.size();
+        // R2 with mate already encoded in this block → mate quality available
+        bool has_mate = is_pe && (idx & 1) && idx > 0 && seen.count(idx - 1) &&
+                        (idx - 1) < rq.size();
+        const std::vector<uint8_t>* mq = has_mate ? &rq[idx - 1] : nullptr;
         CtxState s;
         for (int j = 0; j < RL; ++j) {
             int q = r[j];
             if (q > qmax) q = qmax;
             int is_dev = (has_dev && j < (int)dev_sets[idx].size() && dev_sets[idx][j]) ? 1 : 0;
-            uint64_t pk, ck; keys(s, j, L, is_dev, qmax, seq, pk, ck, cfg.use_seq);
+            int qmb = 4; // no-mate / R1 / SE sentinel
+            if (mq && j < (int)mq->size()) {
+                int qm = (*mq)[j];
+                qmb = qm < 10 ? 0 : qm < 20 ? 1 : qm < 30 ? 2 : 3;
+            }
+            uint64_t pk, ck; keys(s, j, L, is_dev, qmax, seq, pk, ck, cfg.use_seq, qmb);
             Freq& FP = lo.get(pk);
             Freq& FC = tbl.get(ck);
             uint32_t tot = build_cf(FC, FP, qmax, cf, cfg.qcm_k);
@@ -335,6 +347,7 @@ static std::vector<uint8_t> encode_block(
             FC.update(q, cfg.freq_inc); FP.update(q, cfg.freq_inc);
             s.advance(q);
         }
+        seen.insert(idx);
     }
     enc.flush();
     return std::move(enc.out);
@@ -345,10 +358,13 @@ static bool decode_block(
     const std::vector<uint32_t>& order, size_t begin, size_t end,
     const std::vector<std::vector<bool>>& dev_sets, int L,
     std::vector<std::vector<uint8_t>>& rq_out,
-    const std::vector<std::string>* seqs, const std::vector<int>* rlens, int qmax, QcmCfg cfg) {
+    const std::vector<std::string>* seqs, const std::vector<int>* rlens, int qmax, QcmCfg cfg,
+    bool is_pe) {
     FreqMap tbl(15), lo(12);
     RangeDec dec(p, e);
     uint32_t cf[QA];
+    // Tracks which indices in this block have been fully decoded (for mate-context lookup).
+    std::vector<bool> decoded(rq_out.size(), false);
     for (size_t oi = begin; oi < end; ++oi) {
         uint32_t idx = order[oi];
         if (idx >= rq_out.size()) return false;
@@ -357,10 +373,19 @@ static bool decode_block(
         r.assign((size_t)RL, 0);
         const bool has_dev = idx < dev_sets.size();
         const std::string* seq = (seqs && idx < seqs->size()) ? &(*seqs)[idx] : nullptr;
+        // R2 with R1 already decoded in this block → mate quality available
+        bool has_mate = is_pe && (idx & 1) && idx > 0 && idx - 1 < decoded.size() &&
+                        decoded[idx - 1] && !rq_out[idx - 1].empty();
+        const std::vector<uint8_t>* mq = has_mate ? &rq_out[idx - 1] : nullptr;
         CtxState s;
         for (int j = 0; j < RL; ++j) {
             int is_dev = (has_dev && j < (int)dev_sets[idx].size() && dev_sets[idx][j]) ? 1 : 0;
-            uint64_t pk, ck; keys(s, j, L, is_dev, qmax, seq, pk, ck, cfg.use_seq);
+            int qmb = 4;
+            if (mq && j < (int)mq->size()) {
+                int qm = (*mq)[j];
+                qmb = qm < 10 ? 0 : qm < 20 ? 1 : qm < 30 ? 2 : 3;
+            }
+            uint64_t pk, ck; keys(s, j, L, is_dev, qmax, seq, pk, ck, cfg.use_seq, qmb);
             Freq& FP = lo.get(pk);
             Freq& FC = tbl.get(ck);
             uint32_t tot = build_cf(FC, FP, qmax, cf, cfg.qcm_k);
@@ -373,6 +398,7 @@ static bool decode_block(
             r[j] = (uint8_t)q;
             s.advance(q);
         }
+        decoded[idx] = true;
     }
     return true;
 }
@@ -409,7 +435,8 @@ std::vector<uint8_t> qual_cm_encode(
     const std::vector<uint32_t>&             order,
     const std::vector<std::vector<bool>>&    dev_sets,
     int                                      L,
-    const std::vector<std::string>*          seqs) {
+    const std::vector<std::string>*          seqs,
+    bool                                     is_pe) {
 
     int qmax = 0;
     for (uint32_t idx : order) {
@@ -428,28 +455,35 @@ std::vector<uint8_t> qual_cm_encode(
     int nb = choose_nblocks(n);
     std::vector<size_t> bnd(nb + 1);
     for (int b = 0; b <= nb; ++b) bnd[b] = n * (size_t)b / (size_t)nb;
+    // For PE mate-context, block boundaries must fall on even indices so R1 and R2
+    // from each pair stay in the same block (mate quality is local to the block).
+    if (is_pe && nb > 1) {
+        for (int b = 1; b < nb; ++b)
+            if (bnd[b] & 1) ++bnd[b]; // round up to even
+    }
 
     std::vector<std::vector<uint8_t>> parts((size_t)nb);
     if (nb == 1) {
-        parts[0] = encode_block(rq, order, bnd[0], bnd[1], dev_sets, L, seqs, qmax, cfg);
+        parts[0] = encode_block(rq, order, bnd[0], bnd[1], dev_sets, L, seqs, qmax, cfg, is_pe);
     } else {
         std::vector<std::thread> th;
         th.reserve((size_t)nb);
         for (int b = 0; b < nb; ++b)
             th.emplace_back([&, b] {
-                parts[(size_t)b] = encode_block(rq, order, bnd[b], bnd[b+1], dev_sets, L, seqs, qmax, cfg);
+                parts[(size_t)b] = encode_block(rq, order, bnd[b], bnd[b+1], dev_sets, L, seqs, qmax, cfg, is_pe);
             });
         for (auto& t : th) t.join();
     }
 
-    // Header: qmax, freq_inc, use_seq, qcm_k, nblocks, [nblocks × uint32 length], payloads…
+    // Header: qmax, freq_inc, use_seq_flags, qcm_k, nblocks, [nblocks × uint32 length], payloads…
+    // use_seq_flags: bit0 = use_seq, bit1 = is_pe (inter-mate quality context)
     std::vector<uint8_t> out;
     size_t tot = 5 + (size_t)nb * 4;
     for (auto& p : parts) tot += p.size();
     out.reserve(tot);
     out.push_back((uint8_t)qmax);
     out.push_back((uint8_t)cfg.freq_inc);
-    out.push_back((uint8_t)cfg.use_seq);
+    out.push_back((uint8_t)((cfg.use_seq ? 0x01 : 0) | (is_pe ? 0x02 : 0)));
     out.push_back((uint8_t)cfg.qcm_k);
     out.push_back((uint8_t)nb);
     for (auto& p : parts) put_u32(out, (uint32_t)p.size());
@@ -470,11 +504,13 @@ bool qual_cm_decode(
     const int qmax = data[0];
     QcmCfg cfg;
     cfg.freq_inc = data[1];
-    cfg.use_seq  = data[2];
+    const uint8_t use_seq_flags = data[2];
+    cfg.use_seq  = (use_seq_flags & 0x01) ? 1 : 0;
+    const bool is_pe = (use_seq_flags & 0x02) != 0;
     cfg.qcm_k    = data[3];
     const int nb = data[4];
     if (qmax < 0 || qmax > QA - 1 || cfg.freq_inc < 1 || cfg.freq_inc > 200 ||
-        cfg.use_seq < 0 || cfg.use_seq > 1 || cfg.qcm_k < 1 || cfg.qcm_k > 255 ||
+        use_seq_flags > 3 || cfg.qcm_k < 1 || cfg.qcm_k > 255 ||
         nb < 1 || nb > 64) return false;
     if (cfg.use_seq && !seqs) return false;
 
@@ -488,6 +524,11 @@ bool qual_cm_decode(
     const size_t n = order.size();
     std::vector<size_t> bnd(nb + 1);
     for (int b = 0; b <= nb; ++b) bnd[b] = n * (size_t)b / (size_t)nb;
+    // Mirror the encoder's even-boundary rounding for PE blocks
+    if (is_pe && nb > 1) {
+        for (int b = 1; b < nb; ++b)
+            if (bnd[b] & 1) ++bnd[b];
+    }
 
     // Block byte offsets
     std::vector<size_t> off((size_t)nb + 1);
@@ -499,7 +540,7 @@ bool qual_cm_decode(
         const uint8_t* p = data.data() + off[(size_t)b];
         const uint8_t* e = data.data() + off[(size_t)b+1];
         ok[(size_t)b] = decode_block(p, e, order, bnd[b], bnd[b+1],
-                                     dev_sets, L, rq_out, seqs, rlens, qmax, cfg) ? 1 : 0;
+                                     dev_sets, L, rq_out, seqs, rlens, qmax, cfg, is_pe) ? 1 : 0;
     };
     if (nb == 1) {
         run(0);

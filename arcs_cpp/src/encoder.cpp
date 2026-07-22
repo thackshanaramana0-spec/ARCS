@@ -1803,12 +1803,31 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
                 for (size_t i = 0; i < reads.size(); ++i) seqvec[i] = reads[i].seq;
                 seqp = &seqvec;
             }
+            // Detect interleaved paired-end: sample 200 consecutive pairs; if >90%
+            // share the same base name (only /1 vs /2 differs), condition R2 quality
+            // on its R1 mate's quality at each position.
+            bool qual_is_pe = false;
+            if (reads.size() >= 4 && reads.size() % 2 == 0) {
+                auto sm = [](const std::string& nm) -> size_t {
+                    size_t t = nm.size();
+                    if (t >= 2 && nm[t-2] == '/' && (nm[t-1]=='1'||nm[t-1]=='2')) t -= 2;
+                    return t;
+                };
+                size_t samp = std::min(reads.size(), (size_t)400);
+                int matches = 0, total = 0;
+                for (size_t i = 0; i + 1 < samp; i += 2) {
+                    size_t b0 = sm(reads[i].name), b1 = sm(reads[i+1].name);
+                    if (b0 == b1 && reads[i].name.compare(0,b0,reads[i+1].name,0,b1)==0) ++matches;
+                    ++total;
+                }
+                qual_is_pe = (total > 0 && matches * 10 >= total * 9);
+            }
             auto _c2 = std::chrono::steady_clock::now();
-            auto cm = qual_cm_encode(rq, result.chain_order, orig_dev_sets, L, seqp);
+            auto cm = qual_cm_encode(rq, result.chain_order, orig_dev_sets, L, seqp, qual_is_pe);
             if (ENC_TIMING) fprintf(stderr, "[ENC]   qual.adaptive-CM: %.2fs\n",
                 std::chrono::duration<double>(std::chrono::steady_clock::now()-_c2).count());
             if (force_both && seqp) {   // exact keep-smaller (opt-in, 2× quality time)
-                auto cm_ns = qual_cm_encode(rq, result.chain_order, orig_dev_sets, L, nullptr);
+                auto cm_ns = qual_cm_encode(rq, result.chain_order, orig_dev_sets, L, nullptr, qual_is_pe);
                 if (cm_ns.size() < cm.size()) cm = std::move(cm_ns);
             }
             size_t cm_tot = cm.size() + 1;   // +1 for the 0x07 mode byte

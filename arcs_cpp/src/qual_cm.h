@@ -23,12 +23,17 @@
 // cannot exploit. Measured −10.65% on held-out data (see QUALITY_SOTA.md). The
 // decoder passes the reconstructed sequence (available before quality), so it is
 // lossless and stores nothing. When null, behaviour is the quality-history model.
+// is_pe: when true, quality CM conditions R2 reads (odd original index) on the
+// corresponding R1 mate's quality at each position. Both encoder and decoder
+// apply the same mate-availability rule (R1 must be processed first within the
+// same block), so the model is self-consistent and lossless.
 std::vector<uint8_t> qual_cm_encode(
     const std::vector<std::vector<uint8_t>>& rq,
     const std::vector<uint32_t>&             order,
     const std::vector<std::vector<bool>>&    dev_sets,
     int                                      L,
-    const std::vector<std::string>*          seqs = nullptr);
+    const std::vector<std::string>*          seqs  = nullptr,
+    bool                                     is_pe = false);
 
 // Decodes a stream produced by qual_cm_encode into rq_out (indexed by read index,
 // same frame as `order`). rq_out is sized [max(order)+1][L]. Returns false on a
