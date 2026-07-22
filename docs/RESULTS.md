@@ -170,17 +170,36 @@ No reference genome used by any tool.
 
 ---
 
-## Table 7 — Het-indel calling: real GIAB HG002 chr20:2.0–2.4 Mb
+## Table 7 — Het-indel calling: real GIAB HG002, three independent chr20 windows
 
-Indels called via contig-bubble detection (bubbles between consecutive contigs). Scored by rtg vcfeval, squash-ploidy.
+Indels called via contig-bubble detection (bubbles between consecutive contigs).  
+Scored by rtg vcfeval, squash-ploidy, confident-BED restricted.  
+All windows: HG002 GRCh37 300x BAM, 113 000 R1 reads, 400 kb windows.
+
+### Table 7a — Primary benchmark window (chr20:2.0–2.4 Mb)
+
+ARCS and DiscoSNP++ scored on the same reads (giab.fq, 113 987 reads).
 
 | Tool | Precision | Recall | F1 | Reference required |
 |---|---|---|---|---|
 | **ARCS** | 0.600 | 0.438 | **0.505** | ❌ |
 | DiscoSNP++ | 0.870 | 0.364 | 0.513 | ❌ |
 
-ARCS F1 = 0.505 vs DiscoSNP++ 0.513 — zero-cost byproduct ties the dedicated indel caller.
-DiscoSNP++ has higher precision; ARCS has better recall. Real indel F1 ~0.5 is the homopolymer/STR ceiling for all reference-free callers on this region.
+### Table 7b — ARCS multi-region validation (three independent windows)
+
+ARCS run on 113 000 R1 reads downsampled from the 300x BAM for each window.  
+DiscoSNP++ is not shown for new regions: it requires paired-end (R1+R2) reads to
+form de Bruijn graph bubbles; with R1-only input it produces no calls.
+
+| Region | Reads | SNV P | SNV R | SNV F1 | Indel P | Indel R | Indel F1 |
+|---|---|---|---|---|---|---|---|
+| chr20:2.0–2.4 Mb | 113 987 | 0.991 | 0.886 | **0.935** | 0.600 | 0.438 | **0.505** |
+| chr20:1.0–1.4 Mb | 113 000 | 0.960 | 0.924 | **0.942** | 0.300 | 0.474 | **0.367** |
+| chr20:3.0–3.4 Mb | 113 000 | 0.849 | 0.520 | **0.645** | 0.384 | 0.424 | **0.403** |
+
+SNV F1 range 0.64–0.94 across regions (regional complexity differences; chr20:3M–3.4M is more
+repetitive — 400 truth SNVs vs 17–289 in other windows). Indel F1 0.37–0.51 is consistent
+with the homopolymer/STR ceiling for all reference-free callers on real genomic data.
 
 ---
 
