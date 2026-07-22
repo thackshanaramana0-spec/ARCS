@@ -31,6 +31,8 @@ static void print_usage(const char* prog) {
         "  %s call        <reads.fastq[.gz]> <out.vcf>   (reference-free SNV calling)\n"
         "  %s compress --call <out.vcf> <reads.fastq[.gz]> <out.arcs>  (archive + call, one pass)\n\n"
         "Options (set before subcommand):\n"
+        "  --fast           fast mode: lean FCM (5 orders) + sparse merge/place + static quality;\n"
+        "                   speed/RAM optimized, always lossless; parallel encode phases preserved\n"
         "  --k <int>        k-mer size (default: auto)\n"
         "  --w <int>        minimizer window (default: 10)\n"
         "  --mink <int>     minimizer k (default: 15)\n"
@@ -71,6 +73,17 @@ int main(int argc, char** argv) {
         else if (opt == "--no-mst")         params.use_mst      = false;
         else if (opt == "--chain")          { params.use_chain = true; params.use_mst = false; }
         else if (opt == "--chain-pg")       { params.use_chain_pg = true; params.use_chain = false; params.use_mst = false; }
+        else if (opt == "--fast")           { params.use_chain_pg = true; params.use_chain = false; params.use_mst = false;
+                                              // --fast: lean FCM (5 orders) + sparse merge/place index + static quality coder.
+                                              // Each of these genuinely trades ratio for speed/RAM.
+                                              // ARCS_ENC_NOPAR is intentionally NOT set: the three heavy phases (pg compress,
+                                              // quality CM, names LZMA-9) run concurrently as async futures. On GIAB that
+                                              // parallelism saves ~8-9s wall-time; serializing them would cost more than the
+                                              // lean-FCM saves. NOPAR is only useful if the user needs to cap peak RAM below
+                                              // the sum of all three phases — available via ARCS_ENC_NOPAR=1 env var.
+                                              SET_ENV("ARCSDNA_ORDERS", "2,4,8,14,22");
+                                              SET_ENV("ARCS_MERGE_SPARSE", "8"); SET_ENV("ARCS_PLACE_SPARSE", "4");
+                                              SET_ENV("ARCS_QUAL_NOCM", "1"); }
         else { fprintf(stderr, "Unknown option: %s\n", opt.c_str()); return 1; }
     }
 
@@ -85,6 +98,10 @@ int main(int argc, char** argv) {
             std::string opt = argv[i++];
             if      (opt == "--chain")    { params.use_chain = true; params.use_mst = false; }
             else if (opt == "--chain-pg") { params.use_chain_pg = true; params.use_chain = false; params.use_mst = false; }
+            else if (opt == "--fast")     { params.use_chain_pg = true; params.use_chain = false; params.use_mst = false;
+                                            SET_ENV("ARCSDNA_ORDERS", "2,4,8,14,22");
+                                            SET_ENV("ARCS_MERGE_SPARSE", "8"); SET_ENV("ARCS_PLACE_SPARSE", "4");
+                                            SET_ENV("ARCS_QUAL_NOCM", "1"); }
             else if (opt == "--no-mst")   { params.use_mst   = false; }
             else if (opt == "--chunk-size" && i < argc) params.chunk_size = std::stoi(argv[i++]);
             else if (opt == "--call" && i < argc) { call_vcf = argv[i++]; params.use_chain_pg = true; params.use_chain = false; params.use_mst = false; }
