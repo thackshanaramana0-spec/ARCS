@@ -909,6 +909,9 @@ struct KmerIndex {
     // with large contigs/buckets (human WGS) where lookups dominate the merge. After
     // this, hhead[slot] = start index into cval, hcnt[slot] = length.
     void finalize() {
+        // htail is only used during insert() to maintain the linked-list tail pointer.
+        // Free it now before allocating cval so the peak during compaction is lower.
+        { std::vector<int32_t>().swap(htail); }
         cval.resize(pval.size());
         size_t w = 0;
         for (size_t s = 0; s <= mask; ++s) {
