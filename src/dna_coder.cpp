@@ -781,28 +781,16 @@ std::string dna_decode(const std::vector<uint8_t>& data, const std::string& seed
 // Ratio cost vs FCM: ~5-20% larger on human pg (FCM models long-range repeats
 // via high-order context; LZMA's sliding window is shorter).
 
-static std::vector<uint8_t> vle_pack(const std::string& pg) {
-    size_t N = pg.size();
-    std::vector<uint8_t> out((N + 3) / 4, 0);
-    for (size_t i = 0; i < N; i++)
-        out[i >> 2] |= (uint8_t)(b2i(pg[i]) << (6 - 2 * (int)(i & 3)));
-    return out;
-}
-
-static std::string vle_unpack(const std::vector<uint8_t>& packed, size_t N) {
-    std::string pg(N, 'A');
-    for (size_t i = 0; i < N; i++)
-        pg[i] = i2b((packed[i >> 2] >> (6 - 2 * (int)(i & 3))) & 3);
-    return pg;
-}
-
+// Plain LZMA-9 on ASCII pg text — no 2-bit packing.
+// Zero regression on datasets where LZMA already beats FCM (bacterial/DS1).
+// Some ratio cost on human WGS where FCM exploits long-range repeats.
 std::vector<uint8_t> vle_encode_pg(const std::string& pg) {
     size_t N = pg.size();
     std::vector<uint8_t> out(8, 0);
     for (int i = 0; i < 8; i++) out[i] = (uint8_t)((uint64_t)N >> ((7 - i) * 8));
     if (N == 0) return out;
-    auto packed = vle_pack(pg);
-    auto comp   = arcs_compress(packed, 9);
+    std::vector<uint8_t> bytes(pg.begin(), pg.end());
+    auto comp = arcs_compress(bytes, 9);
     out.insert(out.end(), comp.begin(), comp.end());
     return out;
 }
@@ -812,10 +800,10 @@ std::string vle_decode_pg(const std::vector<uint8_t>& data) {
     uint64_t N = 0;
     for (int i = 0; i < 8; i++) N = (N << 8) | data[i];
     if (N == 0) return {};
-    auto packed_comp = std::vector<uint8_t>(data.begin() + 8, data.end());
-    auto packed = arcs_decompress(packed_comp.data(), packed_comp.size());
-    if (packed.empty()) return {};
-    return vle_unpack(packed, (size_t)N);
+    auto comp = std::vector<uint8_t>(data.begin() + 8, data.end());
+    auto raw  = arcs_decompress(comp.data(), comp.size());
+    if (raw.empty()) return {};
+    return std::string(raw.begin(), raw.end());
 }
 
 // ── compute_pg_surprise (idea B) ──────────────────────────────────────────────

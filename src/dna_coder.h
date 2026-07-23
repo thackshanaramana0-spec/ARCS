@@ -35,10 +35,10 @@ std::vector<uint8_t> dna_encode(
 std::string dna_decode(const std::vector<uint8_t>& data,
                        const std::string&           seed = "");
 
-// ── VLE + LZMA pseudogenome backend ──────────────────────────────────────────
-// Alternative to adaptive FCM: 2-bit pack (4 bases/byte) + LZMA-9.
-// Trades ratio (~5-20% larger on human pg) for fast independent decode
-// (~10-50ms vs ~1-2s for FCM) — enables Genozip-class decompress on blocks.
+// ── LZMA-ASCII pseudogenome backend (fast-decode mode) ───────────────────────
+// Alternative to adaptive FCM: plain LZMA-9 on raw ASCII pg text.
+// Used by ARCS_PG_FAST_DECODE=1. Trades ~0.23% ratio (GIAB) for 2.8× faster
+// decompress (1.0s vs 2.8s) — LZMA streaming replay vs FCM adaptive re-training.
 // Same 8-byte pg_len header as dna_encode for symmetric format handling.
 std::vector<uint8_t> vle_encode_pg(const std::string& pg);
 std::string          vle_decode_pg(const std::vector<uint8_t>& data);
