@@ -8,7 +8,7 @@ v4.6 (built from source).
 ## Full-archive result (bytes)
 | tool | archive | lossless? |
 |---|---|---|
-| **ARCS (--chain-pg)** | **4,227,376** | **YES (verified paste|sort|cmp)** |
+| **ARCS** | **4,310,976** | **YES (verified paste|sort|cmp)** |
 | fqzcomp v4.6 | 7,258,815 | NO on this data (see below) |
 | PgRC2 (default) | 245,363 | NO — lossy quality |
 
