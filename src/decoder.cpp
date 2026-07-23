@@ -1093,6 +1093,48 @@ static std::string decompress_pg(const std::vector<uint8_t>& blob) {
         std::string pg; for (auto& p : parts) pg += p;
         return pg;
     }
+    if (flag == 0x07) {
+        // Multi-codec multi-block: [0x07][nb][nb×u32 len][nb×26 seed][nb×1 codec_id][payloads]
+        // codec_id 0x00 = ARCS adaptive FCM (seeded); 0x01 = VLE 2-bit + LZMA-9.
+        static const int SEED_LEN = 26;
+        if (blob.size() < 2) return {};
+        int nb = blob[1];
+        if (nb < 1 || nb > 64) return {};
+        size_t hdr = 2 + (size_t)nb * 4 + (size_t)nb * SEED_LEN + (size_t)nb;
+        if (blob.size() < hdr) return {};
+        std::vector<uint32_t> len((size_t)nb); size_t total = hdr;
+        for (int b = 0; b < nb; ++b) {
+            len[(size_t)b] = (uint32_t)blob[2+b*4] | ((uint32_t)blob[3+b*4]<<8)
+                           | ((uint32_t)blob[4+b*4]<<16) | ((uint32_t)blob[5+b*4]<<24);
+            total += len[(size_t)b];
+        }
+        if (total != blob.size()) return {};
+        size_t seed_base   = 2 + (size_t)nb * 4;
+        size_t codec_base  = seed_base + (size_t)nb * SEED_LEN;
+        std::vector<std::string> seeds((size_t)nb);
+        std::vector<uint8_t>    codec_ids((size_t)nb);
+        for (int b = 0; b < nb; ++b) {
+            seeds[(size_t)b] = std::string(
+                blob.begin() + seed_base + (size_t)b * SEED_LEN,
+                blob.begin() + seed_base + (size_t)b * SEED_LEN + SEED_LEN);
+            codec_ids[(size_t)b] = blob[codec_base + (size_t)b];
+        }
+        std::vector<size_t> off((size_t)nb + 1); off[0] = hdr;
+        for (int b = 0; b < nb; ++b) off[(size_t)b+1] = off[(size_t)b] + len[(size_t)b];
+        std::vector<std::string> parts((size_t)nb);
+        std::vector<std::thread> th; th.reserve((size_t)nb);
+        for (int b = 0; b < nb; ++b)
+            th.emplace_back([&, b] {
+                std::vector<uint8_t> chunk(blob.begin() + off[(size_t)b], blob.begin() + off[(size_t)b+1]);
+                if (codec_ids[(size_t)b] == 0x01)
+                    parts[(size_t)b] = vle_decode_pg(chunk);
+                else
+                    parts[(size_t)b] = dna_decode(chunk, seeds[(size_t)b]);
+            });
+        for (auto& t : th) t.join();
+        std::string pg; for (auto& p : parts) pg += p;
+        return pg;
+    }
     if (flag == 0x01) {
         auto raw = arcs_decompress(payload, plen);
         return std::string(raw.begin(), raw.end());

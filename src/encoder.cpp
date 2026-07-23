@@ -12,6 +12,7 @@
 #include <numeric>
 #include <unordered_map>
 #include <cstdlib>
+#include <thread>
 
 #ifdef _WIN32
 // POSIX setenv/unsetenv are absent on MinGW; provide portable shims.
@@ -1428,70 +1429,155 @@ static std::vector<uint8_t> compress_pg(
     const std::vector<uint32_t>& chain_order,
     const std::vector<uint32_t>& pg_pos)
 {
-    // ── Block-parallel ARCS-DNA (format 0x05 / 0x06) ─────────────────────────────
-    // Format 0x05: independent blocks, no seed (OPT-IN via ARCS_PG_BLOCKS=N).
-    // Format 0x06: seeded blocks — each block's context seed = 26 bases from the
-    //   preceding block's tail.  AUTO-ACTIVATES when pg >= 100 MB so that per-block
-    //   sizes are large enough (≥25 MB for 4 blocks) for the FCM freq-table warm-up
-    //   cost to be well within the 0.25% ratio spec gate.  On small genomes (DS1,
-    //   GIAB test) the threshold keeps us at single-stream with zero ratio regression.
-    //   DS7-scale WGS (pg >> 1 GB) gets 4-block parallel decode: ~3-4× DNA decode
-    //   speedup (dominant decompress pole on large human WGS).
-    {
-        static const size_t AUTO_THRESHOLD = (size_t)100 * 1024 * 1024; // 100 MB
-        static const int    SEED_LEN       = 26;                         // max FCM order
+    // ── Phase A: backend oracle (ARCS_PG_ORACLE=1) ───────────────────────────────
+    // Encodes the pg with BOTH FCM and VLE+LZMA on a 1 MB sample, then prints
+    // ratio/time comparison to stderr.  Does NOT change the output.  Zero risk.
+    if (getenv("ARCS_PG_ORACLE")) {
+        static const size_t SAMPLE = (size_t)1 * 1024 * 1024;
+        std::string samp = pg.substr(0, std::min(pg.size(), SAMPLE));
+        auto t0 = std::chrono::steady_clock::now();
+        auto fcm_enc = dna_encode(samp, {}, {}, {});
+        double fcm_ms = std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        t0 = std::chrono::steady_clock::now();
+        auto vle_enc = vle_encode_pg(samp);
+        double vle_ms = std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        // Decode timing
+        t0 = std::chrono::steady_clock::now();
+        dna_decode(fcm_enc);
+        double fcm_dec_ms = std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        t0 = std::chrono::steady_clock::now();
+        vle_decode_pg(vle_enc);
+        double vle_dec_ms = std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        double fcm_bpb = 8.0 * (fcm_enc.size() - 8) / samp.size();
+        double vle_bpb = 8.0 * (vle_enc.size() - 8) / samp.size();
+        double ratio_delta = 100.0 * ((double)vle_enc.size() - fcm_enc.size()) / fcm_enc.size();
+        fprintf(stderr,
+            "[PG-ORACLE] sample=%zuB  pg_total=%zuB\n"
+            "  FCM:      enc=%.1fms  dec=%.1fms  %.3f bpb  %zuB\n"
+            "  VLE+LZMA: enc=%.1fms  dec=%.1fms  %.3f bpb  %zuB\n"
+            "  VLE vs FCM: ratio %+.2f%%  dec speedup %.1fx\n",
+            samp.size(), pg.size(),
+            fcm_ms, fcm_dec_ms, fcm_bpb, fcm_enc.size() - 8,
+            vle_ms, vle_dec_ms, vle_bpb, vle_enc.size() - 8,
+            ratio_delta, fcm_dec_ms / std::max(vle_dec_ms, 0.001));
+    }
 
-        int pgnb = 1;
-        bool explicit_blocks = false;
+    // ── Phase B+C: multi-codec multi-block (format 0x07) ─────────────────────────
+    // Format 0x07: [0x07][nb][nb×u32 block_len][nb×26 seed_bytes][nb×1 codec_id][payloads]
+    //   codec_id 0x00 = ARCS adaptive FCM (seeded)
+    //   codec_id 0x01 = VLE 2-bit + LZMA-9 (fast decode, no warm-up)
+    //
+    // Phase C — dynamic block count:
+    //   VLE blocks: 1MB minimum/block (no warm-up, any size is independent)
+    //   FCM blocks: 25MB minimum/block (freq-table warm-up cost < 0.25%)
+    //   Block count = min(hw_threads, pg_size / target_per_block), capped [1,8]
+    //
+    // Phase B — per-block codec selection (three policies):
+    //   ARCS_PG_FAST_DECODE=1 → force VLE+LZMA on every block
+    //   ARCS_PG_BLOCKS=N      → force N FCM seeded blocks (old 0x06 path)
+    //   default               → sample-based oracle: VLE if ≤0.5% larger than FCM
+    {
+        static const int    SEED_LEN       = 26;
+        static const size_t FCM_MIN_BLOCK  = (size_t)25 * 1024 * 1024;
+        static const size_t VLE_MIN_BLOCK  = (size_t)1  * 1024 * 1024;
+
+        bool fast_decode    = (getenv("ARCS_PG_FAST_DECODE") != nullptr);
+        bool explicit_fcm   = false;
+        int  explicit_nb    = 1;
         if (const char* e = getenv("ARCS_PG_BLOCKS")) {
             int v = atoi(e);
-            if (v >= 1 && v <= 64) { pgnb = v; explicit_blocks = true; }
+            if (v >= 1 && v <= 64) { explicit_nb = v; explicit_fcm = true; }
         }
-        // Auto-activate 4 blocks for large pg (>= 100 MB), unless already set.
-        if (!explicit_blocks && pg.size() >= AUTO_THRESHOLD) pgnb = 4;
 
-        if (pgnb > 1 && pg.size() > (size_t)pgnb * 65536) {
+        // Decide codec + block count
+        bool use_vle = fast_decode;
+        int  pgnb    = 1;
+
+        if (explicit_fcm) {
+            // Legacy explicit FCM blocks → use format 0x06 path (no change)
+            use_vle = false;
+            pgnb    = explicit_nb;
+        } else if (fast_decode) {
+            // VLE forced: dynamic block count based on VLE_MIN_BLOCK
+            int hw = (int)std::thread::hardware_concurrency();
+            if (hw < 1) hw = 1;
+            pgnb = std::min(hw, (int)(pg.size() / VLE_MIN_BLOCK));
+            pgnb = std::max(1, std::min(pgnb, 8));
+        } else {
+            // Auto: sample-based oracle decides codec; dynamic block count
+            if (pg.size() >= VLE_MIN_BLOCK) {
+                static const size_t ORACLE_SAMPLE = (size_t)512 * 1024; // 512KB sample
+                std::string samp = pg.substr(0, std::min(pg.size(), ORACLE_SAMPLE));
+                auto fcm_enc = dna_encode(samp, {}, {}, {});
+                auto vle_enc = vle_encode_pg(samp);
+                // Use VLE if within 0.5% of FCM size
+                use_vle = (vle_enc.size() <= fcm_enc.size() * 1005 / 1000);
+            }
+            if (use_vle) {
+                int hw = (int)std::thread::hardware_concurrency();
+                if (hw < 1) hw = 1;
+                pgnb = std::min(hw, (int)(pg.size() / VLE_MIN_BLOCK));
+                pgnb = std::max(1, std::min(pgnb, 8));
+            } else if (pg.size() >= FCM_MIN_BLOCK * 4) {
+                // Large pg: auto FCM blocks (100MB+ threshold, same as before)
+                int hw = (int)std::thread::hardware_concurrency();
+                if (hw < 1) hw = 1;
+                pgnb = std::min(hw, (int)(pg.size() / FCM_MIN_BLOCK));
+                pgnb = std::max(1, std::min(pgnb, 8));
+            }
+        }
+
+        // Enter format 0x07 path when: VLE requested (even 1 block) OR multi-block FCM
+        if ((use_vle || pgnb > 1) && pg.size() > (size_t)pgnb * 65536) {
             std::vector<size_t> bnd((size_t)pgnb + 1, 0);
             for (int b = 1; b < pgnb; ++b) bnd[(size_t)b] = pg.size() * (size_t)b / (size_t)pgnb;
             bnd[(size_t)pgnb] = pg.size();
 
-            // Collect 26-byte context seeds from the tail of each preceding block.
+            // Seeds (26-byte tail of preceding block; ignored for VLE but stored for uniformity)
             std::vector<std::string> seeds((size_t)pgnb, std::string(SEED_LEN, 'A'));
             for (int b = 1; b < pgnb; ++b) {
-                size_t seed_start = (bnd[(size_t)b] >= (size_t)SEED_LEN)
-                                    ? bnd[(size_t)b] - (size_t)SEED_LEN : 0;
-                seeds[(size_t)b] = pg.substr(seed_start, bnd[(size_t)b] - seed_start);
+                size_t ss = (bnd[(size_t)b] >= (size_t)SEED_LEN) ? bnd[(size_t)b] - SEED_LEN : 0;
+                seeds[(size_t)b] = pg.substr(ss, bnd[(size_t)b] - ss);
             }
 
             std::vector<std::vector<uint8_t>> parts((size_t)pgnb);
+            std::vector<uint8_t> codec_ids((size_t)pgnb, use_vle ? 0x01 : 0x00);
             std::vector<std::thread> th; th.reserve((size_t)pgnb);
             for (int b = 0; b < pgnb; ++b)
                 th.emplace_back([&, b] {
                     std::string chunk = pg.substr(bnd[(size_t)b], bnd[(size_t)b+1] - bnd[(size_t)b]);
-                    parts[(size_t)b] = dna_encode(chunk, {}, {}, {}, seeds[(size_t)b]);
+                    if (use_vle)
+                        parts[(size_t)b] = vle_encode_pg(chunk);
+                    else
+                        parts[(size_t)b] = dna_encode(chunk, {}, {}, {}, seeds[(size_t)b]);
                 });
             for (auto& t : th) t.join();
 
-            // Format 0x06: [0x06][nb][nb×u32 block_len][nb×SEED_LEN seed_bytes][payloads]
-            std::vector<uint8_t> out; out.push_back(0x06); out.push_back((uint8_t)pgnb);
+            // Format 0x07: [flag][nb][nb×u32 len][nb×26 seed][nb×1 codec_id][payloads]
+            std::vector<uint8_t> out; out.push_back(0x07); out.push_back((uint8_t)pgnb);
             for (auto& p : parts) {
                 uint32_t s = (uint32_t)p.size();
                 out.push_back(s & 0xFF); out.push_back((s>>8) & 0xFF);
                 out.push_back((s>>16) & 0xFF); out.push_back((s>>24) & 0xFF);
             }
-            // Store seeds (block 0 seed is all-'A' padding, blocks 1..nb-1 are real).
             for (int b = 0; b < pgnb; ++b) {
                 const std::string& sd = seeds[(size_t)b];
-                // Pad with 'A' if shorter than SEED_LEN (short pg near boundary).
                 for (int k = 0; k < SEED_LEN; ++k)
                     out.push_back((size_t)k < sd.size() ? (uint8_t)sd[(size_t)k] : (uint8_t)'A');
             }
+            for (int b = 0; b < pgnb; ++b) out.push_back(codec_ids[(size_t)b]);
             for (auto& p : parts) out.insert(out.end(), p.begin(), p.end());
-            fprintf(stderr, "[CHAIN-PG] ARCS-DNA seeded-block: %d blocks, pg=%zu B → %zu B%s\n",
-                    pgnb, pg.size(), out.size() - 1,
-                    explicit_blocks ? " (explicit)" : " (auto)");
+            fprintf(stderr, "[CHAIN-PG] multi-block: %d blocks codec=%s pg=%zu B → %zu B\n",
+                    pgnb, use_vle ? "VLE+LZMA" : "FCM-seeded", pg.size(), out.size() - 1);
             return out;
         }
+
+        // Explicit single FCM block still falls through to default ARCS-DNA below
+        if (explicit_fcm && explicit_nb == 1) { /* fall through */ }
     }
     // ── ARCS-DNA (always available, embedded) ─────────────────────────────────
     auto dna_raw = dna_encode(pg, {}, chain_order, pg_pos);

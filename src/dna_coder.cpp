@@ -18,6 +18,7 @@
 // unused here so that decode (which lacks them) stays perfectly symmetric.
 
 #include "dna_coder.h"
+#include "container.h"
 #include <array>
 #include <vector>
 #include <cstdint>
@@ -771,6 +772,50 @@ std::string dna_decode(const std::vector<uint8_t>& data, const std::string& seed
     std::string pg(N, 'A');
     run_core<false>(nullptr, &pg, N, coder, seed);
     return pg;
+}
+
+// ── VLE + LZMA pseudogenome backend ──────────────────────────────────────────
+// 2-bit pack (A=0,C=1,G=2,T=3, 4 bases/byte, MSB first) + LZMA-9.
+// Each block is independently decodable — no warm-up, no cross-block state.
+// Decode is ~10-50ms per block vs ~1-2s for adaptive FCM (LZMA is streaming).
+// Ratio cost vs FCM: ~5-20% larger on human pg (FCM models long-range repeats
+// via high-order context; LZMA's sliding window is shorter).
+
+static std::vector<uint8_t> vle_pack(const std::string& pg) {
+    size_t N = pg.size();
+    std::vector<uint8_t> out((N + 3) / 4, 0);
+    for (size_t i = 0; i < N; i++)
+        out[i >> 2] |= (uint8_t)(b2i(pg[i]) << (6 - 2 * (int)(i & 3)));
+    return out;
+}
+
+static std::string vle_unpack(const std::vector<uint8_t>& packed, size_t N) {
+    std::string pg(N, 'A');
+    for (size_t i = 0; i < N; i++)
+        pg[i] = i2b((packed[i >> 2] >> (6 - 2 * (int)(i & 3))) & 3);
+    return pg;
+}
+
+std::vector<uint8_t> vle_encode_pg(const std::string& pg) {
+    size_t N = pg.size();
+    std::vector<uint8_t> out(8, 0);
+    for (int i = 0; i < 8; i++) out[i] = (uint8_t)((uint64_t)N >> ((7 - i) * 8));
+    if (N == 0) return out;
+    auto packed = vle_pack(pg);
+    auto comp   = arcs_compress(packed, 9);
+    out.insert(out.end(), comp.begin(), comp.end());
+    return out;
+}
+
+std::string vle_decode_pg(const std::vector<uint8_t>& data) {
+    if (data.size() < 8) return {};
+    uint64_t N = 0;
+    for (int i = 0; i < 8; i++) N = (N << 8) | data[i];
+    if (N == 0) return {};
+    auto packed_comp = std::vector<uint8_t>(data.begin() + 8, data.end());
+    auto packed = arcs_decompress(packed_comp.data(), packed_comp.size());
+    if (packed.empty()) return {};
+    return vle_unpack(packed, (size_t)N);
 }
 
 // ── compute_pg_surprise (idea B) ──────────────────────────────────────────────

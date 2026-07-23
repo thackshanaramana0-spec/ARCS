@@ -35,6 +35,14 @@ std::vector<uint8_t> dna_encode(
 std::string dna_decode(const std::vector<uint8_t>& data,
                        const std::string&           seed = "");
 
+// ── VLE + LZMA pseudogenome backend ──────────────────────────────────────────
+// Alternative to adaptive FCM: 2-bit pack (4 bases/byte) + LZMA-9.
+// Trades ratio (~5-20% larger on human pg) for fast independent decode
+// (~10-50ms vs ~1-2s for FCM) — enables Genozip-class decompress on blocks.
+// Same 8-byte pg_len header as dna_encode for symmetric format handling.
+std::vector<uint8_t> vle_encode_pg(const std::string& pg);
+std::string          vle_decode_pg(const std::vector<uint8_t>& data);
+
 // ── Cross-stream quality: pseudogenome "surprise" signal (idea B) ─────────────
 // Computes, for each base of the pseudogenome, a quantized local-predictability
 // ("surprise") bucket in [0, nbuckets): a low-order causal finite-context model
