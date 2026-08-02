@@ -1,79 +1,106 @@
 #!/bin/bash
-# Master benchmark: ARCS, SPRING, Genozip, fqzcomp on 8 datasets.
-# Data copied to ext4 (/tmp) for fair timing; logs to /mnt/c/Temp/bench8/logs (persist).
-set -u
-LOGD=/mnt/c/Temp/bench8/logs
-WD=/tmp/bench_wd; mkdir -p $WD
-ARCS=/tmp/arcs
-GZ=/tmp/gz/src/genozip; GC=/tmp/gz/src/genounzip
-FQ=/tmp/fqzcomp
-export USER="Thackshanaramana B"
-cp /mnt/c/Users/Lenovo/OneDrive/Desktop/nu256_upgrade/arcs_cpp/build_wsl/arcs $ARCS; chmod +x $ARCS
-cp /mnt/c/Temp/arcs_test/fqzcomp $FQ; chmod +x $FQ 2>/dev/null
+# Benchmark ARCS, SPRING, Genozip, and fqzcomp on up to 8 FASTQ datasets.
+#
+# Usage:
+#   bash benchmark/run_linux.sh <DATA_DIR> <ARCS_BIN> [OUT_DIR]
+#
+# DATA_DIR : directory containing FASTQ files named DS1.fastq … DS7.fastq,
+#            GIAB.fastq, NA12878.fastq (any subset is fine; missing files are skipped).
+# ARCS_BIN : path to the compiled arcs binary (e.g. build/arcs).
+# OUT_DIR  : where to write per-dataset log files (default: ./bench_results).
+#
+# External tools expected on PATH: spring, genozip, genounzip, fqzcomp.
+# Data is copied to /tmp for fair I/O timing on native Linux ext4.
+#
+# Example:
+#   cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)
+#   bash benchmark/run_linux.sh ~/fastq_datasets ./build/arcs ./results
+set -euo pipefail
 
-declare -A SRC=(
- [DS1]="/mnt/c/Users/Lenovo/OneDrive/Desktop/nu256_upgrade/trial7/data/inputs/orig_DS1.fastq"
- [DS2]="/mnt/c/Users/Lenovo/OneDrive/Desktop/nu256_upgrade/trial7/data/inputs/orig_DS2.fastq"
- [DS4]="/mnt/c/Users/Lenovo/OneDrive/Desktop/nu256_upgrade/trial7/data/inputs/orig_DS4.fastq"
- [DS5]="/mnt/c/Users/Lenovo/OneDrive/Desktop/nu256_upgrade/trial7/data/inputs/orig_DS5.fastq"
- [DS6]="/mnt/c/Users/Lenovo/OneDrive/Desktop/nu256_upgrade/trial7/data/inputs/orig_DS6.fastq"
- [DS7]="/mnt/c/Users/Lenovo/OneDrive/Desktop/nu256_upgrade/trial7/data/inputs/DS7_30x_chr22_5Mbp.fastq"
- [GIAB]="/mnt/c/Temp/arcs_test/giab150.fq"
- [NA12878]="/mnt/c/Temp/arcs_test/na12878_region.fq"
-)
-ORDER="DS1 DS2 DS4 DS5 DS6 DS7 GIAB NA12878"
+DATA_DIR="${1:?Usage: $0 <DATA_DIR> <ARCS_BIN> [OUT_DIR]}"
+ARCS_BIN="${2:?Usage: $0 <DATA_DIR> <ARCS_BIN> [OUT_DIR]}"
+OUT_DIR="${3:-./bench_results}"
+mkdir -p "$OUT_DIR"
 
-# peak VmHWM (KB) of a command run in background
-peak(){ "$@" >/dev/null 2>&1 & local P=$!; local m=0 h; while kill -0 $P 2>/dev/null; do h=$(awk "/VmHWM/{print \$2}" /proc/$P/status 2>/dev/null); [ -n "$h" ]&&[ "$h" -gt "$m" ]&&m=$h; sleep 0.03; done; wait $P; echo $m; }
-# best-of-2 wall time (s)
-btime(){ local b=99999 t; for i in 1 2; do /usr/bin/time -o /tmp/_tt -f "%e" "$@" >/dev/null 2>/dev/null; t=$(cat /tmp/_tt); awk -v t="$t" -v b="$b" "BEGIN{exit !(t+0<b+0)}" && b=$t; done; echo $b; }
-losscmp(){ paste - - - - < "$1" | tr -d "\r" | sort > /tmp/_o; paste - - - - < "$2" | tr -d "\r" | sort > /tmp/_d; cmp -s /tmp/_o /tmp/_d && echo LOSSLESS || echo LOSSY; }
+WD=/tmp/arcs_bench_wd
+mkdir -p "$WD"
 
-for DS in $ORDER; do
-  IN=$WD/$DS.fq; cp "${SRC[$DS]}" "$IN"
-  raw=$(stat -c %s "$IN")
-  echo ">>> $DS  raw=$raw B  $(date +%T)"
+DATASETS="DS1 DS2 DS4 DS5 DS6 DS7 GIAB NA12878"
 
-  # ---------- ARCS ----------
-  A=$WD/$DS.arcs; DEC=$WD/$DS.arcs.dec
-  ct=$(btime $ARCS --chain-pg compress "$IN" "$A"); cr=$(peak $ARCS --chain-pg compress "$IN" "$A")
-  arch=$(stat -c %s "$A")
-  dt=$(btime $ARCS decompress "$A" "$DEC"); dr=$(peak $ARCS decompress "$A" "$DEC")
-  ll=$(losscmp "$IN" "$DEC")
-  printf "TOOL=ARCS DS=%s raw=%s archive=%s ctime=%s crss_kb=%s dtime=%s drss_kb=%s lossless=%s\n" \
-    "$DS" "$raw" "$arch" "$ct" "$cr" "$dt" "$dr" "$ll" | tee $LOGD/${DS}__ARCS.log
-  rm -f "$A" "$DEC"
+# best-of-2 wall time in seconds
+btime() {
+    local best=99999 t
+    for _ in 1 2; do
+        /usr/bin/time -o /tmp/_tt -f "%e" "$@" >/dev/null 2>/dev/null
+        t=$(cat /tmp/_tt)
+        awk -v t="$t" -v b="$best" 'BEGIN{exit !(t+0 < b+0)}' && best=$t
+    done
+    echo "$best"
+}
 
-  # ---------- SPRING (default 8 threads) ----------
-  A=$WD/$DS.spring; DEC=$WD/$DS.spring.dec
-  ct=$(btime spring -c -i "$IN" -o "$A" -w $WD); cr=$(peak spring -c -i "$IN" -o "$A" -w $WD)
-  arch=$(stat -c %s "$A")
-  dt=$(btime spring -d -i "$A" -o "$DEC" -w $WD); dr=$(peak spring -d -i "$A" -o "$DEC" -w $WD)
-  ll=$(losscmp "$IN" "$DEC")
-  printf "TOOL=SPRING DS=%s raw=%s archive=%s ctime=%s crss_kb=%s dtime=%s drss_kb=%s lossless=%s\n" \
-    "$DS" "$raw" "$arch" "$ct" "$cr" "$dt" "$dr" "$ll" | tee $LOGD/${DS}__SPRING.log
-  rm -f "$A" "$DEC"
+# byte-exact lossless check (order-free, handles CRLF)
+losscmp() {
+    paste - - - - < "$1" | tr -d '\r' | sort > /tmp/_orig
+    paste - - - - < "$2" | tr -d '\r' | sort > /tmp/_dec
+    cmp -s /tmp/_orig /tmp/_dec && echo LOSSLESS || echo LOSSY
+}
 
-  # ---------- Genozip ----------
-  A=$WD/$DS.genozip; DEC=$WD/$DS.gz.dec
-  ct=$(btime $GZ --force -o "$A" "$IN"); cr=$(peak $GZ --force -o "$A" "$IN")
-  arch=$(stat -c %s "$A")
-  dt=$(btime $GC --force -o "$DEC" "$A"); dr=$(peak $GC --force -o "$DEC" "$A")
-  ll=$(losscmp "$IN" "$DEC")
-  printf "TOOL=Genozip DS=%s raw=%s archive=%s ctime=%s crss_kb=%s dtime=%s drss_kb=%s lossless=%s\n" \
-    "$DS" "$raw" "$arch" "$ct" "$cr" "$dt" "$dr" "$ll" | tee $LOGD/${DS}__Genozip.log
-  rm -f "$A" "$DEC"
+for DS in $DATASETS; do
+    SRC="$DATA_DIR/$DS.fastq"
+    [ -f "$SRC" ] || { echo "Skipping $DS (not found: $SRC)"; continue; }
 
-  # ---------- fqzcomp (NOT byte-lossless: quality quirk) ----------
-  A=$WD/$DS.fqz; DEC=$WD/$DS.fqz.dec
-  ct=$(btime $FQ "$IN" "$A"); cr=$(peak $FQ "$IN" "$A")
-  arch=$(stat -c %s "$A")
-  dt=$(btime $FQ -d "$A" "$DEC"); dr=$(peak $FQ -d "$A" "$DEC")
-  ll=$(losscmp "$IN" "$DEC")
-  printf "TOOL=fqzcomp DS=%s raw=%s archive=%s ctime=%s crss_kb=%s dtime=%s drss_kb=%s lossless=%s\n" \
-    "$DS" "$raw" "$arch" "$ct" "$cr" "$dt" "$dr" "$ll" | tee $LOGD/${DS}__fqzcomp.log
-  rm -f "$A" "$DEC"
+    IN="$WD/$DS.fq"
+    cp "$SRC" "$IN"
+    RAW=$(stat -c %s "$IN")
+    echo ">>> $DS  raw=$RAW B  $(date +%T)"
 
-  rm -f "$IN"
+    # ── ARCS ──────────────────────────────────────────────────────────────────
+    A="$WD/$DS.arcs"; DEC="$WD/$DS.arcs.dec"
+    CT=$(btime "$ARCS_BIN" compress "$IN" "$A")
+    ARCH=$(stat -c %s "$A")
+    DT=$(btime "$ARCS_BIN" decompress "$A" "$DEC")
+    LL=$(losscmp "$IN" "$DEC")
+    printf "TOOL=ARCS DS=%s raw=%s archive=%s ctime=%s dtime=%s lossless=%s\n" \
+        "$DS" "$RAW" "$ARCH" "$CT" "$DT" "$LL" | tee "$OUT_DIR/${DS}__ARCS.log"
+    rm -f "$A" "$DEC"
+
+    # ── SPRING ────────────────────────────────────────────────────────────────
+    if command -v spring &>/dev/null; then
+        A="$WD/$DS.spring"; DEC="$WD/$DS.spring.dec"
+        CT=$(btime spring -c -i "$IN" -o "$A" -w "$WD")
+        ARCH=$(stat -c %s "$A")
+        DT=$(btime spring -d -i "$A" -o "$DEC" -w "$WD")
+        LL=$(losscmp "$IN" "$DEC")
+        printf "TOOL=SPRING DS=%s raw=%s archive=%s ctime=%s dtime=%s lossless=%s\n" \
+            "$DS" "$RAW" "$ARCH" "$CT" "$DT" "$LL" | tee "$OUT_DIR/${DS}__SPRING.log"
+        rm -f "$A" "$DEC"
+    fi
+
+    # ── Genozip ───────────────────────────────────────────────────────────────
+    if command -v genozip &>/dev/null; then
+        A="$WD/$DS.genozip"; DEC="$WD/$DS.gz.dec"
+        CT=$(btime genozip --force -o "$A" "$IN")
+        ARCH=$(stat -c %s "$A")
+        DT=$(btime genounzip --force -o "$DEC" "$A")
+        LL=$(losscmp "$IN" "$DEC")
+        printf "TOOL=Genozip DS=%s raw=%s archive=%s ctime=%s dtime=%s lossless=%s\n" \
+            "$DS" "$RAW" "$ARCH" "$CT" "$DT" "$LL" | tee "$OUT_DIR/${DS}__Genozip.log"
+        rm -f "$A" "$DEC"
+    fi
+
+    # ── fqzcomp ───────────────────────────────────────────────────────────────
+    if command -v fqzcomp &>/dev/null; then
+        A="$WD/$DS.fqz"; DEC="$WD/$DS.fqz.dec"
+        CT=$(btime fqzcomp "$IN" "$A")
+        ARCH=$(stat -c %s "$A")
+        DT=$(btime fqzcomp -d "$A" "$DEC")
+        LL=$(losscmp "$IN" "$DEC")
+        printf "TOOL=fqzcomp DS=%s raw=%s archive=%s ctime=%s dtime=%s lossless=%s\n" \
+            "$DS" "$RAW" "$ARCH" "$CT" "$DT" "$LL" | tee "$OUT_DIR/${DS}__fqzcomp.log"
+        rm -f "$A" "$DEC"
+    fi
+
+    rm -f "$IN"
 done
-echo "ALL LINUX TOOLS DONE $(date +%T)" | tee $LOGD/_DONE.flag
+
+echo "ALL DONE $(date +%T) — results in $OUT_DIR/"

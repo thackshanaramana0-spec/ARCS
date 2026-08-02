@@ -99,7 +99,7 @@ brew install cmake xz
 ```
 src/          C++17 source — encoder, decoder, chain assembler, quality coder, variant caller
 tests/        7 CTest roundtrip and unit tests
-third_party/  rans_byte.h (rANS entropy coder, public domain)
+third_party/  rans_byte.h (rANS entropy coder, public domain) + libbsc (BWT+QLFC, MIT)
 docs/         Benchmark results and algorithm notes
 scripts/      Evaluation scripts (variant calling, indel bench, polyploid sim)
 benchmark/    Linux benchmark runner
