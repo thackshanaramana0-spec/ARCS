@@ -82,8 +82,8 @@ wall-clock times.
 †PgRC2 default applies lossy quality binning and is not a lossless comparison.
 
 ARCS produces the smallest fully-lossless archive: **14% smaller than Genozip, 23% smaller
-than SPRING**. Wins on all 8 public datasets spanning 5 organisms and 4 read-length
-profiles. Byte-exact lossless including CRLF line endings, which SPRING silently alters.
+than SPRING**. Wins on all 8 public datasets spanning 4 organisms (E. coli, H. sapiens,
+M. tuberculosis, SARS-CoV-2) and read lengths from 51 bp to 221 bp. Byte-exact lossless including CRLF line endings, which SPRING silently alters.
 
 With `--fast-decode`: 0.28 s decompress on GIAB (vs 1.9 s default), archive 4.41 MB
 (still 12% smaller than Genozip, 21% smaller than SPRING).

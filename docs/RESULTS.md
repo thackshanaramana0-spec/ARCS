@@ -25,7 +25,7 @@ Variant calling benchmarks: rtg vcfeval (GA4GH engine), frozen parameters throug
 ## Table 1 — Archive size (KB, smaller = better)
 
 PgRC2 default is lossy quality — lossless mode (`-Q`) crashes on tested datasets.
-ARCS (default) = chain-pg encoder (best ratio). ARCS (fast) = `--fast` flag (faster compress, slightly larger).
+ARCS (default) = chain-pg encoder (best ratio). ARCS (fast) = `--fast-decode` flag (faster decompress, slightly larger archive).
 
 | Dataset | Raw | **ARCS** | ARCS (fast) | Genozip | SPRING | PgRC2 (lossy†) |
 |---|---|---|---|---|---|---|
@@ -47,6 +47,11 @@ SPRING is not byte-exact on 4/8 bacterial/short datasets (reorders reads); ARCS 
 ---
 
 ## Table 2 — Compress time (seconds, lower = better)
+
+> **Note:** These times were recorded before the v2.2.0 parallel shard assembly (4× speedup).
+> Current ARCS v2.2.0 compress times are approximately 3-4× faster on multi-core machines.
+> Ratio numbers in Table 1 are unaffected (parallel assembly is ratio-neutral within 1.5%).
+
 
 | Dataset | **ARCS** | ARCS (fast) | Genozip | SPRING |
 |---|---|---|---|---|
