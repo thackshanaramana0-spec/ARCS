@@ -29,15 +29,15 @@ and fqzcomp.
 
 **ARCS produces the smallest fully-lossless archive of any tested tool: −14% vs Genozip, −23% vs SPRING.**
 Wins 8/8 public datasets. Byte-exact lossless including CRLF line endings (SPRING silently corrupts CRLF files).
-See [docs/REAL_BENCHMARK_GIAB.md](docs/REAL_BENCHMARK_GIAB.md) for full numbers.
+See [docs/RESULTS.md](docs/RESULTS.md) for full numbers.
 
-### Reference-free variant calling (5 GIAB individuals, 3 ancestries, rtg vcfeval gold standard)
+### Reference-free variant calling (4 GIAB individuals, 3 ancestries, rtg vcfeval gold standard)
 
 | Tool | Het-SNV F1 | Notes |
 |---|---|---|
-| **ARCS** | **0.957** | zero-cost byproduct of compression |
-| DiscoSNP++ | 0.912 | dedicated reference-free caller |
-| Kmer2SNP | 0.533 | dedicated reference-free caller |
+| **ARCS** | **0.936** | zero-cost byproduct of compression |
+| DiscoSNP++ | 0.918 | dedicated reference-free caller |
+| Kmer2SNP | 0.532 | dedicated reference-free caller |
 
 `arcs call reads.fq out.vcf` — one command, no aligner, no reference, no extra runtime.
 Also supports het-indels (F1 ≈ 0.51 on real GIAB, ties DiscoSNP++) and polyploid calling
@@ -87,6 +87,7 @@ brew install cmake xz
 | `ARCS_QUAL_BLOCKS=N` | Override quality coder thread/block count |
 | `ARCS_NAMES_BLOCKS=N` | Override name coder block count |
 | `ARCS_PG_FAST_DECODE=1` | LZMA-ASCII sequence codec: 2.8× faster decompress, +0.23% archive (GIAB) |
+| `ARCS_MERGE_OFF=1` | Disable contig merge step (default on; merge collapses fragmented contigs for better ratio) |
 | `ARCS_ORDER_FREE=1` | Opt into multiset mode (smaller archive, loses read order) |
 | `ARCS_ENC_TIMING=1` | Per-phase encode timing |
 | `ARCS_DEC_TIMING=1` | Per-phase decode timing |
@@ -114,7 +115,7 @@ Test data is not stored in this repository. Download separately:
 - **GIAB HG002 / HG001 (NA12878)** — [NIST Genome in a Bottle](https://www.nist.gov/programs-projects/genome-bottle)
 - **E. coli K-12** — NCBI accession NC_000913.3
 
-See [docs/FINAL_BENCHMARK.md](docs/FINAL_BENCHMARK.md) for exact download commands and slicing parameters.
+See [docs/RESULTS.md](docs/RESULTS.md) for full multi-dataset tables and dataset descriptions.
 
 ---
 

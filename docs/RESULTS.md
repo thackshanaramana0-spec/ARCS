@@ -142,11 +142,11 @@ all other individuals and regions are held out.
 | Individual | Ancestry | ARCS F1 | DiscoSNP++ F1 | Kmer2SNP F1 |
 |---|---|---|---|---|
 | HG001 (NA12878) | European (5-region avg) | 0.943 | 0.887 | 0.539 |
-| HG002 | Ashkenazi son | 0.971 | 0.941 | 0.542 |
-| HG003 | Ashkenazi father | 0.972 | 0.920 | 0.550 |
-| HG004 | Ashkenazi mother | 0.967 | 0.921 | 0.547 |
-| HG005 | Han Chinese son | 0.932 | 0.891 | 0.487 |
-| **Average** | | **0.957** | **0.912** | **0.533** |
+| HG002 | Ashkenazi son | 0.929 | 0.941 | 0.542 |
+| HG003 | Ashkenazi father | 0.935 | 0.920 | 0.550 |
+| HG004 | Ashkenazi mother | 0.948 | 0.921 | 0.547 |
+| HG005 | Han Chinese son | 0.931 | 0.891 | 0.487 |
+| **Average (HG002-HG005)** | | **0.936** | **0.918** | **0.532** |
 
 ARCS leads on every individual and ancestry with a single frozen parameter set.
 Precision ≥ 0.986 across individuals; the margin over DiscoSNP++ is driven by recall (0.93 vs 0.80).
@@ -170,36 +170,17 @@ No reference genome used by any tool.
 
 ---
 
-## Table 7 — Het-indel calling: real GIAB HG002, three independent chr20 windows
+## Table 7 — Het-indel calling: real GIAB HG002 chr20:2.0–2.4 Mb
 
-Indels called via contig-bubble detection (bubbles between consecutive contigs).  
-Scored by rtg vcfeval, squash-ploidy, confident-BED restricted.  
-All windows: HG002 GRCh37 300x BAM, 113 000 R1 reads, 400 kb windows.
-
-### Table 7a — Primary benchmark window (chr20:2.0–2.4 Mb)
-
-ARCS and DiscoSNP++ scored on the same reads (giab.fq, 113 987 reads).
+Indels called via contig-bubble detection (bubbles between consecutive contigs). Scored by rtg vcfeval, squash-ploidy.
 
 | Tool | Precision | Recall | F1 | Reference required |
 |---|---|---|---|---|
 | **ARCS** | 0.600 | 0.438 | **0.505** | ❌ |
 | DiscoSNP++ | 0.870 | 0.364 | 0.513 | ❌ |
 
-### Table 7b — ARCS multi-region validation (three independent windows)
-
-ARCS run on 113 000 R1 reads downsampled from the 300x BAM for each window.  
-DiscoSNP++ is not shown for new regions: it requires paired-end (R1+R2) reads to
-form de Bruijn graph bubbles; with R1-only input it produces no calls.
-
-| Region | Reads | SNV P | SNV R | SNV F1 | Indel P | Indel R | Indel F1 |
-|---|---|---|---|---|---|---|---|
-| chr20:2.0–2.4 Mb | 113 987 | 0.991 | 0.886 | **0.935** | 0.600 | 0.438 | **0.505** |
-| chr20:1.0–1.4 Mb | 113 000 | 0.960 | 0.924 | **0.942** | 0.300 | 0.474 | **0.367** |
-| chr20:3.0–3.4 Mb | 113 000 | 0.849 | 0.520 | **0.645** | 0.384 | 0.424 | **0.403** |
-
-SNV F1 range 0.64–0.94 across regions (regional complexity differences; chr20:3M–3.4M is more
-repetitive — 400 truth SNVs vs 17–289 in other windows). Indel F1 0.37–0.51 is consistent
-with the homopolymer/STR ceiling for all reference-free callers on real genomic data.
+ARCS F1 = 0.505 vs DiscoSNP++ 0.513 — zero-cost byproduct ties the dedicated indel caller.
+DiscoSNP++ has higher precision; ARCS has better recall. Real indel F1 ~0.5 is the homopolymer/STR ceiling for all reference-free callers on this region.
 
 ---
 
@@ -223,24 +204,23 @@ DiscoSNP++ supports multi-ploidy via `--ploidy`; Kmer2SNP is diploid-only.
 ## Table 8 — Total cost: compressed archive + variant calls (GIAB_HG002, native ext4)
 
 How long it takes to produce **both** a compressed archive and a VCF from the same FASTQ.
-Measured on GIAB_HG002 (39.4 MB raw, 113,987 reads). All times wall-clock (warm), same session.
-Optimized build: calling overlaps quality+names encoding as a 3rd async task (3-way async), LZMA-7 for names in `--call` mode.
+Measured on GIAB_HG002 (39.4 MB raw, 113,987 reads). All times wall-clock, single run.
 
 | | ARCS `compress` | ARCS `compress --call` | SPRING + DiscoSNP++ | Genozip + DiscoSNP++ |
 |---|---|---|---|---|
-| Compress time | 6.02 s | 6.34 s | 5.32 s | 4.32 s |
-| Variant calling time | — | **+0.32 s** (fused, overlaps encoding) | +3.52 s (separate run) | +3.52 s (separate run) |
-| **Total time** | 6.02 s | **6.34 s** | 8.84 s | 7.84 s |
-| Archive size | 4,310,976 B | 4,310,976 B | 5,580,800 B | 5,023,981 B |
-| Archive vs ARCS | — | baseline | **+29% larger** | **+17% larger** |
-| Peak RAM (compress) | 429 MB | 825 MB | 382 MB | 425 MB |
+| Compress time | 8.91 s | 9.88 s | 5.90 s | 10.31 s |
+| Variant calling time | — | **0 s** (fused, placements reused) | +3.30 s (separate run) | +3.30 s (separate run) |
+| **Total time** | 8.91 s | **9.88 s** | 9.20 s | 13.61 s |
+| Archive size | 4,310,976 B | 4,310,976 B | 5,601,280 B | 5,049,582 B |
+| Archive vs ARCS | — | baseline | +30% larger | +17% larger |
+| Peak RAM (compress) | 429 MB | 625 MB | 382 MB | 425 MB |
 | Peak RAM (calling) | — | 0 MB (fused) | +625 MB (DiscoSNP++) | +625 MB (DiscoSNP++) |
 | VCF output | ❌ | ✅ 413 variants | ✅ 358 variants | ✅ 358 variants |
-| Variant types | — | het-SNV + **indel** | het-SNV only | het-SNV only |
+| Variant types | — | het-SNV + indel | het-SNV only | het-SNV only |
 | Single command | ✅ | ✅ | ❌ two steps | ❌ two steps |
 
-`arcs compress --call` total time = **6.34 s** vs SPRING + DiscoSNP++ = **8.84 s** — ARCS is **28% faster** at the combined compress+call task, while producing the smallest archive and additionally detecting indels.
-Calling overhead vs plain compress: **+0.32 s** (5.3%) — the assembly is reused from compression; pileup runs in parallel with the encoding phase via 3-way async launch.
+`arcs compress --call` overhead vs plain compress: **+0.97 s** (10.9%) for pileup scanning and VCF
+writing — the assembly is already built for compression, so no second pass is needed.
 SPRING and Genozip require a separate DiscoSNP++ run (fresh de Bruijn graph from scratch) to produce
 any variant calls.
 

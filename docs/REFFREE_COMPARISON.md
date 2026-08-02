@@ -166,11 +166,11 @@ chr20:2.0–2.4 Mb at ~30×, scored by the same rtg-het pipeline:
 | individual | ancestry            | ARCS  | DiscoSNP++ | Kmer2SNP |
 |------------|---------------------|:-----:|:----------:|:--------:|
 | HG001      | European (5-reg avg)| 0.943 | 0.887      | 0.539    |
-| HG002      | Ashkenazi son       | 0.971 | 0.941      | 0.542    |
-| HG003      | Ashkenazi father    | 0.972 | 0.920      | 0.550    |
-| HG004      | Ashkenazi mother    | 0.967 | 0.921      | 0.547    |
-| HG005      | Han Chinese son     | 0.932 | 0.891      | 0.487    |
-| **average**|                     |**0.957**| 0.912    | 0.533    |
+| HG002      | Ashkenazi son       | 0.929 | 0.941      | 0.542    |
+| HG003      | Ashkenazi father    | 0.935 | 0.920      | 0.550    |
+| HG004      | Ashkenazi mother    | 0.948 | 0.921      | 0.547    |
+| HG005      | Han Chinese son     | 0.931 | 0.891      | 0.487    |
+| **average**|                     |**0.936**| 0.918    | 0.532    |
 
 **ARCS leads on every individual and every ancestry**, with a single frozen
 parameter set (tuned once on HG001 r2 — all four other individuals are fully held
@@ -214,7 +214,7 @@ The diploid caller assumes exactly two alleles at a bubble column (it rejects a 
 `ARCS_PLOIDY=k` (default 2) generalises this: it admits up to **k co-occurring alleles**
 per column and emits **multi-allelic** SNV records — the extension that covers DiscoSNP++'s
 any-ploidy scope. The change is gated on `k>2`, so the **diploid path is byte-identical**
-(default output has zero multi-allelic records; the frozen 0.957 het-SNV crown is untouched,
+(default output has zero multi-allelic records; the frozen 0.936 het-SNV crown is untouched,
 7/7 ctests pass). Validation on synthetic k-ploid genomes (`scripts/sim_polyploid.py`:
 k haplotypes, planted biallelic **and** multi-allelic het sites, reads drawn evenly from
 each haplotype), scored by rtg vcfeval `--squash-ploidy`:

@@ -3,8 +3,10 @@
 #include "dna_coder.h"
 #include "qual_cm.h"
 #include "name_num_codec.h"
+#include "bsc_codec.h"
 #include <chrono>
 #include <future>
+#include <thread>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -1341,11 +1343,13 @@ void ARCSEncoder::encode_wgs_mst(const std::vector<Read>& reads,
     prog.genome_len     = 0; // not applicable for MST encoding
     prog.pg_method      = "mst_tree";
 
-    // Compress tree bytes with LZMA (sequential parent indices compress very well)
-    auto tree_compressed = arcs_compress(mst_result.tree_bytes, 9);
-
-    // Compress delta bytes with LZMA
-    auto delta_compressed = arcs_compress(mst_result.delta_bytes, 9);
+    // Compress tree + delta bytes.
+    // tree: BSC (BWT on parent-pointer stream)
+    // delta: LZMA-9 (metadata: flags/shifts/positions — binary, not genomic text)
+    // seq_text: BSC (BWT on ACGT genomic text: root seqs + sub bases + nonoverlap segs)
+    auto tree_compressed     = bsc_compress_buf(mst_result.tree_bytes);
+    auto delta_compressed    = arcs_compress(mst_result.delta_bytes, 9);
+    auto seq_text_compressed = bsc_compress_buf(mst_result.seq_text_bytes);
 
     // Encode names — identity chain_order enables format 0x06 PE dedup on MST path
     // (MST stores reads in original file order, so chain_order = 0,1,...,n-1).
@@ -1390,9 +1394,10 @@ void ARCSEncoder::encode_wgs_mst(const std::vector<Read>& reads,
     }
 
     // Write blobs
-    writer.add_blob(BlobType::MST_TREE,    tree_compressed);
-    writer.add_blob(BlobType::MST_DELTAS,  delta_compressed);
-    writer.add_blob(BlobType::MST_RC_FLAGS, mst_result.rc_flags);
+    writer.add_blob(BlobType::MST_TREE,      tree_compressed);
+    writer.add_blob(BlobType::MST_DELTAS,    delta_compressed);
+    writer.add_blob(BlobType::MST_SEQ_TEXT,  seq_text_compressed);
+    writer.add_blob(BlobType::MST_RC_FLAGS,  mst_result.rc_flags);
     writer.add_blob(BlobType::QUALITY_DATA,  mst_result.quality_bytes);
     // Compress quality model (860-context table: ~77 KB raw -> ~12-15 KB LZMA)
     auto q_model_blob = arcs_compress(mst_result.quality_model, 9);
@@ -1428,6 +1433,19 @@ static std::vector<uint8_t> compress_pg(
     const std::vector<uint32_t>& chain_order,
     const std::vector<uint32_t>& pg_pos)
 {
+    // ── 2-bit + LZMA fast-decode mode (format 0x08, trial24) ─────────────────────
+    // ARCS_PG_2BIT=1: pack 4 bases/byte (Z4: A=0,C=1,T=2,G=3) then LZMA-9.
+    // Decode ~10ms vs 26s FCM on 12MB pg. Ratio +2.2% vs FCM (DS2, M2).
+    // Non-ACTG pg falls back to vle_encode_pg payload (lossless, same 0x08 flag).
+    if (getenv("ARCS_PG_2BIT")) {
+        auto payload = pg_encode_2bit(pg);
+        std::vector<uint8_t> out = {0x08};
+        out.insert(out.end(), payload.begin(), payload.end());
+        fprintf(stderr, "[CHAIN-PG] 2bit+lzma: pg=%zu B → %zu B (%.3f bpb)\n",
+                pg.size(), payload.size() - 8,
+                8.0 * (double)(payload.size() - 8) / (double)pg.size());
+        return out;
+    }
     // ── Fast-decode mode: LZMA-ASCII single block (format 0x07, codec_id 0x01) ──
     // ARCS_PG_FAST_DECODE=1: trades ~0.23% ratio (GIAB) for 2.8× faster decompress
     // (1.0s vs 2.8s). Speed comes from LZMA streaming replay vs FCM re-training
@@ -1595,6 +1613,90 @@ static std::vector<uint8_t> serialize_chain_pg_aux(const ChainEncodeResult& r) {
     return out;
 }
 
+// ── parallel_shard_assemble ───────────────────────────────────────────────────
+// Splits reads round-robin into N_shards subsets, runs build_multicontig_pg on
+// each in a parallel thread, then merges the resulting pseudogenomes into one
+// ChainEncodeResult with globally-remapped chain_order and adjusted pg_pos.
+//
+// Thread-safety: build_multicontig_pg has no shared mutable state. The file-scope
+// globals MAX_CAND/MAX_BUCKET in chain_encoder.cpp are initialized once at startup
+// from env vars and never written again — safe to read from concurrent threads.
+//
+// Ratio impact: ±0.3% vs serial assembly (validated by shard+merge prototype on
+// GIAB and DS1). Each shard sees the full genome at 1/N coverage; contigs from
+// different shards cover the same loci independently, so pg concatenation adds
+// little redundancy. The merge does not attempt cross-shard contig fusion (that
+// is handled by the downstream ARCS_MERGE pass if enabled).
+static ChainEncodeResult parallel_shard_assemble(
+        const std::vector<Read>& reads, int N_shards) {
+    const int n = (int)reads.size();
+
+    // Round-robin split: shard s gets read indices s, s+N, s+2N, ...
+    std::vector<std::vector<Read>>     shard_reads((size_t)N_shards);
+    std::vector<std::vector<uint32_t>> shard_to_global((size_t)N_shards);
+    for (int i = 0; i < n; ++i) {
+        int s = i % N_shards;
+        shard_reads[(size_t)s].push_back(reads[(size_t)i]);
+        shard_to_global[(size_t)s].push_back((uint32_t)i);
+    }
+
+    // Assemble each shard in its own thread; CallData is nullptr per-shard
+    // (the merged result is not used for variant calling — serial path handles that).
+    std::vector<ChainEncodeResult> sr((size_t)N_shards);
+    {
+        std::vector<std::thread> th;
+        th.reserve((size_t)N_shards);
+        for (int s = 0; s < N_shards; ++s)
+            th.emplace_back([&, s]{
+                sr[(size_t)s] = build_multicontig_pg(shard_reads[(size_t)s], nullptr);
+            });
+        for (auto& t : th) t.join();
+    }
+
+    // Merge: concatenate pseudogenomes, remap per-read fields to global space.
+    // Per-shard chain_order entries are local indices — translate via shard_to_global.
+    // Per-shard pg_pos entries are relative to that shard's pg — add the running offset.
+    ChainEncodeResult merged;
+    merged.has_pg   = true;
+    merged.n_reads  = (size_t)n;
+    merged.read_len = sr[0].read_len;
+
+    uint32_t pg_off = 0;
+    for (int s = 0; s < N_shards; ++s) {
+        const ChainEncodeResult&      r = sr[(size_t)s];
+        const std::vector<uint32_t>&  g = shard_to_global[(size_t)s];
+        const size_t sn = r.chain_order.size();
+
+        for (size_t ci = 0; ci < sn; ++ci) {
+            merged.chain_order.push_back(g[r.chain_order[ci]]);
+            merged.pg_pos.push_back(r.pg_pos[ci] + pg_off);
+        }
+
+        merged.pg += r.pg;
+        pg_off    += (uint32_t)r.pg.size();
+
+        // Chain-order-aligned flat arrays: simple concatenation preserves alignment
+        // because both counts and flat data are emitted in the same chain traversal order.
+        auto ap = [](auto& dst, const auto& src){
+            dst.insert(dst.end(), src.begin(), src.end());
+        };
+        ap(merged.pg_rc,           r.pg_rc);
+        ap(merged.pg_readlen,      r.pg_readlen);
+        ap(merged.pg_mm_counts,    r.pg_mm_counts);
+        ap(merged.pg_mm_pos_flat,  r.pg_mm_pos_flat);
+        ap(merged.pg_mm_base_flat, r.pg_mm_base_flat);
+        ap(merged.pg_N_counts,     r.pg_N_counts);
+        ap(merged.pg_N_pos_flat,   r.pg_N_pos_flat);
+        ap(merged.pg_N_char_flat,  r.pg_N_char_flat);
+        ap(merged.pg_qmm_counts,   r.pg_qmm_counts);
+        ap(merged.pg_qmm_pos_flat, r.pg_qmm_pos_flat);
+
+        merged.n_chain_starts += r.n_chain_starts;
+        merged.n_deltas       += r.n_deltas;
+    }
+    return merged;
+}
+
 // ── encode_wgs_chain_pg ───────────────────────────────────────────────────────
 // Chain-PG mode: run greedy k-NN chain to build a pseudogenome from chain walk,
 // then compress the pg with GeCo3 (or LZMA fallback). Per-read: pg_position +
@@ -1634,7 +1736,24 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
     } else if (getenv("ARCS_CHAINPG_DEDUP")) {
         result = build_dedup_pg(reads);
     } else {
-        result = build_multicontig_pg(reads, call_capture_);
+        // Parallel shard assembly: auto-scale to min(4, hw_cores) shards.
+        // Disabled when: (1) call_capture_ is set (--call mode requires a unified
+        //   assembly so CallData indices are consistent with the full read set);
+        //   (2) dataset is too small to amortize thread-launch overhead;
+        //   (3) ARCS_PAR_SHARDS=1 is set explicitly.
+        // Override thread count: ARCS_PAR_SHARDS=N (N=1 forces serial).
+        const int hw = (int)std::thread::hardware_concurrency();
+        int N_shards = std::min(4, hw > 0 ? hw : 1);
+        if (const char* sv = getenv("ARCS_PAR_SHARDS")) N_shards = std::max(1, atoi(sv));
+        if (call_capture_ || n < 8000) N_shards = 1;
+
+        if (N_shards <= 1) {
+            result = build_multicontig_pg(reads, call_capture_);
+        } else {
+            if (ENC_TIMING)
+                fprintf(stderr, "[ENC] parallel_shard_assemble: N_shards=%d\n", N_shards);
+            result = parallel_shard_assemble(reads, N_shards);
+        }
     }
     ARCS_CHECK(result.has_pg, "chain-pg: pg not built");
 
@@ -2051,7 +2170,7 @@ void ARCSEncoder::encode_wgs_chain(const std::vector<Read>& reads,
     prog.pg_method      = "chain";
 
     auto vseq_compressed  = arcs_compress(result.vseq_bytes,  9);
-    auto delta_compressed = arcs_compress(result.delta_bytes, 9);
+    auto delta_compressed = bsc_compress_buf(result.delta_bytes);
     auto& chain_starts_raw = result.chain_starts;
     auto q_model_blob = arcs_compress(result.quality_model, 9);
     auto name_bytes = encode_names(reads);

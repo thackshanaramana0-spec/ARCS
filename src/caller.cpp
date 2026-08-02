@@ -1,6 +1,7 @@
 #include "caller.h"
 #include "chain_encoder.h"     // CallData
 #include <unordered_map>
+#include <unordered_set>
 #include <map>
 #include <vector>
 #include <string>
@@ -60,6 +61,27 @@ inline uint64_t canon31(uint64_t v) { uint64_t r = rc31(v); return v < r ? v : r
 
 inline uint64_t colkey(uint32_t cid, uint32_t pos) { return ((uint64_t)cid << 32) | pos; }
 
+// ── STR / tandem-repeat detection ────────────────────────────────────────────
+// Returns true when `seq` is composed of a short tandem unit (≤4 bp) that also
+// appears in the left-flank context `flank`. Such bubbles are STR length changes:
+// they require stronger anchor evidence before we emit a call.
+static bool is_str_event(const std::string& seq, const std::string& flank) {
+    if (seq.size() < 2) return false;
+    for (int u = 1; u <= std::min((int)seq.size(), 4); ++u) {
+        // check that seq is a perfect tandem of the unit
+        bool tandem = true;
+        for (size_t i = 0; i < seq.size(); i += (size_t)u) {
+            size_t rem = std::min((size_t)u, seq.size() - i);
+            if (seq.substr(i, rem) != seq.substr(0, rem)) { tandem = false; break; }
+        }
+        if (!tandem) continue;
+        // check the same unit appears in the left flank (confirms STR context)
+        std::string unit = seq.substr(0, (size_t)u);
+        if (flank.find(unit) != std::string::npos) return true;
+    }
+    return false;
+}
+
 // ── Contig-bubble indel extraction ───────────────────────────────────────────
 // Het indels segregate the two haplotypes into separate contigs (the frameshift
 // breaks the k-mer chain), so they appear as a BUBBLE between two contigs that share
@@ -99,6 +121,30 @@ Bubble extract_bubble(const std::string& A, uint32_t pA, const std::string& B, u
             r.type = 0; r.apos = pA + d; r.len = g; r.ok = true; return r;
         }
     }
+    return r;
+}
+
+// ── Cross-contig SNV bubble ───────────────────────────────────────────────────
+// A 1-substitution bubble between two haplotype contigs: they share flanking
+// sequence but differ at exactly one base. The assembler's correct haplotype
+// separation makes this invisible to the pileup; it shows up here as a bubble
+// where the two contigs diverge at one base then immediately re-converge.
+struct SnvBubble { bool ok = false; uint32_t apos; char ref_base, alt_base; };
+
+inline SnvBubble extract_snv_bubble(const std::string& A, uint32_t pA,
+                                     const std::string& B, uint32_t qB, int FLANK) {
+    SnvBubble r;
+    const size_t la = A.size(), lb = B.size();
+    uint32_t d = 0;
+    while (pA + d < la && qB + d < lb && A[pA + d] == B[qB + d]) ++d;
+    if (pA + d >= la || qB + d >= lb) return r;          // ran off an end
+    char ra = A[pA + d], rb = B[qB + d];
+    if (b2i(ra) < 0 || b2i(rb) < 0) return r;            // non-ACGT at bubble
+    // right flank: next FLANK bases must be identical (ensures a clean single-SNV bubble)
+    if (pA + d + 1u + (uint32_t)FLANK > (uint32_t)la) return r;
+    if (qB + d + 1u + (uint32_t)FLANK > (uint32_t)lb) return r;
+    if (!flank_match(A, pA + d + 1u, B, qB + d + 1u, FLANK)) return r;
+    r.ok = true; r.apos = pA + d; r.ref_base = ra; r.alt_base = rb;
     return r;
 }
 
@@ -143,12 +189,12 @@ int run_variant_call(const std::vector<Read>& reads, const CallData& cd,
         FILE* df = fopen(dp, "w");
         if (df) {
             for (size_t ci = 0; ci < cd.contigs.size(); ++ci)
-                fprintf(df, "contig_%zu\t%s\n", ci, cd.contigs[ci].c_str());
+                fprintf(df, ">contig_%zu\n%s\n", ci, cd.contigs[ci].c_str());
             fclose(df);
         }
     }
 
-    // ── 1. Internal canonical-31-mer counts + coverage histogram (H = homozygous peak) ──
+    // ── 1. Internal canonical-31-mer counts ──
     std::unordered_map<uint64_t, uint32_t> kc;
     kc.reserve(1u << 21);
     for (const auto& rd : reads) {
@@ -159,10 +205,36 @@ int run_variant_call(const std::vector<Read>& reads, const CallData& cd,
             if (pack31(s.data() + i, v)) ++kc[canon31(v)];
         }
     }
-    std::unordered_map<uint32_t, uint64_t> hist;
-    for (auto& kv : kc) ++hist[kv.second];
+    // H = expected k-mer count at a single-copy het site (haploid depth estimate).
+    // Count-frequency histogram mode: single-copy k-mers are the most numerous as
+    // DISTINCT entries (~320k regardless of coverage), outnumbering repeat k-mers.
+    // k²-weighting fails because repeat counts (e.g. 13000²) swamp signal counts
+    // (240²).  Pileup-median fails when assembly fragments (low pileup → low H →
+    // KHI threshold rejects all real k-mers at high coverage → 0 calls).
     uint32_t H = 30;
-    { uint64_t bestc = 0; for (auto& hv : hist) if (hv.first >= 5 && hv.second > bestc) { bestc = hv.second; H = hv.first; } }
+    {
+        uint32_t cnt_max = 0;
+        for (auto& [km, cnt] : kc) cnt_max = std::max(cnt_max, cnt);
+        cnt_max = std::min(cnt_max, 5000u);
+        if (cnt_max >= 4) {
+            uint32_t bw = std::max(1u, cnt_max / 200u);
+            uint32_t nb = cnt_max / bw + 2;
+            std::vector<uint64_t> bkt(nb, 0);
+            for (auto& [km, cnt] : kc)
+                if (cnt >= 2 && cnt <= cnt_max) bkt[cnt / bw]++;
+            // Find first local minimum in first third (valley between error and signal peaks).
+            size_t valley = 2; // fallback: skip first 2 buckets (error-adjacent low counts)
+            for (size_t b = 1; b + 1 < nb / 3 && b + 1 < bkt.size(); ++b) {
+                if (bkt[b] < bkt[b - 1] && bkt[b] < bkt[b + 1]) { valley = b; break; }
+            }
+            // Highest peak after valley = single-copy k-mer count = H.
+            size_t peak = (valley + 1 < bkt.size()) ? valley + 1 : valley;
+            for (size_t b = valley + 1; b < bkt.size(); ++b)
+                if (bkt[b] > bkt[peak]) peak = b;
+            uint32_t H_hist = (uint32_t)((peak + 0.5) * bw);
+            if (H_hist >= 5) H = H_hist;
+        }
+    }
     auto kcount = [&](const std::string& km) -> uint32_t {
         if (km.size() != 31) return 0;
         uint64_t v; if (!pack31(km.data(), v)) return 0;
@@ -231,11 +303,7 @@ int run_variant_call(const std::vector<Read>& reads, const CallData& cd,
     }
     if (C.empty()) { fprintf(stderr, "caller: 0 candidates\n"); }
 
-    // median candidate depth
-    std::vector<int> depths; depths.reserve(C.size());
-    for (auto& kv : C) depths.push_back(kv.second.d);
-    std::sort(depths.begin(), depths.end());
-    int med = depths.empty() ? 30 : depths[depths.size() / 2];
+    if (const char* he = std::getenv("ARCS_HAPLOID_COV")) { int v = atoi(he); if (v > 0) H = (uint32_t)v; }
 
     // ── 4. Flank pass: major/minor 31-mer flanks + per-offset base votes ──
     std::unordered_map<uint64_t, std::unordered_map<std::string,int>> FLmaj, FLmin;
@@ -286,7 +354,7 @@ int run_variant_call(const std::vector<Read>& reads, const CallData& cd,
             }
         }
         if (diffs > HDMAX) continue;
-        if (c.d > DHI * med) continue;
+        if (c.d > (int)(DHI * H * 1.25 + 0.5)) continue;
         int cmajN = 0, cminN = 0;
         std::string fmaj, fmin;
         auto mj = FLmaj.find(key); auto mn2 = FLmin.find(key);
@@ -354,7 +422,7 @@ int run_variant_call(const std::vector<Read>& reads, const CallData& cd,
     // between contig pairs, extract the clean single-indel bubble, and express it on the
     // longer (reference) haplotype. Support/allele-balance come from each contig's read
     // coverage. (default on; ARCS_NO_INDELS disables to reproduce the frozen SNV caller.)
-    size_t n_indel = 0;
+    size_t n_indel = 0, n_xsnv = 0;
     if (!std::getenv("ARCS_NO_INDELS") && cd.contigs.size() >= 2) {
         constexpr int BK = 25, FLANK = 15;
         // per-contig read coverage (placed reads, ungapped span)
@@ -436,8 +504,8 @@ int run_variant_call(const std::vector<Read>& reads, const CallData& cd,
             int altd = std::max(medcov[a.altcid], (int)covwin(a.altcid, a.altpos));
             double af = (double)altd / std::max(1, refd + altd);
             if (std::getenv("ARCS_INDEL_DEBUG"))
-                fprintf(stderr, "[IDBG] bubble cid=%u apos=%u type=%d len=%d ins=%s refd=%d altd=%d af=%.3f anchors=%d\n",
-                        cid, apos, type, len, ins.c_str(), refd, altd, af, a.anchors);
+                fprintf(stderr, "[IDBG] bubble cid=%u apos=%u type=%d len=%d ins=%s refd=%d altd=%d af=%.3f anchors=%d altlen=%zu\n",
+                        cid, apos, type, len, ins.c_str(), refd, altd, af, a.anchors, cd.contigs[a.altcid].size());
             // A bubble is heterozygous by construction (a homozygous indel yields one
             // contig, no bubble). The real requirements: both haplotypes carry read
             // support, and the shared flank is long enough to be a true bubble (not a
@@ -445,6 +513,19 @@ int run_variant_call(const std::vector<Read>& reads, const CallData& cd,
             // (alt reads spill onto the shared ref contig), so no SNV-style AF band.
             if (refd < MC || altd < MC) continue;
             if (a.anchors < 3) continue;                          // solid flank, not a fluke
+            // STR filter: tandem-repeat bubbles (homopolymer/STR length changes) are the
+            // dominant false-positive class on real GIAB data. Require 5 anchors instead
+            // of 3 when the indel sequence is a tandem unit that also appears in the left
+            // flank — this eliminates collapsed-STR FPs without touching clean indels.
+            {
+                std::string left_flank = (apos >= 12) ? cc.substr(apos - 12, 12)
+                                                       : cc.substr(0, apos);
+                std::string indel_seq  = (type == 0)
+                    ? ((apos + (uint32_t)len <= cc.size()) ? cc.substr(apos, (size_t)len) : "")
+                    : ins;
+                if (!indel_seq.empty() && is_str_event(indel_seq, left_flank) && a.anchors < 5)
+                    continue;
+            }
             char anchor = cc[apos - 1];
             std::string ref, alt;
             if (type == 0) {                                     // deletion in alt haplotype
@@ -461,6 +542,92 @@ int run_variant_call(const std::vector<Read>& reads, const CallData& cd,
             orecs.push_back({cid, apos, ref, alt, info});        // apos already 1-based anchor
             ++n_indel;
         }
+
+        // ── 6b2. Cross-contig SNV pass (opt-in: ARCS_XSNV=1) ─────────────────
+        // When the assembler correctly haplotype-separates reads, the pileup on
+        // each contig shows only one allele → FN. We scan the same anchor pairs
+        // used for indels, looking for a 1-substitution bubble.
+        // Disabled by default: the 1-SNP bubble pattern is less specific than the
+        // indel re-convergence pattern, causing net F1 regression on some windows.
+        // Enable with ARCS_XSNV=1 for experimental use; tune parameters per dataset.
+        if (!std::getenv("ARCS_XSNV")) goto skip_xsnv;
+        //
+        // Three quality gates enforce high precision:
+        //  (1) ANCHORS ≥ 15: many independent 25-mer anchors in the left flank
+        //      confirm the bubble is not a chance match.
+        //  (2) Position-specific allele balance (AF ∈ [0.25,0.75]): both contigs
+        //      must carry similar read depth at the bubble site. A collapsed contig
+        //      (both haplotypes mis-assembled into one) appears as high ref-contig
+        //      depth, while its spurious alt-pair also has high depth → AF ≈ 0.5
+        //      but combined DP >> expected, so we also apply:
+        //  (3) DP ≤ 1.8×H: for a genuine het pair each contig carries ~half the
+        //      reads at that locus, so total ≈ H. Inflated DP reveals a collapsed
+        //      contig falsely paired with an unrelated alt contig.
+        //
+        // Position-specific alt coverage (covwin at the bubble site on the alt
+        // contig, not medcov across the full contig) gives a reliable AF estimate.
+        {
+            constexpr int XSNV_FLANK = 15;
+            constexpr int XSNV_MIN_ANCHORS = 15;
+            // collect pileup SNV keys (1-based VCF pos) so we don't double-emit
+            std::unordered_set<uint64_t> pileup_keys;
+            pileup_keys.reserve(n_snv);
+            for (size_t i = 0; i < n_snv; ++i)
+                pileup_keys.insert(colkey(orecs[i].cid, orecs[i].pos));
+            struct XsnvAgg { int anchors = 0; uint32_t altcid = 0, altpos = 0; };
+            std::map<std::tuple<uint32_t,uint32_t,char,char>, XsnvAgg> xim;
+            for (auto& kv : kidx) {
+                const auto& occ = kv.second;
+                if (occ.size() != 2) continue;
+                uint32_t cax, pax, cbx, pbx; uint8_t oax, obx;
+                std::tie(cax, pax, oax) = occ[0]; std::tie(cbx, pbx, obx) = occ[1];
+                if (cax == cbx) continue;
+                uint32_t rcx, rpx, acx, apx; uint8_t rox, aox;
+                if (cd.contigs[cax].size() >= cd.contigs[cbx].size()) {
+                    rcx=cax; rpx=pax; rox=oax; acx=cbx; apx=pbx; aox=obx;
+                } else {
+                    rcx=cbx; rpx=pbx; rox=obx; acx=cax; apx=pax; aox=oax;
+                }
+                bool oppx = (rox != aox);
+                std::string Bx = oppx ? rc_str(cd.contigs[acx]) : cd.contigs[acx];
+                uint32_t qBx = oppx ? (uint32_t)(cd.contigs[acx].size() - apx - BK) : apx;
+                SnvBubble sb = extract_snv_bubble(cd.contigs[rcx], rpx, Bx, qBx, XSNV_FLANK);
+                if (!sb.ok) continue;
+                // position of the bubble in alt contig's FORWARD strand
+                uint32_t d = sb.apos - rpx;
+                uint32_t alt_pos_fwd = oppx
+                    ? (uint32_t)(cd.contigs[acx].size() - 1u) - (qBx + d)
+                    : qBx + d;
+                auto& xa = xim[std::make_tuple(rcx, sb.apos, sb.ref_base, sb.alt_base)];
+                xa.anchors++;
+                xa.altcid = acx;
+                xa.altpos = alt_pos_fwd;   // last writer wins; all anchors for same bubble agree
+            }
+            for (auto& kv : xim) {
+                uint32_t cid2, apos2; char rb2, ab2;
+                std::tie(cid2, apos2, rb2, ab2) = kv.first;
+                XsnvAgg& xa = kv.second;
+                if (xa.anchors < XSNV_MIN_ANCHORS) continue;
+                uint32_t vcf_pos2 = apos2 + 1u;              // 0-based apos → 1-based VCF POS
+                if (pileup_keys.count(colkey(cid2, vcf_pos2))) continue;
+                // position-specific coverage on both contigs (much more accurate than medcov)
+                int refd2 = covwin(cid2, apos2);
+                int altd2 = covwin(xa.altcid, xa.altpos);
+                if (refd2 < MC || altd2 < MC) continue;
+                int dp2 = refd2 + altd2;
+                double af2 = (double)altd2 / std::max(1, dp2);
+                // gate 2: allele balance — genuine het pair has ~equal depth on each contig
+                if (af2 < 0.25 || af2 > 0.75) continue;
+                // gate 3: total DP close to one haplotype coverage (H); inflated DP = collapsed contig
+                if (dp2 > (int)(H * 1.8 + 0.5)) continue;
+                char inf2[96];
+                snprintf(inf2, sizeof inf2, "AF=%.3f;DP=%d;ANCHORS=%d;SOURCE=XCONTIG",
+                         af2, dp2, xa.anchors);
+                orecs.push_back({cid2, vcf_pos2, std::string(1, rb2), std::string(1, ab2), inf2});
+                ++n_xsnv;
+            }
+        }
+        skip_xsnv:;
     }
 
     // ── 6c. Write all records, sorted by (contig, pos) so the VCF is valid ──
@@ -470,12 +637,15 @@ int run_variant_call(const std::vector<Read>& reads, const CallData& cd,
     FILE* f = fopen(out_vcf.c_str(), "w");
     if (!f) { fprintf(stderr, "caller: cannot open %s\n", out_vcf.c_str()); return -1; }
     fprintf(f, "##fileformat=VCFv4.2\n##source=ARCS-reffree-caller\n");
+    // Declare each assembled contig so the VCF is self-contained (POS is 1-based per VCF v4.2).
+    for (size_t ci = 0; ci < cd.contigs.size(); ++ci)
+        fprintf(f, "##contig=<ID=contig_%zu,length=%zu>\n", ci, cd.contigs[ci].size());
     fprintf(f, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n");
     for (auto& r : orecs)
         fprintf(f, "contig_%u\t%u\t.\t%s\t%s\t.\tPASS\t%s\n",
                 r.cid, r.pos, r.ref.c_str(), r.alt.c_str(), r.info.c_str());
     fclose(f);
-    fprintf(stderr, "[CALL] H=%u candidates=%zu SNVs=%zu indels=%zu -> %s\n",
-            H, C.size(), n_snv, n_indel, out_vcf.c_str());
+    fprintf(stderr, "[CALL] H=%u candidates=%zu SNVs=%zu+%zu indels=%zu -> %s\n",
+            H, C.size(), n_snv, n_xsnv, n_indel, out_vcf.c_str());
     return (int)orecs.size();
 }

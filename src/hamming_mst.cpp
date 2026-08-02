@@ -12,7 +12,7 @@ float hamming_shift_dist(const std::string& a, const std::string& b, int max_shi
     int la = (int)a.size(), lb = (int)b.size();
     if (la == 0 || lb == 0) return 1.0f;
 
-    float best = 1.0f;
+    float best = (float)la * 2.0f; // worst possible encoding cost (unnormalized)
 
     for (int shift = -max_shift; shift <= max_shift; ++shift) {
         int start_a = std::max(0,  shift);
@@ -24,7 +24,9 @@ float hamming_shift_dist(const std::string& a, const std::string& b, int max_shi
         for (int i = 0; i < len; ++i) {
             if (a[start_a + i] != b[start_b + i]) ++ham;
         }
-        float d = (float)ham / len;
+        // Encoding cost: each mismatch costs ~2 bytes (varint pos + packed base),
+        // each nonoverlap base costs ~1 byte (ACGT char). Minimize total.
+        float d = (float)(ham * 2 + std::abs(shift)) / (float)la;
         if (d < best) best = d;
     }
     return best;

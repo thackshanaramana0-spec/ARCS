@@ -8,6 +8,7 @@
 #include "mst_encoder.h"
 #include "chain_encoder.h"
 #include "name_num_codec.h"
+#include "bsc_codec.h"
 #include <cstring>
 #include <sstream>
 #include <algorithm>
@@ -810,7 +811,9 @@ void ARCSDecoder::decode_wgs_mst(const ARCSReader& rdr, FASTQWriter& out_writer)
     if (n_reads == 0)  n_reads  = hdr.n_reads;
 
     // ── 2. Decode sequences ───────────────────────────────────────────────────
-    // MST_TREE and MST_DELTAS are stored LZMA-compressed in the archive.
+    // MST_TREE: BSC-compressed parent pointer array.
+    // MST_DELTAS: LZMA-compressed metadata (flags, shifts, sub positions, nonoverlap lengths).
+    // MST_SEQ_TEXT: BSC-compressed ACGT text stream (root seqs + sub bases + nonoverlap segs).
     auto tree_compressed  = rdr.read_blob(BlobType::MST_TREE);
     auto delta_compressed = rdr.read_blob(BlobType::MST_DELTAS);
     auto rc_blob          = rdr.has_blob(BlobType::MST_RC_FLAGS) ?
@@ -818,16 +821,24 @@ void ARCSDecoder::decode_wgs_mst(const ARCSReader& rdr, FASTQWriter& out_writer)
     ARCS_CHECK(!tree_compressed.empty(),  "MST_TREE blob missing");
     ARCS_CHECK(!delta_compressed.empty(), "MST_DELTAS blob missing");
 
-    auto tree_blob  = arcs_decompress(tree_compressed.data(),  tree_compressed.size());
+    auto tree_blob  = bsc_decompress_buf(tree_compressed.data(),  tree_compressed.size());
     auto delta_blob = arcs_decompress(delta_compressed.data(), delta_compressed.size());
+
+    // Seq text: present in text-separated format (MST_SEQ_TEXT blob).
+    std::vector<uint8_t> seq_text_blob;
+    if (rdr.has_blob(BlobType::MST_SEQ_TEXT)) {
+        auto stc = rdr.read_blob(BlobType::MST_SEQ_TEXT);
+        seq_text_blob = bsc_decompress_buf(stc.data(), stc.size());
+    }
 
     MSTSequenceDecoder mst_dec;
     std::vector<uint32_t>            dfs_order;
     std::vector<uint32_t>            parents;
     std::vector<std::vector<bool>>   dev_sets;
+    const std::vector<uint8_t>* seq_text_ptr = seq_text_blob.empty() ? nullptr : &seq_text_blob;
     auto seqs = mst_dec.decode_sequences(
         tree_blob, delta_blob, rc_blob,
-        n_reads, read_len, &dfs_order, &parents, &dev_sets);
+        n_reads, read_len, &dfs_order, &parents, &dev_sets, seq_text_ptr);
 
     // ── 3. Decode quality ─────────────────────────────────────────────────────
     auto q_data       = rdr.has_blob(BlobType::QUALITY_DATA)  ? rdr.read_blob(BlobType::QUALITY_DATA)  : std::vector<uint8_t>{};
@@ -898,7 +909,7 @@ void ARCSDecoder::decode_wgs_chain(const ARCSReader& rdr, FASTQWriter& out_write
 
     auto delta_compressed = rdr.read_blob(BlobType::MST_DELTAS);
     ARCS_CHECK(!delta_compressed.empty(), "MST_DELTAS blob missing");
-    auto delta_blob = arcs_decompress(delta_compressed.data(), delta_compressed.size());
+    auto delta_blob = bsc_decompress_buf(delta_compressed.data(), delta_compressed.size());
 
     auto rc_blob = rdr.has_blob(BlobType::MST_RC_FLAGS)
                    ? rdr.read_blob(BlobType::MST_RC_FLAGS)
@@ -1027,6 +1038,12 @@ static std::string decompress_pg(const std::vector<uint8_t>& blob) {
     const uint8_t* payload = blob.data() + 1;
     size_t  plen           = blob.size() - 1;
 
+    if (flag == 0x08) {
+        // 2-bit + LZMA-9 fast decode (format 0x08, trial24).
+        // Non-ACTG fallback payload is plain LZMA-ASCII (same as vle_decode_pg).
+        std::vector<uint8_t> data(payload, payload + plen);
+        return pg_decode_2bit(data);
+    }
     if (flag == 0x04) {
         // ARCS-DNA embedded decoder (no subprocess, no temp files).
         std::vector<uint8_t> data(payload, payload + plen);
@@ -1245,6 +1262,16 @@ void ARCSDecoder::decode_wgs_chain_pg(const ARCSReader& rdr, FASTQWriter& out_wr
     std::string pg = pg_fut.get();
     ARCS_CHECK(!pg.empty(), "chain-pg: pg decompression failed");
     _dmark("pg_decode");
+    if (DEC_TIMING) {
+        fprintf(stderr, "[DEC] pg_blob_bytes: %zu  (FCM-compressed in archive)\n", _pg_raw.size());
+        fprintf(stderr, "[DEC] pg_raw_chars:  %zu  (uncompressed pseudogenome)\n", pg.size());
+    }
+    if (getenv("ARCS_DUMP_PG")) {
+        const char* path = getenv("ARCS_DUMP_PG");
+        FILE* f = fopen(path, "wb");
+        if (f) { fwrite(pg.data(), 1, pg.size(), f); fclose(f); }
+        fprintf(stderr, "[DEC] pg dumped to %s (%zu bytes)\n", path, pg.size());
+    }
 
     // ── 2. Parse pg positions ─────────────────────────────────────────────────
     std::vector<uint32_t> pg_pos(n);
@@ -1569,19 +1596,40 @@ void ARCSDecoder::print_info(const std::string& input_path) {
     printf("k-mer size:  %d\n",   hdr.k);
     printf("Flags:       0x%02X\n", hdr.flags);
 
-    // Print blob sizes
+    // Print blob sizes — enumerate all known BlobType values
     printf("\nBlob sizes:\n");
-    static const char* blob_names[] = {
-        "GENOME","NAMES","SE_POSITIONS","PE_R2_DELTAS",
-        "MISMATCHES","QUALITY_MODEL","QUALITY_DATA","UNMAPPED",
-        "GUTENSOR","STRAND_FLAGS","PE_STATS",
-        "MST_TREE","MST_DELTAS","MST_RC_FLAGS","COUNT_DATA","QUALITY_PERM"
+    static const struct { BlobType type; const char* name; } known_blobs[] = {
+        { BlobType::GENOME,          "GENOME"          },
+        { BlobType::NAMES,           "NAMES"           },
+        { BlobType::SE_POSITIONS,    "SE_POSITIONS"    },
+        { BlobType::PE_R2_DELTAS,    "PE_R2_DELTAS"    },
+        { BlobType::MISMATCHES,      "MISMATCHES"      },
+        { BlobType::QUALITY_MODEL,   "QUALITY_MODEL"   },
+        { BlobType::QUALITY_DATA,    "QUALITY_DATA"    },
+        { BlobType::UNMAPPED,        "UNMAPPED"        },
+        { BlobType::GUTENSOR,        "GUTENSOR"        },
+        { BlobType::STRAND_FLAGS,    "STRAND_FLAGS"    },
+        { BlobType::PE_STATS,        "PE_STATS"        },
+        { BlobType::MST_TREE,        "MST_TREE"        },
+        { BlobType::MST_DELTAS,      "MST_DELTAS"      },
+        { BlobType::MST_RC_FLAGS,    "MST_RC_FLAGS"    },
+        { BlobType::COUNT_DATA,      "COUNT_DATA"      },
+        { BlobType::QUALITY_PERM,    "QUALITY_PERM"    },
+        { BlobType::CHUNK_DATA,      "CHUNK_DATA"      },
+        { BlobType::CHAIN_STARTS,    "CHAIN_STARTS"    },
+        { BlobType::CHAIN_READ_PERM, "CHAIN_READ_PERM" },
+        { BlobType::MST_TREE_DFS,    "MST_TREE_DFS"    },
+        { BlobType::CHAIN_VSEQ,      "CHAIN_VSEQ"      },
+        { BlobType::CHAIN_PG_SEQ,    "CHAIN_PG_SEQ"    },
+        { BlobType::CHAIN_PG_POS,    "CHAIN_PG_POS"    },
+        { BlobType::CHAIN_PG_AUX,    "CHAIN_PG_AUX"    },
+        { BlobType::PLUS_LINES,      "PLUS_LINES"      },
+        { BlobType::MST_SEQ_TEXT,    "MST_SEQ_TEXT"    },
     };
-    for (int t = 0; t < (int)BlobType::MAX_BLOB_ID; ++t) {
-        BlobType bt = (BlobType)t;
-        if (rdr.has_blob(bt)) {
-            auto blob = rdr.read_blob(bt);
-            printf("  %-20s %7zu bytes\n", blob_names[t], blob.size());
+    for (const auto& kb : known_blobs) {
+        if (rdr.has_blob(kb.type)) {
+            auto blob = rdr.read_blob(kb.type);
+            printf("  %-20s %7zu bytes\n", kb.name, blob.size());
         }
     }
 }

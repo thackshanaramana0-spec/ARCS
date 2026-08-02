@@ -4,6 +4,74 @@ All notable changes to ARCS are documented here.
 
 ---
 
+## v2.2.0 — 2026-08-02
+
+### Fast-decode mode (`--fast-decode`)
+
+- **`--fast-decode`** CLI flag: 2-bit packed DNA (zstd-6, format 0x08) + precomputed
+  2-dimensional quality table. Decompress ~8–30× faster than default adaptive CM,
+  matching Genozip's decode speed class.
+  - GIAB: 0.28 s decompress (vs 1.9 s default), 4,414,819 B (−12.2% vs Genozip, −21.3% vs SPRING).
+  - DS7: 0.21 s decompress (vs ~15 s default), 4,990,674 B (−1.8% vs Genozip).
+  - Archive is ~2% larger than default but still beats all lossless competitors.
+  - Decoder auto-detects mode via format byte (0x08) — no flag needed at decompress time.
+  - Serial assembly forced (`ARCS_PAR_SHARDS=1`) to keep pg compact in this mode.
+
+### Parallel shard assembly (4× compress speedup by default)
+
+- Reads split round-robin into `min(4, hw_cores)` shards; each shard assembled in its
+  own thread via `build_multicontig_pg`; results merged with globally-remapped indices.
+- GIAB: assembly 7.65 s → 1.72 s (4× speedup). Ratio: +1.48% GIAB, +0.1% DS7 vs serial.
+- Thread-safe: `MAX_CAND`/`MAX_BUCKET` (`chain_encoder.cpp`) converted to file-scope
+  lambda-initialized constants — no writes during parallel shard calls.
+- Disabled automatically when `--call` is active (unified assembly required for CallData
+  index consistency) or dataset < 8000 reads. Override: `ARCS_PAR_SHARDS=N`.
+
+### BSC codec for MST tree and chain delta streams
+
+- MST `tree_bytes` and chain `delta_bytes` now compressed with libbsc (BWT + QLFC)
+  instead of LZMA. BSC outperforms LZMA on structured binary parent-pointer and
+  delta-metadata streams.
+- MST encoder refactored: ACGT sequence text separated into its own `MST_SEQ_TEXT` blob
+  (BSC-compressed), leaving `MST_DELTAS` as pure metadata (flags, shifts, positions).
+  MST alignment cost metric updated to `n_mm*2 + |shift|` (encoding-cost aware).
+- New blob type `MST_SEQ_TEXT = 26`; `MAX_BLOB_ID` bumped to 32.
+- `libbsc` bundled in `third_party/libbsc/` (BWT + QLFC + LZP, MIT-compatible license).
+
+### Static + fast quality models
+
+- `ARCS_QUAL_STATIC=1`: two-pass encode prescan builds global FreqMap CDFs, stores them
+  LZMA-compressed in the blob. Decoder uses direct table lookup — no adaptive updates.
+  ~3–5× faster quality decode. Archive cost: ~30–60 KB overhead.
+- `ARCS_QUAL_FAST=1` (used by `--fast-decode`): precomputed 2-dimensional quality table
+  (position × previous-quality). Extremely fast decode, lossless, stored in archive.
+
+### Caller improvements
+
+- STR/tandem-repeat detection: bubbles whose sequence is a short tandem unit (≤4 bp)
+  present in the left-flank context are flagged as STR length events and require stronger
+  anchor evidence before calling.
+- Cross-contig SNV bubble extractor: detects single-substitution bubbles between two
+  haplotype contigs that diverge at exactly one base then reconverge.
+- H-estimation (haploid depth) fixed: count-frequency histogram mode-finding replaces
+  k²-weighted and pileup-median approaches, which both failed at high coverage.
+- Contig dump format fixed: `>contig_N` FASTA header (was bare tab-separated).
+
+### Corrected variant calling numbers
+
+- Het-SNV F1 corrected to **0.936** (HG002–HG005 average, 5 chr20 windows each,
+  4 individuals) from the previously-reported 0.957 (which averaged single-window results
+  rather than the full 5-window-per-individual benchmark).
+- ARCS still leads: 0.936 > DiscoSNP++ 0.918 > Kmer2SNP 0.532.
+- HG001 (NA12878) 5-region average 0.943 unchanged.
+
+### Blob debug printer
+
+- `arcs info` blob size output updated to enumerate all 26 known `BlobType` values
+  (previously capped at IDs 0–15, missing `CHAIN_PG_*`, `PLUS_LINES`, `MST_SEQ_TEXT`).
+
+---
+
 ## v2.1.0 — 2026-07-23
 
 ### Dual-mode sequence codec

@@ -806,6 +806,66 @@ std::string vle_decode_pg(const std::vector<uint8_t>& data) {
     return std::string(raw.begin(), raw.end());
 }
 
+// ── 2-bit + LZMA pg codec (format 0x08) ──────────────────────────────────────
+// Z4 encoding: A=0, C=1, T=2, G=3 (complement = +2 mod 4, complement = XOR high bit).
+// Pack 4 bases per byte MSB-first, LZMA-9 compress. Decode ~10ms vs 26s FCM.
+// M2 result: +2.2% vs FCM on DS2 (trial24). Non-ACTG chars → fall back to ASCII LZMA.
+
+static const char S_I2B[4] = {'A','C','T','G'};
+static int S_B2I[256];
+static bool s_b2i_ready = false;
+static void s_init_b2i() {
+    if (s_b2i_ready) return;
+    for (int& v : S_B2I) v = 0;
+    S_B2I[(uint8_t)'A'] = S_B2I[(uint8_t)'a'] = 0;
+    S_B2I[(uint8_t)'C'] = S_B2I[(uint8_t)'c'] = 1;
+    S_B2I[(uint8_t)'T'] = S_B2I[(uint8_t)'t'] = 2;
+    S_B2I[(uint8_t)'G'] = S_B2I[(uint8_t)'g'] = 3;
+    s_b2i_ready = true;
+}
+
+static bool s_pg_is_pure_actg(const std::string& pg) {
+    for (unsigned char c : pg)
+        if (c != 'A' && c != 'C' && c != 'T' && c != 'G') return false;
+    return true;
+}
+
+std::vector<uint8_t> pg_encode_2bit(const std::string& pg) {
+    s_init_b2i();
+    if (!s_pg_is_pure_actg(pg)) {
+        // Non-ACTG chars present: fall back to LZMA on ASCII (same ratio, fully lossless).
+        return vle_encode_pg(pg);
+    }
+    const size_t N = pg.size();
+    // 8-byte big-endian N header
+    std::vector<uint8_t> out(8);
+    for (int k = 7; k >= 0; --k) out[7-k] = (uint8_t)(N >> (k * 8));
+    // Pack: 4 bases/byte, MSB-first (base i → bits [7-6, 5-4, 3-2, 1-0])
+    std::vector<uint8_t> packed((N + 3) / 4, 0);
+    for (size_t i = 0; i < N; ++i)
+        packed[i >> 2] |= (uint8_t)(S_B2I[(uint8_t)pg[i]] << (6 - (i & 3) * 2));
+    // zstd-6: ~1 GB/s decompress vs LZMA's ~50 MB/s → 20× faster; ratio ~= LZMA-3.
+    // arcs_decompress auto-detects zstd magic (at byte 8 of the zstd_compress output).
+    auto comp = zstd_compress(packed, 6);
+    out.insert(out.end(), comp.begin(), comp.end());
+    return out;
+}
+
+std::string pg_decode_2bit(const std::vector<uint8_t>& data) {
+    s_init_b2i();
+    if (data.size() < 8) return {};
+    uint64_t N = 0;
+    for (int i = 0; i < 8; ++i) N = (N << 8) | data[i];
+    if (N == 0) return {};
+    std::vector<uint8_t> comp(data.begin() + 8, data.end());
+    auto packed = arcs_decompress(comp.data(), comp.size());
+    if (packed.empty()) return {};
+    std::string out(N, 'A');
+    for (size_t i = 0; i < N; ++i)
+        out[i] = S_I2B[(packed[i >> 2] >> (6 - (i & 3) * 2)) & 3];
+    return out;
+}
+
 // ── compute_pg_surprise (idea B) ──────────────────────────────────────────────
 // Deterministic low-order causal FCM confidence bucketer. Depends only on `pg`,
 // so encoder and decoder derive identical buckets from the identical (decoded)

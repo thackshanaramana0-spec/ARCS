@@ -43,6 +43,14 @@ std::string dna_decode(const std::vector<uint8_t>& data,
 std::vector<uint8_t> vle_encode_pg(const std::string& pg);
 std::string          vle_decode_pg(const std::vector<uint8_t>& data);
 
+// ── 2-bit + LZMA pg codec (format 0x08, fast-decode) ─────────────────────────
+// Z4 encoding A=0,C=1,T=2,G=3 (complement = +2 mod 4). Packs 4 bases/byte
+// MSB-first, then LZMA-9. Decode: ~10ms vs 26s FCM for 12MB pg (DS2).
+// Ratio: +2.2% vs FCM on DS2 (M2 measurement, trial24). Non-ACTG pg falls
+// back to vle_encode_pg (LZMA-ASCII, format 0x07-style payload).
+std::vector<uint8_t> pg_encode_2bit(const std::string& pg);
+std::string          pg_decode_2bit(const std::vector<uint8_t>& data);
+
 // ── Cross-stream quality: pseudogenome "surprise" signal (idea B) ─────────────
 // Computes, for each base of the pseudogenome, a quantized local-predictability
 // ("surprise") bucket in [0, nbuckets): a low-order causal finite-context model

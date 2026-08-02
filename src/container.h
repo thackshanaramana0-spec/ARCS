@@ -69,7 +69,8 @@ enum class BlobType : uint32_t {
     CHAIN_PG_POS   = 23, // chain-pg pg positions: LZMA-9 of uint32_be[n_reads] (chain order)
     CHAIN_PG_AUX   = 24, // chain-pg RC+mm+N+qmm data: LZMA-9 of columnar binary (chain order)
     PLUS_LINES     = 25, // arbitrary '+' line suffixes (assembly order, newline-joined, LZMA-9)
-    MAX_BLOB_ID    = 16  // reserved blob-table slots (chunked outer archive uses only 1)
+    MST_SEQ_TEXT   = 26, // MST ACGT text stream (root seqs + nonoverlap + sub bases) BSC-compressed
+    MAX_BLOB_ID    = 32  // reserved blob-table slots (chunked outer archive uses only 1)
 };
 
 static constexpr size_t HEADER_SIZE    = 64;

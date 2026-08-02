@@ -63,6 +63,7 @@ ReadAlignResult align_reads(const std::string& parent,
     best.overlap_len = L;
     best.n_subs     = max_mm + 1; // sentinel: worse than any valid alignment
     best.rc_child   = false;
+    int best_cost   = L * 3; // worst possible encoding cost: n_mm*2 + |shift|
 
     auto try_align = [&](const std::string& ch, bool rc) {
         for (int s = -max_shift; s <= max_shift; ++s) {
@@ -79,9 +80,12 @@ ReadAlignResult align_reads(const std::string& parent,
             int n_mm = hamming_count(parent.data() + pa_start, ch.data() + ch_start, ov_len);
             if (n_mm > max_mm) continue;
 
-            // Better than current best?
-            if (n_mm < best.n_subs ||
-                (n_mm == best.n_subs && ov_len > best.overlap_len)) {
+            // Select alignment that minimises encoding cost:
+            // each mismatch costs ~2 bytes, each nonoverlap base costs ~1 byte.
+            int cost = n_mm * 2 + std::abs(s);
+            if (cost < best_cost ||
+                (cost == best_cost && ov_len > best.overlap_len)) {
+                best_cost       = cost;
                 best.shift      = s;
                 best.overlap_len = ov_len;
                 best.n_subs     = n_mm;
@@ -688,13 +692,15 @@ std::vector<uint8_t> MSTSequenceEncoder::encode_deltas(
     }
 
     // ── Phase C: serialise in DFS order (sequential, no expensive ops) ────────
-    std::vector<uint8_t> out;
-    out.reserve((size_t)n * L / 4);
+    std::vector<uint8_t> out;       // metadata only (flags, shifts, positions, lengths)
+    std::vector<uint8_t> seq_text;  // ACGT chars: root seqs + sub bases + nonoverlap segs
+    out.reserve((size_t)n * 8);
+    seq_text.reserve((size_t)n * L);
 
     double total_subs = 0, total_overlap = 0;
     size_t n_root = 0, n_delta = 0;
 
-    // Helper: write N-position list for a sequence (decoder restores ambiguous bases).
+    // Helper: write N-position list into meta stream (decoder restores ambiguous bases).
     auto write_N_positions = [&](const std::string& s) {
         std::vector<uint32_t> npos;
         for (int p = 0; p < (int)s.size(); ++p)
@@ -704,19 +710,12 @@ std::vector<uint8_t> MSTSequenceEncoder::encode_deltas(
         for (uint32_t p : npos) { write_varint(out, p - prev); prev = p; }
     };
 
-    // write_seq: pack read bases as 2-bit, no flag byte.
+    // write_seq: emit L ACGT chars into seq_text, then N-positions into meta.
     auto write_seq = [&](uint32_t idx) {
         const std::string& seq = reads[idx].seq;
-        int bytes_needed = (L + 3) / 4;
-        for (int b = 0; b < bytes_needed; ++b) {
-            uint8_t packed = 0;
-            for (int j = 0; j < 4; ++j) {
-                int pos = b * 4 + j;
-                uint8_t base = (pos < L) ? encode_base(seq[pos]) : 0;
-                if (base > 3) base = 0;
-                packed |= (base << (6 - j * 2));
-            }
-            out.push_back(packed);
+        for (int p = 0; p < L; ++p) {
+            uint8_t base = encode_base(seq[p]);
+            seq_text.push_back(base < 4 ? BASE_TO_CHAR[base] : 'A');
         }
         write_N_positions(seq);
     };
@@ -767,15 +766,11 @@ std::vector<uint8_t> MSTSequenceEncoder::encode_deltas(
             prev_pos = pos;
         }
 
+        // Sub bases: emit as ACGT chars into seq_text (not packed binary).
         int n_subs = aln.n_subs;
-        for (int i = 0; i < n_subs; i += 4) {
-            uint8_t packed = 0;
-            for (int j = 0; j < 4 && i + j < n_subs; ++j) {
-                uint8_t b = aln.sub_bases[i + j];
-                if (b > 3) b = 0;
-                packed |= (b << (6 - j * 2));
-            }
-            out.push_back(packed);
+        for (int i = 0; i < n_subs; ++i) {
+            uint8_t b = aln.sub_bases[i];
+            seq_text.push_back(b < 4 ? BASE_TO_CHAR[b] : 'A');
         }
 
         {
@@ -794,20 +789,11 @@ std::vector<uint8_t> MSTSequenceEncoder::encode_deltas(
                 nonoverlap_len   = 0;
             }
             write_varint(out, nonoverlap_len);
-            if (nonoverlap_len > 0) {
-                int bytes_needed = (nonoverlap_len + 3) / 4;
-                for (int b = 0; b < bytes_needed; ++b) {
-                    uint8_t packed = 0;
-                    for (int j = 0; j < 4; ++j) {
-                        int local_pos = b * 4 + j;
-                        int seq_pos   = nonoverlap_start + local_pos;
-                        uint8_t base  = (local_pos < nonoverlap_len && seq_pos < L)
-                                        ? encode_base(cu[seq_pos]) : 0;
-                        if (base > 3) base = 0;
-                        packed |= (base << (6 - j * 2));
-                    }
-                    out.push_back(packed);
-                }
+            // Nonoverlap bases: emit as ACGT chars into seq_text (not packed binary).
+            for (int i = 0; i < nonoverlap_len; ++i) {
+                int seq_pos  = nonoverlap_start + i;
+                uint8_t base = (seq_pos < L) ? encode_base(cu[seq_pos]) : 0;
+                seq_text.push_back(base < 4 ? BASE_TO_CHAR[base] : 'A');
             }
         }
 
@@ -821,6 +807,7 @@ std::vector<uint8_t> MSTSequenceEncoder::encode_deltas(
     stats.n_delta_reads     = n_delta;
     stats.avg_subs_per_read = n_delta > 0 ? total_subs / n_delta : 0.0;
     stats.avg_overlap       = n_delta > 0 ? total_overlap / n_delta : 0.0;
+    stats.seq_text_bytes    = std::move(seq_text);
 
     return out;
 }
@@ -1239,7 +1226,8 @@ std::vector<std::string> MSTSequenceDecoder::decode_sequences(
     int                         read_len,
     std::vector<uint32_t>*      dfs_order_out,
     std::vector<uint32_t>*      parents_out,
-    std::vector<std::vector<bool>>* dev_sets_out) const {
+    std::vector<std::vector<bool>>* dev_sets_out,
+    const std::vector<uint8_t>* seq_text) const {
 
     if (n_reads == 0) return {};
     int L = read_len;
@@ -1307,6 +1295,21 @@ std::vector<std::string> MSTSequenceDecoder::decode_sequences(
     const uint8_t* dp  = delta_bytes.data();
     const uint8_t* den = dp + delta_bytes.size();
 
+    // seq_text stream: ACGT chars for root seqs + sub bases + nonoverlap segs.
+    // Present only in archives written with the text-separated format (MST_SEQ_TEXT blob).
+    const uint8_t* sp  = (seq_text && !seq_text->empty()) ? seq_text->data() : nullptr;
+    const uint8_t* sen = sp ? sp + seq_text->size() : nullptr;
+
+    auto read_seq_text = [&](int len) -> std::string {
+        ARCS_CHECK(sp != nullptr, "seq_text pointer null but text format expected");
+        std::string s(len, 'A');
+        for (int i = 0; i < len; ++i) {
+            ARCS_CHECK(sp < sen, "seq_text stream underflow");
+            s[i] = (char)*sp++;
+        }
+        return s;
+    };
+
     auto unpack_bases = [&](int len) -> std::string {
         std::string s(len, 'A');
         int bytes_needed = (len + 3) / 4;
@@ -1345,7 +1348,7 @@ std::vector<std::string> MSTSequenceDecoder::decode_sequences(
 
         if ((flags & 0x01) == 0x00) {
             // Root: verbatim — enc_frame and decoded are both the stored sequence.
-            std::string seq = unpack_bases(L);
+            std::string seq = sp ? read_seq_text(L) : unpack_bases(L);
             restore_N(seq);             // overwrite N→A positions with 'N'
             enc_frame[read_idx] = seq;
             decoded[read_idx]   = seq;
@@ -1364,19 +1367,27 @@ std::vector<std::string> MSTSequenceDecoder::decode_sequences(
                 prev = sub_pos[i];
             }
 
-            // Read substitution bases
+            // Read substitution bases (from seq_text as ACGT, or from packed meta).
             std::vector<uint8_t> sub_bases(n_subs);
-            for (int i = 0; i < n_subs; i += 4) {
-                ARCS_CHECK(dp < den, "delta stream underflow (sub bases)");
-                uint8_t packed = *dp++;
-                for (int j = 0; j < 4 && i + j < n_subs; ++j)
-                    sub_bases[i + j] = (packed >> (6 - j * 2)) & 3;
+            if (sp) {
+                for (int i = 0; i < n_subs; ++i) {
+                    ARCS_CHECK(sp < sen, "seq_text underflow (sub bases)");
+                    uint8_t base = encode_base((char)*sp++);
+                    sub_bases[i] = (base < 4) ? base : 0;
+                }
+            } else {
+                for (int i = 0; i < n_subs; i += 4) {
+                    ARCS_CHECK(dp < den, "delta stream underflow (sub bases)");
+                    uint8_t packed = *dp++;
+                    for (int j = 0; j < 4 && i + j < n_subs; ++j)
+                        sub_bases[i + j] = (packed >> (6 - j * 2)) & 3;
+                }
             }
 
             // Read non-overlapping portion length and bases
             int extra_len = (int)read_varint(dp, den);
             std::string extra;
-            if (extra_len > 0) extra = unpack_bases(extra_len);
+            if (extra_len > 0) extra = sp ? read_seq_text(extra_len) : unpack_bases(extra_len);
 
             // Build child sequence from the parent's encoding frame.
             uint32_t par = parents[read_idx];

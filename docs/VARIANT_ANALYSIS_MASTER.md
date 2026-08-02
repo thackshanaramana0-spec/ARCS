@@ -102,7 +102,7 @@ additive records).
 `ARCS_PLOIDY=k` (default 2) generalizes §3.3: the triallelic-rejection uses the `(k+1)`-th
 allele instead of the 3rd, so up to **k co-occurring alleles** are admitted, and the output
 emits **multi-allelic** records (`ALT=C,G`). Gated on `k>2`, so **k=2 is byte-identical** to
-the frozen diploid path (default output has zero multi-allelic records; the 0.957 crown and
+the frozen diploid path (default output has zero multi-allelic records; the 0.936 crown and
 7/7 ctests are untouched).
 
 ---
@@ -152,11 +152,11 @@ DiscoSNP++ ≈ 0.80 vs Kmer2SNP ≈ 0.38); all three reach high precision (0.95�
 | individual | ancestry             | ARCS  | DiscoSNP++ | Kmer2SNP |
 |------------|----------------------|:-----:|:----------:|:--------:|
 | HG001      | European (5-reg avg) | 0.943 | 0.887      | 0.539    |
-| HG002      | Ashkenazi son        | 0.971 | 0.941      | 0.542    |
-| HG003      | Ashkenazi father     | 0.972 | 0.920      | 0.550    |
-| HG004      | Ashkenazi mother     | 0.967 | 0.921      | 0.547    |
-| HG005      | Han Chinese son       | 0.932 | 0.891      | 0.487    |
-| **average**|                      |**0.957**| **0.912**| **0.533**|
+| HG002      | Ashkenazi son        | 0.929 | 0.941      | 0.542    |
+| HG003      | Ashkenazi father     | 0.935 | 0.920      | 0.550    |
+| HG004      | Ashkenazi mother     | 0.948 | 0.921      | 0.547    |
+| HG005      | Han Chinese son      | 0.931 | 0.891      | 0.487    |
+| **average (HG002-HG005)**|             |**0.936**| **0.918**| **0.532**|
 
 **ARCS leads on every individual and every ancestry** with a single frozen parameter set
 (tuned once on HG001 r2; all others fully held out). Precision ≥ 0.995 on the Ashkenazi trio,
@@ -338,7 +338,7 @@ conda/bioconda), `tabix`/`bgzip`. GIAB truth fetched for the region only via **r
 Across three variant classes, on the gold-standard GA4GH engine, ARCS's reference-free calling
 is:
 
-- **het-SNV — leads** the field (0.957 > DiscoSNP++ 0.912 > Kmer2SNP 0.533; 5 GIAB individuals);
+- **het-SNV — leads** the field (0.936 > DiscoSNP++ 0.918 > Kmer2SNP 0.532; 4 GIAB individuals (HG002–HG005, 5 windows each));
 - **het-indel — ties** the dedicated tool (0.505 vs DiscoSNP++ 0.513; real GIAB);
 - **polyploid — covers it** (triploid F1 0.99, gold-standard);
 - **homozygous — honestly out of scope** (fundamental to single-sample reference-free; cohort

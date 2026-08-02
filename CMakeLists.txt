@@ -85,6 +85,21 @@ function(target_link_zstd tgt)
     endif()
 endfunction()
 
+# ── libbsc (bundled) ──────────────────────────────────────────────────────────
+set(LIBBSC_SOURCES
+    third_party/libbsc/adler32/adler32.cpp
+    third_party/libbsc/bwt/bwt.cpp
+    third_party/libbsc/bwt/divsufsort/divsufsort.c
+    third_party/libbsc/coder/coder.cpp
+    third_party/libbsc/coder/qlfc/qlfc.cpp
+    third_party/libbsc/coder/qlfc/qlfc_model.cpp
+    third_party/libbsc/filters/detectors.cpp
+    third_party/libbsc/filters/preprocessing.cpp
+    third_party/libbsc/libbsc/libbsc.cpp
+    third_party/libbsc/lzp/lzp.cpp
+    third_party/libbsc/platform/platform.cpp
+)
+
 # ── Sources ───────────────────────────────────────────────────────────────────
 set(ARCS_SOURCES
     src/fastq_io.cpp
@@ -104,6 +119,8 @@ set(ARCS_SOURCES
     src/encoder.cpp
     src/decoder.cpp
     src/caller.cpp
+    src/bsc_codec.cpp
+    ${LIBBSC_SOURCES}
 )
 
 # ── Main binary ───────────────────────────────────────────────────────────────
@@ -112,6 +129,7 @@ add_executable(arcs src/main.cpp ${ARCS_SOURCES})
 target_include_directories(arcs PRIVATE
     src/
     third_party/
+    third_party/libbsc
 )
 
 find_package(Threads REQUIRED)

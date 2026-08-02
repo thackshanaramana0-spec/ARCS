@@ -52,7 +52,8 @@ ReadAlignResult align_reads(const std::string& parent,
 // ── MST encoder result ─────────────────────────────────────────────────────────
 struct MSTEncodeResult {
     std::vector<uint8_t> tree_bytes;        // parent indices (compressed)
-    std::vector<uint8_t> delta_bytes;       // shift + sub lists
+    std::vector<uint8_t> delta_bytes;       // shift + sub lists (metadata only, no bases)
+    std::vector<uint8_t> seq_text_bytes;    // ACGT chars: root seqs + sub bases + nonoverlap segs
     std::vector<uint8_t> quality_bytes;     // quality rANS stream
     std::vector<uint8_t> quality_model;     // serialized ContextModel for quality
     std::vector<uint8_t> rc_flags;          // RC flags (bitpacked)
@@ -158,7 +159,8 @@ public:
         int                         read_len,
         std::vector<uint32_t>*           dfs_order_out = nullptr,
         std::vector<uint32_t>*           parents_out   = nullptr,
-        std::vector<std::vector<bool>>*  dev_sets_out  = nullptr
+        std::vector<std::vector<bool>>*  dev_sets_out  = nullptr,
+        const std::vector<uint8_t>*      seq_text      = nullptr
     ) const;
 
     // Decode quality stream back to per-read quality strings in ORIGINAL ORDER.

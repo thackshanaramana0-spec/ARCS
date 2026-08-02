@@ -33,6 +33,8 @@ static void print_usage(const char* prog) {
         "Options (set before subcommand):\n"
         "  --fast           fast mode: lean FCM (5 orders) + sparse merge/place + static quality;\n"
         "                   speed/RAM optimized, always lossless; parallel encode phases preserved\n"
+        "  --fast-decode    fast-decode mode: 2-bit DNA (zstd) + dense quality table;\n"
+        "                   decompress ~8-30x faster (Genozip-speed), ~2%% larger archive\n"
         "  --k <int>        k-mer size (default: auto)\n"
         "  --w <int>        minimizer window (default: 10)\n"
         "  --mink <int>     minimizer k (default: 15)\n"
@@ -70,6 +72,7 @@ int main(int argc, char** argv) {
         else if (opt == "--lossy8")         params.quality_bins = 8;
         else if (opt == "--lossy2")         params.quality_bins = 2;
         else if (opt == "--chunk-size" && i < argc) params.chunk_size = std::stoi(argv[i++]);
+        else if (opt == "--mst")            { params.use_mst = true; params.use_chain_pg = false; params.use_chain = false; }
         else if (opt == "--no-mst")         params.use_mst      = false;
         else if (opt == "--chain")          { params.use_chain = true; params.use_mst = false; }
         else if (opt == "--chain-pg")       { params.use_chain_pg = true; params.use_chain = false; params.use_mst = false; }
@@ -84,6 +87,15 @@ int main(int argc, char** argv) {
                                               SET_ENV("ARCSDNA_ORDERS", "2,4,8,14,22");
                                               SET_ENV("ARCS_MERGE_SPARSE", "8"); SET_ENV("ARCS_PLACE_SPARSE", "4");
                                               SET_ENV("ARCS_QUAL_NOCM", "1"); }
+        else if (opt == "--fast-decode")    { // Fast-decode mode: 2-bit packed DNA (zstd-6) + dense 2-dim quality table.
+                                              // Decompress ~8-30× faster than default adaptive CM, matching Genozip speed.
+                                              // Serial assembly (ARCS_PAR_SHARDS=1) keeps the pg compact so PG_2BIT ratio
+                                              // cost stays ~2% vs default. Parallel shards only help compress speed, not
+                                              // decode speed, and they enlarge pg — wrong tradeoff for this mode.
+                                              // Stored in archive header (format 0x08 / flag 0x08) so decoder auto-detects.
+                                              SET_ENV("ARCS_PG_2BIT", "1");
+                                              SET_ENV("ARCS_QUAL_FAST", "1");
+                                              SET_ENV("ARCS_PAR_SHARDS", "1"); }
         else { fprintf(stderr, "Unknown option: %s\n", opt.c_str()); return 1; }
     }
 

@@ -599,8 +599,10 @@ static inline bool is_acgt_strict(char c) {
 }
 
 constexpr int      DEDUP_K        = 16;    // seed length
-int MAX_CAND   = 96;   // candidate positions verified per read (env ARCS_DEDUP_CAND)
-int MAX_BUCKET = 200;  // cap index bucket size (env ARCS_DEDUP_BUCKET)
+// Initialized once from env vars at startup — const thereafter so parallel
+// calls to build_multicontig_pg can read them without a data race.
+int MAX_CAND   = []{ const char* s = getenv("ARCS_DEDUP_CAND");   return s ? atoi(s) : 96;  }();
+int MAX_BUCKET = []{ const char* s = getenv("ARCS_DEDUP_BUCKET"); return s ? atoi(s) : 200; }();
 
 // Record a read that maps onto existing pg at (pos, rc). target = RC^rc(orig).
 // Uses the read's ACTUAL length (target.size()) so variable-length reads work.
@@ -1025,8 +1027,8 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
     double OV_ERR = 0.06;
     if (const char* s = getenv("ARCS_DEDUP_MAXMM"))  MAXMM      = atoi(s);
     if (const char* s = getenv("ARCS_DEDUP_OVERR"))  OV_ERR     = atof(s);
-    if (const char* s = getenv("ARCS_DEDUP_CAND"))   MAX_CAND   = atoi(s);
-    if (const char* s = getenv("ARCS_DEDUP_BUCKET")) MAX_BUCKET = atoi(s);
+    // MAX_CAND and MAX_BUCKET are initialized once at file scope from env vars;
+    // no per-call writes needed — and omitting them makes parallel shard calls safe.
 
     // ── Sparse placement index — OPT-IN (ARCS_PLACE_SPARSE=w) ─────────────────────
     // On errored/high-coverage data the placement index balloons with spurious distinct
@@ -1417,8 +1419,8 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
     // super-contigs, and remap every read's (cid,pos). Shrinks the pg toward genome
     // size → smaller sequence blob AND unique read placement for self-alignment.
     // Lossless: reads still record mismatches vs the (re-polished) super-contig.
-    // Gated by ARCS_MERGE_CONTIGS. Passes controllable via ARCS_MERGE_PASSES.
-    // DEFAULT ON: the merge collapses the redundant contigs Phase-1's online greedy
+    // DEFAULT ON. Passes controllable via ARCS_MERGE_PASSES.
+    // The merge collapses the redundant contigs Phase-1's online greedy
     // produced (fixing the ordering-fragmentation that costs sequence ratio). 1 pass
     // captures ~96% of the gain and already beats SPRING's sequence; further passes
     // add <1% for 3× the time. Disable with ARCS_MERGE_OFF; tune with ARCS_MERGE_PASSES.

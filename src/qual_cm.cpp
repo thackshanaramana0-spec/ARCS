@@ -19,6 +19,7 @@
 // rich context is free (the lesson the static rANS model could not exploit).
 // Integer-only → encode and decode are bit-exact and portable → lossless.
 #include "qual_cm.h"
+#include "container.h"
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
@@ -500,6 +501,398 @@ static inline uint32_t get_u32(const uint8_t* p) {
     return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
 }
 
+// ── Static quality model: precomputed CDF for fast decode ────────────────────
+// Format flag 0x04 in use_seq_flags: two-pass encode — prescan builds global
+// FreqMaps, precomputes per-context CDFs, stores them LZMA-compressed in the
+// blob. Decoder reads stored CDFs → direct table lookup, no build_cf(), no
+// FreqMap updates → ~3-5× faster quality decode. Archive cost: ~30-60KB.
+// Enable: ARCS_QUAL_STATIC=1. Can become default for large files later.
+//
+// Serialisation: [n: u32][qmax: u8][n × {key: u64, tot: u32, cf[0..qmax]: u16}]
+// then LZMA-9 compressed. u16 is safe: build_cf outputs ≤ CF_TARGET=16384 < 65536.
+
+struct StaticCDFEntry {
+    uint32_t cf[QA];  // probability mass per quality level 0..qmax
+    uint32_t tot;     // sum of cf[0..qmax]
+};
+
+using StaticModel = std::unordered_map<uint64_t, StaticCDFEntry>;
+
+static StaticCDFEntry make_uniform_entry(int qmax) {
+    StaticCDFEntry e;
+    e.tot = (uint32_t)(qmax + 1);
+    for (int q = 0;     q <= qmax; ++q) e.cf[q] = 1;
+    for (int q = qmax+1; q < QA;  ++q) e.cf[q] = 0;
+    return e;
+}
+
+// Prescan one block: same context logic as encode_block but accumulates
+// FreqMaps and records ck→pk. No range coder output.
+static void prescan_block(
+    const std::vector<std::vector<uint8_t>>& rq,
+    const std::vector<uint32_t>& order, size_t begin, size_t end,
+    const std::vector<std::vector<bool>>& dev_sets, int L,
+    const std::vector<std::string>* seqs, int qmax, QcmCfg cfg, bool is_pe,
+    FreqMap& lo, FreqMap& tbl,
+    std::unordered_map<uint64_t, uint64_t>& ck_to_pk) {
+
+    std::unordered_set<uint32_t> seen;
+    for (size_t oi = begin; oi < end; ++oi) {
+        uint32_t idx = order[oi];
+        if (idx >= rq.size()) { seen.insert(idx); continue; }
+        const auto& r = rq[idx];
+        const bool has_dev = idx < dev_sets.size();
+        const std::string* seq = (seqs && idx < seqs->size()) ? &(*seqs)[idx] : nullptr;
+        const int RL = (int)r.size();
+        bool has_mate = is_pe && (idx & 1) && idx > 0 && seen.count(idx - 1) &&
+                        (idx - 1) < rq.size();
+        const std::vector<uint8_t>* mq = has_mate ? &rq[idx - 1] : nullptr;
+        CtxState s;
+        for (int j = 0; j < RL; ++j) {
+            int q = r[j]; if (q > qmax) q = qmax;
+            int is_dev_v = (has_dev && j < (int)dev_sets[idx].size() && dev_sets[idx][j]) ? 1 : 0;
+            int qmb = 4;
+            if (mq && j < (int)mq->size()) {
+                int qm = (*mq)[j];
+                qmb = qm < 10 ? 0 : qm < 20 ? 1 : qm < 30 ? 2 : 3;
+            }
+            uint64_t pk, ck;
+            keys(s, j, L, is_dev_v, qmax, seq, pk, ck, cfg.use_seq, qmb);
+            Freq& FP = lo.get(pk);
+            Freq& FC = tbl.get(ck);
+            ck_to_pk[ck] = pk;  // pk is uniquely determined by ck; safe to overwrite
+            FP.update(q, cfg.freq_inc);
+            FC.update(q, cfg.freq_inc);
+            s.advance(q);
+        }
+        seen.insert(idx);
+    }
+}
+
+// Build precomputed CDF from fully-populated FreqMaps + ck→pk mapping.
+static StaticModel build_precomputed_cdfs(
+    FreqMap& tbl, FreqMap& lo,
+    const std::unordered_map<uint64_t, uint64_t>& ck_to_pk,
+    int qmax, QcmCfg cfg) {
+
+    StaticModel m;
+    m.reserve(ck_to_pk.size() * 2);
+    uint32_t cf[QA];
+    for (auto& kv : ck_to_pk) {
+        uint64_t ck = kv.first, pk = kv.second;
+        Freq& FC = tbl.get(ck);
+        Freq& FP = lo.get(pk);
+        StaticCDFEntry& e = m[ck];
+        e.tot = build_cf(FC, FP, qmax, cf, cfg.qcm_k);
+        for (int q = 0; q <= qmax; ++q) e.cf[q] = cf[q];
+        for (int q = qmax+1; q < QA;  ++q) e.cf[q] = 0;
+    }
+    return m;
+}
+
+// Serialize static model to raw bytes (caller LZMA-compresses).
+static std::vector<uint8_t> serialize_static_model(const StaticModel& m, int qmax) {
+    size_t n = m.size();
+    size_t entry_bytes = 8 + 4 + (size_t)(qmax + 1) * 2;  // key + tot + cf[u16]
+    std::vector<uint8_t> raw;
+    raw.reserve(5 + n * entry_bytes);
+    auto put32 = [&](uint32_t v) {
+        raw.push_back((uint8_t)(v));  raw.push_back((uint8_t)(v>>8));
+        raw.push_back((uint8_t)(v>>16)); raw.push_back((uint8_t)(v>>24));
+    };
+    put32((uint32_t)n);
+    raw.push_back((uint8_t)qmax);
+    for (auto& kv : m) {
+        uint64_t ck = kv.first;
+        const StaticCDFEntry& e = kv.second;
+        for (int b = 0; b < 8; ++b) raw.push_back((uint8_t)(ck >> (b*8)));
+        put32(e.tot);
+        for (int q = 0; q <= qmax; ++q) {
+            uint16_t v = (uint16_t)e.cf[q];
+            raw.push_back((uint8_t)(v)); raw.push_back((uint8_t)(v>>8));
+        }
+    }
+    return raw;
+}
+
+static bool deserialize_static_model(const uint8_t* data, size_t len,
+                                     StaticModel& m, int expected_qmax) {
+    if (len < 5) return false;
+    uint32_t n = (uint32_t)data[0] | ((uint32_t)data[1]<<8) |
+                 ((uint32_t)data[2]<<16) | ((uint32_t)data[3]<<24);
+    int qmax = (int)data[4];
+    if (qmax != expected_qmax) return false;
+    size_t entry_bytes = 8 + 4 + (size_t)(qmax + 1) * 2;
+    if (len < 5 + (size_t)n * entry_bytes) return false;
+    m.reserve(n * 2);
+    const uint8_t* p = data + 5;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint64_t ck = 0;
+        for (int b = 0; b < 8; ++b) ck |= ((uint64_t)*p++) << (b*8);
+        uint32_t tot = (uint32_t)p[0] | ((uint32_t)p[1]<<8) |
+                       ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24); p += 4;
+        StaticCDFEntry& e = m[ck];
+        e.tot = tot;
+        for (int q = 0; q <= qmax; ++q) {
+            uint16_t v = (uint16_t)p[0] | ((uint16_t)p[1]<<8); p += 2;
+            e.cf[q] = v;
+        }
+        for (int q = qmax+1; q < QA; ++q) e.cf[q] = 0;
+    }
+    return true;
+}
+
+// Encode one block using precomputed static CDFs (no adaptive updates).
+static std::vector<uint8_t> encode_block_static(
+    const std::vector<std::vector<uint8_t>>& rq,
+    const std::vector<uint32_t>& order, size_t begin, size_t end,
+    const std::vector<std::vector<bool>>& dev_sets, int L,
+    const std::vector<std::string>* seqs, int qmax, QcmCfg cfg, bool is_pe,
+    const StaticModel& model, const StaticCDFEntry& fallback) {
+
+    RangeEnc enc;
+    std::unordered_set<uint32_t> seen;
+    for (size_t oi = begin; oi < end; ++oi) {
+        uint32_t idx = order[oi];
+        if (idx >= rq.size()) { seen.insert(idx); continue; }
+        const auto& r = rq[idx];
+        const bool has_dev = idx < dev_sets.size();
+        const std::string* seq = (seqs && idx < seqs->size()) ? &(*seqs)[idx] : nullptr;
+        const int RL = (int)r.size();
+        bool has_mate = is_pe && (idx & 1) && idx > 0 && seen.count(idx - 1) &&
+                        (idx - 1) < rq.size();
+        const std::vector<uint8_t>* mq = has_mate ? &rq[idx - 1] : nullptr;
+        CtxState s;
+        for (int j = 0; j < RL; ++j) {
+            int q = r[j]; if (q > qmax) q = qmax;
+            int is_dev_v = (has_dev && j < (int)dev_sets[idx].size() && dev_sets[idx][j]) ? 1 : 0;
+            int qmb = 4;
+            if (mq && j < (int)mq->size()) {
+                int qm = (*mq)[j];
+                qmb = qm < 10 ? 0 : qm < 20 ? 1 : qm < 30 ? 2 : 3;
+            }
+            uint64_t pk, ck;
+            keys(s, j, L, is_dev_v, qmax, seq, pk, ck, cfg.use_seq, qmb);
+            auto it = model.find(ck);
+            const StaticCDFEntry& e = (it != model.end()) ? it->second : fallback;
+            uint32_t cum = 0;
+            for (int i = 0; i < q; ++i) cum += e.cf[i];
+            enc.encode(cum, e.cf[q] ? e.cf[q] : 1u, e.tot ? e.tot : 1u);
+            s.advance(q);
+        }
+        seen.insert(idx);
+    }
+    enc.flush();
+    return std::move(enc.out);
+}
+
+// ── Dense fast-decode quality codec (flag 0x08 in use_seq_flags) ─────────────
+// Context: (q1, posbin) only → 2-dim dense array, index = q1*8 + posbin.
+// No hash table, no build_cf(), no model updates. Decode: one array index + CDF
+// lookup + binary search in qmax+1 elements. Expected ~10-14× faster than
+// adaptive CM, ~6% worse ratio (entropy bound). Archive overhead: ~5-10KB.
+// Enable: ARCS_QUAL_FAST=1.
+//
+// Format (flag 0x08): after byte 4 (nb), [fast_lzma_len: u32][fast_lzma_bytes],
+// then block lengths + payloads. Independent of 0x04 (can combine or use alone).
+
+constexpr int FAST_PB = 8;  // position bins (same as posbin() range)
+
+// Dense table: (qmax+1) × FAST_PB entries; index = q1 * FAST_PB + posbin.
+using FastTable = std::vector<StaticCDFEntry>;  // size = (qmax+1)*FAST_PB
+
+// Build a dense (q1, posbin) frequency table from all quality data.
+static FastTable build_fast_table(
+    const std::vector<std::vector<uint8_t>>& rq,
+    const std::vector<uint32_t>& order, int L, int qmax) {
+
+    int ncx = (qmax + 1) * FAST_PB;
+    std::vector<std::vector<uint32_t>> raw(ncx, std::vector<uint32_t>(qmax + 1, 1u));  // Laplace
+
+    for (uint32_t idx : order) {
+        if (idx >= rq.size()) continue;
+        const auto& r = rq[idx];
+        const int RL = (int)r.size();
+        int q1 = 0;
+        for (int j = 0; j < RL; ++j) {
+            int q = r[j]; if (q > qmax) q = qmax;
+            int pb = posbin(j, L);
+            int ci = q1 * FAST_PB + pb;
+            if (ci < ncx) raw[(size_t)ci][(size_t)q]++;
+            q1 = q;
+        }
+    }
+
+    FastTable ft(ncx);
+    for (int i = 0; i < ncx; ++i) {
+        uint64_t sum = 0;
+        for (int q = 0; q <= qmax; ++q) sum += raw[(size_t)i][(size_t)q];
+        if (sum == 0) sum = 1;
+        U64Div dv(sum);
+        uint32_t tot = 0;
+        for (int q = 0; q <= qmax; ++q) {
+            uint32_t v = (uint32_t)dv((uint64_t)raw[(size_t)i][(size_t)q] * CF_TARGET);
+            if (v == 0) v = 1;
+            ft[(size_t)i].cf[q] = v; tot += v;
+        }
+        ft[(size_t)i].tot = tot;
+        for (int q = qmax + 1; q < QA; ++q) ft[(size_t)i].cf[q] = 0;
+    }
+    return ft;
+}
+
+// Serialize dense fast table: [ncx: u32][qmax: u8][ncx × {tot: u32, cf[0..qmax]: u16}]
+static std::vector<uint8_t> serialize_fast_table(const FastTable& ft, int qmax) {
+    std::vector<uint8_t> raw;
+    uint32_t ncx = (uint32_t)ft.size();
+    auto put32 = [&](uint32_t v) {
+        raw.push_back((uint8_t)v); raw.push_back((uint8_t)(v>>8));
+        raw.push_back((uint8_t)(v>>16)); raw.push_back((uint8_t)(v>>24));
+    };
+    put32(ncx);
+    raw.push_back((uint8_t)qmax);
+    for (uint32_t i = 0; i < ncx; ++i) {
+        put32(ft[i].tot);
+        for (int q = 0; q <= qmax; ++q) {
+            uint16_t v = (uint16_t)ft[i].cf[q];
+            raw.push_back((uint8_t)v); raw.push_back((uint8_t)(v>>8));
+        }
+    }
+    return raw;
+}
+
+static bool deserialize_fast_table(const uint8_t* data, size_t len,
+                                   FastTable& ft, int expected_qmax) {
+    if (len < 5) return false;
+    uint32_t ncx = (uint32_t)data[0] | ((uint32_t)data[1]<<8) |
+                   ((uint32_t)data[2]<<16) | ((uint32_t)data[3]<<24);
+    int qmax = (int)data[4];
+    if (qmax != expected_qmax) return false;
+    size_t entry_bytes = 4 + (size_t)(qmax + 1) * 2;
+    if (len < 5 + (size_t)ncx * entry_bytes) return false;
+    ft.resize(ncx);
+    const uint8_t* p = data + 5;
+    for (uint32_t i = 0; i < ncx; ++i) {
+        ft[i].tot = (uint32_t)p[0] | ((uint32_t)p[1]<<8) |
+                    ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24); p += 4;
+        for (int q = 0; q <= qmax; ++q) {
+            uint16_t v = (uint16_t)p[0] | ((uint16_t)p[1]<<8); p += 2;
+            ft[i].cf[q] = v;
+        }
+        for (int q = qmax + 1; q < QA; ++q) ft[i].cf[q] = 0;
+    }
+    return true;
+}
+
+// Encode one block with fast 2-dim model (no updates, direct table lookup).
+static std::vector<uint8_t> encode_block_fast(
+    const std::vector<std::vector<uint8_t>>& rq,
+    const std::vector<uint32_t>& order, size_t begin, size_t end,
+    int L, int qmax, const FastTable& ft) {
+
+    int ncx = (int)ft.size();
+    RangeEnc enc;
+    for (size_t oi = begin; oi < end; ++oi) {
+        uint32_t idx = order[oi];
+        if (idx >= rq.size()) continue;
+        const auto& r = rq[idx];
+        const int RL = (int)r.size();
+        int q1 = 0;
+        for (int j = 0; j < RL; ++j) {
+            int q = r[j]; if (q > qmax) q = qmax;
+            int ci = std::min(q1 * FAST_PB + posbin(j, L), ncx - 1);
+            const StaticCDFEntry& e = ft[(size_t)ci];
+            uint32_t cum = 0;
+            for (int i = 0; i < q; ++i) cum += e.cf[i];
+            enc.encode(cum, e.cf[q] ? e.cf[q] : 1u, e.tot ? e.tot : 1u);
+            q1 = q;
+        }
+    }
+    enc.flush();
+    return std::move(enc.out);
+}
+
+// Decode one block with fast 2-dim model.
+static bool decode_block_fast(
+    const uint8_t* p, const uint8_t* e,
+    const std::vector<uint32_t>& order, size_t begin, size_t end,
+    int L, std::vector<std::vector<uint8_t>>& rq_out,
+    const std::vector<int>* rlens, int qmax, const FastTable& ft) {
+
+    int ncx = (int)ft.size();
+    RangeDec dec(p, e);
+    for (size_t oi = begin; oi < end; ++oi) {
+        uint32_t idx = order[oi];
+        if (idx >= rq_out.size()) return false;
+        auto& r = rq_out[idx];
+        const int RL = (rlens && idx < rlens->size()) ? (*rlens)[idx] : L;
+        r.assign((size_t)RL, 0);
+        int q1 = 0;
+        for (int j = 0; j < RL; ++j) {
+            int ci = std::min(q1 * FAST_PB + posbin(j, L), ncx - 1);
+            const StaticCDFEntry& e_cdf = ft[(size_t)ci];
+            uint32_t tot = e_cdf.tot ? e_cdf.tot : 1u;
+            uint32_t target = dec.getfreq(tot);
+            uint32_t cum = 0; int q = 0;
+            while (q <= qmax && cum + e_cdf.cf[q] <= target) { cum += e_cdf.cf[q]; ++q; }
+            if (q > qmax) return false;
+            dec.update(cum, e_cdf.cf[q] ? e_cdf.cf[q] : 1u);
+            r[j] = (uint8_t)q;
+            q1 = q;
+        }
+    }
+    return true;
+}
+
+// Decode one block using precomputed static CDFs.
+static bool decode_block_static(
+    const uint8_t* p, const uint8_t* e,
+    const std::vector<uint32_t>& order, size_t begin, size_t end,
+    const std::vector<std::vector<bool>>& dev_sets, int L,
+    std::vector<std::vector<uint8_t>>& rq_out,
+    const std::vector<std::string>* seqs, const std::vector<int>* rlens,
+    int qmax, QcmCfg cfg, bool is_pe,
+    const StaticModel& model, const StaticCDFEntry& fallback) {
+
+    RangeDec dec(p, e);
+    std::vector<bool> decoded(rq_out.size(), false);
+    for (size_t oi = begin; oi < end; ++oi) {
+        uint32_t idx = order[oi];
+        if (idx >= rq_out.size()) return false;
+        auto& r = rq_out[idx];
+        const int RL = (rlens && idx < rlens->size()) ? (*rlens)[idx] : L;
+        r.assign((size_t)RL, 0);
+        const bool has_dev = idx < dev_sets.size();
+        const std::string* seq = (seqs && idx < seqs->size()) ? &(*seqs)[idx] : nullptr;
+        bool has_mate = is_pe && (idx & 1) && idx > 0 && idx - 1 < decoded.size() &&
+                        decoded[idx - 1] && !rq_out[idx - 1].empty();
+        const std::vector<uint8_t>* mq = has_mate ? &rq_out[idx - 1] : nullptr;
+        CtxState s;
+        for (int j = 0; j < RL; ++j) {
+            int is_dev_v = (has_dev && j < (int)dev_sets[idx].size() && dev_sets[idx][j]) ? 1 : 0;
+            int qmb = 4;
+            if (mq && j < (int)mq->size()) {
+                int qm = (*mq)[j];
+                qmb = qm < 10 ? 0 : qm < 20 ? 1 : qm < 30 ? 2 : 3;
+            }
+            uint64_t pk, ck;
+            keys(s, j, L, is_dev_v, qmax, seq, pk, ck, cfg.use_seq, qmb);
+            auto it = model.find(ck);
+            const StaticCDFEntry& e = (it != model.end()) ? it->second : fallback;
+            uint32_t tot = e.tot ? e.tot : 1u;
+            uint32_t target = dec.getfreq(tot);
+            uint32_t cum = 0; int q = 0;
+            while (q <= qmax && cum + e.cf[q] <= target) { cum += e.cf[q]; ++q; }
+            if (q > qmax) return false;
+            dec.update(cum, e.cf[q] ? e.cf[q] : 1u);
+            r[j] = (uint8_t)q;
+            s.advance(q);
+        }
+        decoded[idx] = true;
+    }
+    return true;
+}
+
 } // namespace
 
 std::vector<uint8_t> qual_cm_encode(
@@ -539,6 +932,47 @@ std::vector<uint8_t> qual_cm_encode(
     // Reset profiling accumulators for this encode run.
     if (QPR) { g_qprof.t_ctx=0; g_qprof.t_freqmap=0; g_qprof.t_buildcf=0; g_qprof.t_cdfcum=0; g_qprof.t_encode=0; g_qprof.t_update=0; g_qprof.n_syms=0; }
 
+    // ── Static model path (ARCS_QUAL_STATIC=1): two-pass encode for fast decode ─
+    // Pass 1: prescan all quality data per block → build global FreqMaps →
+    //         precompute interpolated CDFs → LZMA-serialize.
+    // Pass 2: encode blocks using precomputed CDFs (no adaptive updates).
+    // Decoder: read stored CDFs → direct table lookup, no build_cf(), no updates.
+    const bool use_static = getenv("ARCS_QUAL_STATIC") != nullptr;
+    StaticModel smodel;
+    StaticCDFEntry smodel_fallback;
+    std::vector<uint8_t> smodel_lzma;  // stored in header if use_static
+
+    if (use_static) {
+        FreqMap static_lo(12), static_tbl(15);
+        std::unordered_map<uint64_t, uint64_t> ck_to_pk;
+        for (int b = 0; b < nb; ++b) {
+            prescan_block(rq, order, bnd[b], bnd[b+1],
+                          dev_sets, L, seqs, qmax, cfg, is_pe,
+                          static_lo, static_tbl, ck_to_pk);
+        }
+        smodel = build_precomputed_cdfs(static_tbl, static_lo, ck_to_pk, qmax, cfg);
+        smodel_fallback = make_uniform_entry(qmax);
+        std::vector<uint8_t> raw = serialize_static_model(smodel, qmax);
+        smodel_lzma = lzma_compress(raw);
+        if (QT) fprintf(stderr, "[QUAL-T] static model: %zu contexts, raw=%zu smodel_lzma=%zu bytes\n",
+                        ck_to_pk.size(), raw.size(), smodel_lzma.size());
+    }
+
+    // ── Fast 2-dim quality codec (ARCS_QUAL_FAST=1, flag 0x08) ──────────────────
+    // Dense (q1, posbin) table — no hash, no build_cf, no model updates on decode.
+    // Expected ~10-14× faster decode, ~6% worse ratio than adaptive CM.
+    const bool use_fast = getenv("ARCS_QUAL_FAST") != nullptr && !use_static;
+    FastTable fast_table;
+    std::vector<uint8_t> fast_lzma;  // stored in header if use_fast
+
+    if (use_fast) {
+        fast_table = build_fast_table(rq, order, L, qmax);
+        std::vector<uint8_t> raw = serialize_fast_table(fast_table, qmax);
+        fast_lzma = lzma_compress(raw, 3);  // level 3: fits L3 cache → fast decode
+        if (QT) fprintf(stderr, "[QUAL-T] fast table: ncx=%d raw=%zu fast_lzma=%zu bytes\n",
+                        (int)fast_table.size(), raw.size(), fast_lzma.size());
+    }
+
     std::vector<std::vector<uint8_t>> parts((size_t)nb);
     // Per-block wall times (ARCS_QUAL_TIMING). Separate vector so threads write to
     // distinct elements without false sharing (each uint64 on its own cache line
@@ -547,9 +981,18 @@ std::vector<uint8_t> qual_cm_encode(
 
     auto run_block = [&](int b) {
         auto t0 = std::chrono::steady_clock::now();
-        parts[(size_t)b] = encode_block(rq, order, bnd[b], bnd[b+1],
-                                        dev_sets, L, seqs, qmax, cfg, is_pe,
-                                        QPR);   // profiling path for all blocks
+        if (use_fast) {
+            parts[(size_t)b] = encode_block_fast(rq, order, bnd[b], bnd[b+1],
+                                                 L, qmax, fast_table);
+        } else if (use_static) {
+            parts[(size_t)b] = encode_block_static(rq, order, bnd[b], bnd[b+1],
+                                                   dev_sets, L, seqs, qmax, cfg, is_pe,
+                                                   smodel, smodel_fallback);
+        } else {
+            parts[(size_t)b] = encode_block(rq, order, bnd[b], bnd[b+1],
+                                            dev_sets, L, seqs, qmax, cfg, is_pe,
+                                            QPR);   // profiling path for all blocks
+        }
         auto t1 = std::chrono::steady_clock::now();
         block_ms[(size_t)b] = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(t1-t0).count();
     };
@@ -607,17 +1050,32 @@ std::vector<uint8_t> qual_cm_encode(
         }
     }
 
-    // Header: qmax, freq_inc, use_seq_flags, qcm_k, nblocks, [nblocks × uint32 length], payloads…
-    // use_seq_flags: bit0 = use_seq, bit1 = is_pe (inter-mate quality context)
+    // Header: qmax, freq_inc, use_seq_flags, qcm_k, nblocks,
+    //   [opt 0x04: model_lzma_len u32 + model_lzma_bytes]  (rich static model)
+    //   [opt 0x08: fast_lzma_len  u32 + fast_lzma_bytes ]  (dense 2-dim fast model)
+    //   [nblocks × uint32 block_length][payloads…]
+    // use_seq_flags: bit0=use_seq, bit1=is_pe, bit2=has_static, bit3=has_fast
+    uint8_t use_seq_byte = (uint8_t)((cfg.use_seq ? 0x01 : 0) | (is_pe ? 0x02 : 0) |
+                                     (use_static ? 0x04 : 0) | (use_fast ? 0x08 : 0));
     std::vector<uint8_t> out;
-    size_t tot = 5 + (size_t)nb * 4;
+    size_t tot = 5 + (use_static ? (4 + smodel_lzma.size()) : 0)
+                   + (use_fast   ? (4 + fast_lzma.size())   : 0)
+                   + (size_t)nb * 4;
     for (auto& p : parts) tot += p.size();
     out.reserve(tot);
     out.push_back((uint8_t)qmax);
     out.push_back((uint8_t)cfg.freq_inc);
-    out.push_back((uint8_t)((cfg.use_seq ? 0x01 : 0) | (is_pe ? 0x02 : 0)));
+    out.push_back(use_seq_byte);
     out.push_back((uint8_t)cfg.qcm_k);
     out.push_back((uint8_t)nb);
+    if (use_static) {
+        put_u32(out, (uint32_t)smodel_lzma.size());
+        out.insert(out.end(), smodel_lzma.begin(), smodel_lzma.end());
+    }
+    if (use_fast) {
+        put_u32(out, (uint32_t)fast_lzma.size());
+        out.insert(out.end(), fast_lzma.begin(), fast_lzma.end());
+    }
     for (auto& p : parts) put_u32(out, (uint32_t)p.size());
     for (auto& p : parts) out.insert(out.end(), p.begin(), p.end());
     return out;
@@ -638,31 +1096,61 @@ bool qual_cm_decode(
     cfg.freq_inc = data[1];
     const uint8_t use_seq_flags = data[2];
     cfg.use_seq  = (use_seq_flags & 0x01) ? 1 : 0;
-    const bool is_pe = (use_seq_flags & 0x02) != 0;
+    const bool is_pe        = (use_seq_flags & 0x02) != 0;
+    const bool has_static   = (use_seq_flags & 0x04) != 0;
+    const bool has_fast     = (use_seq_flags & 0x08) != 0;
     cfg.qcm_k    = data[3];
     const int nb = data[4];
     if (qmax < 0 || qmax > QA - 1 || cfg.freq_inc < 1 || cfg.freq_inc > 200 ||
-        use_seq_flags > 3 || cfg.qcm_k < 1 || cfg.qcm_k > 255 ||
+        use_seq_flags > 15 || cfg.qcm_k < 1 || cfg.qcm_k > 255 ||
         nb < 1 || nb > 64) return false;
     if (cfg.use_seq && !seqs) return false;
 
-    const size_t hdr = 5 + (size_t)nb * 4;
+    // Read optional stored models before the block-length table.
+    StaticModel smodel; StaticCDFEntry smodel_fallback;
+    FastTable fast_table;
+    size_t model_region = 0;  // total bytes consumed by stored model sections
+
+    if (has_static) {
+        if (data.size() < 5 + model_region + 4) return false;
+        uint32_t mlz = get_u32(data.data() + 5 + model_region);
+        model_region += 4 + mlz;
+        if (data.size() < 5 + model_region) return false;
+        std::vector<uint8_t> raw = lzma_decompress(data.data() + 5 + (model_region - 4 - mlz) + 4, mlz);
+        if (raw.empty() || !deserialize_static_model(raw.data(), raw.size(), smodel, qmax))
+            return false;
+        smodel_fallback = make_uniform_entry(qmax);
+    }
+    if (has_fast) {
+        size_t off5 = 5 + model_region;
+        if (data.size() < off5 + 4) return false;
+        uint32_t flz = get_u32(data.data() + off5);
+        model_region += 4 + flz;
+        if (data.size() < 5 + model_region) return false;
+        std::vector<uint8_t> raw = lzma_decompress(data.data() + off5 + 4, flz);
+        if (raw.empty() || !deserialize_fast_table(raw.data(), raw.size(), fast_table, qmax))
+            return false;
+    }
+
+    const size_t hdr = 5 + model_region + (size_t)nb * 4;
     if (data.size() < hdr) return false;
     std::vector<uint32_t> len((size_t)nb);
     size_t payload = hdr;
-    for (int b = 0; b < nb; ++b) { len[(size_t)b] = get_u32(data.data() + 5 + (size_t)b*4); payload += len[(size_t)b]; }
+    const size_t block_len_off = 5 + model_region;
+    for (int b = 0; b < nb; ++b) {
+        len[(size_t)b] = get_u32(data.data() + block_len_off + (size_t)b*4);
+        payload += len[(size_t)b];
+    }
     if (payload != data.size()) return false;
 
     const size_t n = order.size();
     std::vector<size_t> bnd(nb + 1);
     for (int b = 0; b <= nb; ++b) bnd[b] = n * (size_t)b / (size_t)nb;
-    // Mirror the encoder's even-boundary rounding for PE blocks
     if (is_pe && nb > 1) {
         for (int b = 1; b < nb; ++b)
             if (bnd[b] & 1) ++bnd[b];
     }
 
-    // Block byte offsets
     std::vector<size_t> off((size_t)nb + 1);
     off[0] = hdr;
     for (int b = 0; b < nb; ++b) off[(size_t)b+1] = off[(size_t)b] + len[(size_t)b];
@@ -671,8 +1159,17 @@ bool qual_cm_decode(
     auto run = [&](int b) {
         const uint8_t* p = data.data() + off[(size_t)b];
         const uint8_t* e = data.data() + off[(size_t)b+1];
-        ok[(size_t)b] = decode_block(p, e, order, bnd[b], bnd[b+1],
-                                     dev_sets, L, rq_out, seqs, rlens, qmax, cfg, is_pe) ? 1 : 0;
+        if (has_fast) {
+            ok[(size_t)b] = decode_block_fast(p, e, order, bnd[b], bnd[b+1],
+                                              L, rq_out, rlens, qmax, fast_table) ? 1 : 0;
+        } else if (has_static) {
+            ok[(size_t)b] = decode_block_static(p, e, order, bnd[b], bnd[b+1],
+                                                dev_sets, L, rq_out, seqs, rlens,
+                                                qmax, cfg, is_pe, smodel, smodel_fallback) ? 1 : 0;
+        } else {
+            ok[(size_t)b] = decode_block(p, e, order, bnd[b], bnd[b+1],
+                                         dev_sets, L, rq_out, seqs, rlens, qmax, cfg, is_pe) ? 1 : 0;
+        }
     };
     if (nb == 1) {
         run(0);
