@@ -1,24 +1,37 @@
-# Evaluation & analysis scripts
+# scripts/
 
-These are the Python scripts used to measure and validate ARCS. They are **not part of the codec** —
-the compressor is pure C++ and runs without them. They require external test data (GIAB / NA12878 /
-E. coli, not stored in this repo) placed alongside a built `arcs` binary.
+Evaluation scripts used to validate ARCS compression and variant calling results.
+These are **not part of the codec** — the compressor is pure C++ and runs without them.
+They require external test data (GIAB / NA12878 / E. coli, not stored in this repo)
+placed alongside a built `arcs` binary.
 
-## Reference-free variant calling (the byproduct evaluation)
-- `sim_ecoli.py` — simulate E. coli reads with injected errors/variants + ground truth.
-- `eval_caller.py` / `eval_pr2.py` — genotype-likelihood caller precision/recall on the sim.
-- `rf_eval.py` / `rf_eval_hg001.py` — reference-free calling vs GIAB truth (HG002 / NA12878).
-- `rf_dual.py` / `rf_frozen2.py` — the bubble-cleanliness caller (dual-region tune + frozen held-out test).
-- `kmer2snp_eval_argv.py` — score Kmer2SNP output on the same slice for head-to-head.
-- `pileup_bwa.py` — build the self-alignment pileup keyed by (contig, pos).
+## Variant calling evaluation
 
-## Compression-headroom analysis (why quality/names are at their floor)
-- `flowcell.py` — held-out cross-entropy of quality with/without flowcell-2D context (negative result).
-- `namefloor.py` / `nametok.py` — read-name information floor and the tokenized-name model measurement.
-- `qent.py` — per-context conditional entropy of quality (run-length lever).
+| Script | Purpose |
+|---|---|
+| `eval_caller.py` | Precision/recall evaluation of `arcs call` output vs truth VCF |
+| `sim_indel.py` | Simulate reads with injected indels + ground truth VCF |
+| `sim_indel_bench.py` | Run indel benchmark across multiple seeds |
+| `sim_polyploid.py` | Simulate polyploid reads (triploid/tetraploid) with injected variants |
+| `run_giab_indel.sh` | Run indel benchmark on real GIAB HG002 chr20 region |
+| `run_indel_bench.sh` | Full indel benchmark sweep |
+| `run_polyploid_bench.sh` | Full polyploid benchmark sweep |
 
-## Tooling
-- `edge_gen.py` — generates the 12 adversarial edge-case FASTQ files (lossless stress test).
-- `arcs_format.py` — parses and dumps the structure of a `.arcs` archive (header + blob table + streams).
+## Compression evaluation
 
-Usage examples and exact data-slicing commands are in the corresponding `docs/*.md` result files.
+| Script | Purpose |
+|---|---|
+| `sim_ecoli.py` | Simulate E. coli reads for compression testing |
+
+## Usage
+
+All scripts expect:
+1. A built `arcs` binary in PATH or the same directory
+2. Test FASTQ data downloaded separately (GIAB, NA12878, E. coli)
+
+See individual `docs/*.md` result files for exact data-slicing commands and download instructions.
+
+## Data sources
+
+- **GIAB HG002 / HG001 (NA12878)**: [https://www.nist.gov/programs-projects/genome-bottle](https://www.nist.gov/programs-projects/genome-bottle)
+- **E. coli K-12**: NCBI accession NC_000913.3
