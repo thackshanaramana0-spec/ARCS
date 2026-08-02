@@ -32,13 +32,15 @@ is itself a haplotype-aware graph — bubbles in that graph are het-SNV and inde
 Variant calling becomes a **zero-cost byproduct** of the best-ratio compression algorithm,
 with no external aligner, no reference genome, and no additional runtime.
 
-**Figure 1 — ARCS compression pipeline.**
+**Figure 1 — ARCS algorithm overview.**
 
 ![ARCS Pipeline](docs/figures/fig1.png)
 
-*FASTQ input is pilot-scored (AKC) to select the optimal encoding path: amplicon reads
-follow a PCR-dedup cluster-sort route; WGS reads follow a k-NN graph → pseudogenome
-assembly → context-mixing coder route. Both paths produce a fully lossless ARCS container.*
+*End-to-end ARCS pipeline: (A) FASTQ reads → (B) de novo string-graph assembly →
+(C) read placement → (D) compact placement index → (E) pseudogenome construction
+and variant evidence extraction in parallel → (F) FCM arithmetic sequence encoding
+and bubble-based variant detection → (G) lossless `.arcs` archive and reference-free
+VCF output, produced in a single pass.*
 
 ---
 
@@ -210,14 +212,16 @@ Defaults are tuned for best lossless ratio. Override only when needed.
 
 ## Design
 
-**Figure 2 — Single-read encoding through the ARCS sequence codec.**
+**Figure 2 — ARCS two-phase encoding pipeline.**
 
 ![ARCS Encoding](docs/figures/fig2.png)
 
-*Raw reads are grouped into overlapping k-mer windows, reordered against the assembled
-pseudogenome parent contig via MST alignment, then delta-encoded (only mismatches and
-shift are stored) and entropy-coded with a context-mixing rANS coder. The result is
-a compact, fully reversible binary representation.*
+*Phase 1 (De Novo Assembly): k-mer graph construction → contig building → read placement.
+Phase 2 (Parallel Encoding Streams): sequence stream through pseudogenome construction
+and FCM arithmetic coder; quality stream through block-parallel context model;
+names stream through Illumina tokenizer and LZMA-9 — all merged into a single lossless
+`.arcs` binary archive. The placement index feeds a pileup → bubble detection → VCF
+output path simultaneously, delivering variant calls at zero additional cost.*
 
 ### Key algorithmic contributions
 
