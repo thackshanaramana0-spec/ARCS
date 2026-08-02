@@ -99,6 +99,7 @@ brew install cmake xz
 ```
 src/          C++17 source — encoder, decoder, chain assembler, quality coder, variant caller
 tests/        7 CTest roundtrip and unit tests
+test_data/    50-read sample FASTQs for 10 organisms (36 KB total) — run immediately after build
 third_party/  rans_byte.h (rANS entropy coder, public domain) + libbsc (BWT+QLFC, MIT)
 docs/         Benchmark results and algorithm notes
 scripts/      Evaluation scripts (variant calling, indel bench, polyploid sim)
@@ -108,9 +109,21 @@ benchmark/    Linux benchmark runner
 
 ---
 
+## Quick test
+
+Sample FASTQs (50 reads, 10 organisms) are included in [`test_data/`](test_data/):
+
+```bash
+./build/arcs compress test_data/ecoli_sample.gz out.arcs
+./build/arcs decompress out.arcs restored.fastq
+diff <(zcat test_data/ecoli_sample.gz) restored.fastq && echo "LOSSLESS OK"
+```
+
+---
+
 ## Reproducing benchmarks
 
-Test data is not stored in this repository. Download separately:
+Full benchmark data is not stored in this repository. Download separately:
 
 - **GIAB HG002 / HG001 (NA12878)** — [NIST Genome in a Bottle](https://www.nist.gov/programs-projects/genome-bottle)
 - **E. coli K-12** — NCBI accession NC_000913.3
