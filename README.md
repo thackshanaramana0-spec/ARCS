@@ -11,6 +11,10 @@ Everything is written in C++17 (no runtime dependencies beyond zlib, liblzma, pt
 and compiles to a single self-contained binary — the same class as SPRING, PgRC2, Genozip,
 and fqzcomp.
 
+<p align="center">
+  <img src="docs/figures/fig1_pipeline.png" width="520" alt="ARCS pipeline: FASTQ → k-NN chain assembly → pseudogenome → compressed archive + variant calls">
+</p>
+
 ---
 
 ## Results
@@ -30,6 +34,10 @@ and fqzcomp.
 **ARCS produces the smallest fully-lossless archive of any tested tool: −14% vs Genozip, −23% vs SPRING.**
 Wins 8/8 public datasets. Byte-exact lossless including CRLF line endings (SPRING silently corrupts CRLF files).
 See [docs/RESULTS.md](docs/RESULTS.md) for full numbers.
+
+<p align="center">
+  <img src="docs/figures/fig2_compression.png" width="720" alt="Archive size comparison across 8 datasets: ARCS vs SPRING, Genozip, PgRC2, fqzcomp">
+</p>
 
 ### Reference-free variant calling (4 GIAB individuals, 3 ancestries, rtg vcfeval gold standard)
 
