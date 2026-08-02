@@ -1,4 +1,4 @@
-# ARCS — Lossless FASTQ Compression + Reference-Free Variant Calling
+# ARCS — Unified Lossless FASTQ Compression and Reference-Free Variant Calling
 
 [![CI](https://github.com/thackshanaramana0-spec/ARCS/actions/workflows/ci.yml/badge.svg)](https://github.com/thackshanaramana0-spec/ARCS/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -6,6 +6,8 @@
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg)](#build)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
 [![Lossless](https://img.shields.io/badge/lossless-byte--exact-brightgreen.svg)](#results)
+
+> Compress Illumina short reads to the smallest lossless archive and call heterozygous SNVs and indels — single pass, single binary, no reference genome.
 
 ---
 
