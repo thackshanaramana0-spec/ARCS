@@ -1,47 +1,103 @@
 # ARCS — Lossless FASTQ Compression + Reference-Free Variant Calling
 
-ARCS is a reference-free, lossless compressor for Illumina FASTQ sequencing data.
-It builds a **self-assembled pseudogenome** from the reads via a greedy k-NN chain walk,
-compresses sequence against it with an embedded context-mixing DNA coder, and compresses
-quality values with an adaptive range coder conditioned on local sequence context.
-As a **zero-cost byproduct** of the compression assembly it also performs reference-free
-heterozygous SNV and indel calling — no external aligner or k-mer tool required.
+[![CI](https://github.com/thackshanaramana0-spec/ARCS/actions/workflows/ci.yml/badge.svg)](https://github.com/thackshanaramana0-spec/ARCS/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Release](https://img.shields.io/badge/release-v2.2.0-blue.svg)](https://github.com/thackshanaramana0-spec/ARCS/releases/tag/v2.2.0)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg)](#build)
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
+[![Lossless](https://img.shields.io/badge/lossless-byte--exact-brightgreen.svg)](#results)
 
-Everything is written in C++17 (no runtime dependencies beyond zlib, liblzma, pthreads)
-and compiles to a single self-contained binary — the same class as SPRING, PgRC2, Genozip,
-and fqzcomp.
+ARCS is a reference-free, lossless compressor for Illumina FASTQ sequencing data that simultaneously performs **heterozygous SNV and indel calling** as a zero-cost byproduct of compression — no external aligner, no reference genome, no extra runtime.
+
+It builds a **self-assembled pseudogenome** from the reads via a greedy k-NN chain walk, compresses sequence against it with an embedded context-mixing DNA coder, and compresses quality values with an adaptive range coder conditioned on local sequence context. Everything compiles to a **single self-contained binary** with no runtime dependencies beyond zlib, liblzma, and pthreads — the same class as SPRING, PgRC2, Genozip, and fqzcomp.
+
+---
+
+## Contents
+
+- [Results](#results)
+- [Quick test](#quick-test)
+- [Build](#build)
+- [Usage](#usage)
+- [Design](#design)
+- [Reproducing benchmarks](#reproducing-benchmarks)
+- [Citation](#citation)
+- [Author](#author)
+- [License](#license)
 
 ---
 
 ## Results
 
-### Compression (GIAB HG002, chr20 region, 39 MB, 113,987 reads, native ext4, byte-lossless-verified)
+### Compression
+
+**Table 1.** Compression benchmark on GIAB HG002 chr20 (39 MB, 113,987 reads, 150 bp,
+native Linux ext4, byte-lossless verified). Best-of-2 wall-clock times; single-end mode.
 
 | Tool | Archive | Compress | Decompress | RAM | Lossless |
 |---|---|---|---|---|---|
 | **ARCS** | **4.31 MB** | **4.4 s** | **1.9 s** | 366 MB | **yes** |
 | Genozip 15 | 5.03 MB | 4.8 s | 0.45 s | 382 MB | yes |
 | SPRING | 5.60 MB | 5.0 s | 4.3 s | 319 MB | yes |
-| PgRC2 | 0.245 MB† | 4.5 s | 0.07 s | 88 MB | no (lossy quality) |
-| fqzcomp v4.6 | 7.26 MB | 0.6 s | 0.9 s | 60 MB | no (quality quirk) |
+| PgRC2 | 0.245 MB† | 4.5 s | 0.07 s | 88 MB | **no** (lossy quality) |
+| fqzcomp v4.6 | 7.26 MB | 0.6 s | 0.9 s | 60 MB | **no** (quality quirk) |
 
-†PgRC2 default is lossy-quality — not a comparable lossless number.
+†PgRC2 default applies lossy quality binning — not a comparable lossless result.
 
 **ARCS produces the smallest fully-lossless archive of any tested tool: −14% vs Genozip, −23% vs SPRING.**
-Wins 8/8 public datasets. Byte-exact lossless including CRLF line endings (SPRING silently corrupts CRLF files).
-See [docs/RESULTS.md](docs/RESULTS.md) for full numbers.
+Wins on all 8 public datasets tested. Byte-exact lossless including CRLF line endings
+(SPRING silently corrupts CRLF files).
 
-### Reference-free variant calling (4 GIAB individuals, 3 ancestries, rtg vcfeval gold standard)
+**Fast-decode mode** (`--fast-decode`): 2-bit packed DNA + precomputed quality table.
+GIAB: 0.28 s decompress (vs 1.9 s default), archive 4.41 MB (still −12% vs Genozip).
 
-| Tool | Het-SNV F1 | Notes |
-|---|---|---|
-| **ARCS** | **0.936** | zero-cost byproduct of compression |
-| DiscoSNP++ | 0.918 | dedicated reference-free caller |
-| Kmer2SNP | 0.532 | dedicated reference-free caller |
+See [docs/RESULTS.md](docs/RESULTS.md) for full 8-dataset tables and per-stream breakdowns.
 
-`arcs call reads.fq out.vcf` — one command, no aligner, no reference, no extra runtime.
-Also supports het-indels (F1 ≈ 0.51 on real GIAB, ties DiscoSNP++) and polyploid calling
-(triploid synthetic F1 = 0.994). See [docs/REFFREE_COMPARISON.md](docs/REFFREE_COMPARISON.md).
+---
+
+### Reference-free variant calling
+
+**Table 2.** Het-SNV calling benchmark on 4 GIAB individuals (HG002–HG005, 3 ancestries),
+5 chr20 windows per individual, evaluated with rtg vcfeval (GA4GH gold standard).
+
+| Tool | Het-SNV F1 | Precision | Recall | Notes |
+|---|---|---|---|---|
+| **ARCS** | **0.936** | **0.991** | **0.886** | zero-cost byproduct of compression |
+| DiscoSNP++ | 0.918 | — | — | dedicated reference-free caller |
+| Kmer2SNP | 0.532 | — | — | dedicated reference-free caller |
+
+`arcs call reads.fq out.vcf` — one command, no aligner, no reference, no additional runtime cost.
+
+Also supports:
+- **Het-indels**: real GIAB HG002 chr20 F1 = 0.505; wins in homopolymer (0.538 vs 0.417) and
+  tandem-repeat (0.383 vs 0.324) strata vs DiscoSNP++.
+- **Polyploid**: triploid synthetic F1 = 0.994–1.000 (4 independent seeds).
+
+See [docs/REFFREE_COMPARISON.md](docs/REFFREE_COMPARISON.md) for full calling benchmarks.
+
+---
+
+## Quick test
+
+Sample FASTQs (50 reads each, 10 organisms) are included in [`test_data/`](test_data/):
+
+```bash
+./build/arcs compress test_data/ecoli_sample.gz out.arcs
+./build/arcs decompress out.arcs restored.fastq
+diff <(zcat test_data/ecoli_sample.gz) restored.fastq && echo "LOSSLESS OK"
+```
+
+All 10 samples at once:
+
+```bash
+for f in test_data/*.gz; do
+    ./build/arcs compress "$f" /tmp/t.arcs
+    ./build/arcs decompress /tmp/t.arcs /tmp/t.fq
+    diff <(zcat "$f") /tmp/t.fq && echo "OK: $f" || echo "FAIL: $f"
+done
+```
+
+Full lossless regression suite (7 tests): `ctest --test-dir build`
 
 ---
 
@@ -56,12 +112,6 @@ ctest --test-dir build          # 7/7 lossless roundtrip tests
 
 **Dependencies:** C++17 compiler, CMake ≥ 3.16, zlib, liblzma.
 
-> **Portability:** by default the build targets your CPU (`-march=native`).
-> To build a binary that runs on any x86-64 machine (e.g. for distribution):
-> ```bash
-> cmake -B build -DCMAKE_BUILD_TYPE=Release -DARCS_NATIVE=OFF -DARCS_PORTABLE=ON
-> ```
-
 ```bash
 # Ubuntu / Debian
 sudo apt-get install cmake build-essential zlib1g-dev liblzma-dev
@@ -70,31 +120,56 @@ sudo apt-get install cmake build-essential zlib1g-dev liblzma-dev
 brew install cmake xz
 ```
 
+**Install system-wide** (optional — puts `arcs` on your PATH):
+
+```bash
+sudo cmake --install build
+arcs compress reads.fastq out.arcs   # works from anywhere
+```
+
+**Portability:** by default the build is optimised for your CPU (`-march=native`).
+To build a portable binary that runs on any x86-64 machine (SSE4.1, 2010+):
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DARCS_NATIVE=OFF -DARCS_PORTABLE=ON
+```
+
 ---
 
 ## Usage
 
 ```bash
-# Compress (chain-pg pseudogenome mode — default)
-./build/arcs compress reads.fastq out.arcs
+# Compress (chain-pg pseudogenome mode — default, best ratio)
+arcs compress reads.fastq out.arcs
 
-# Decompress (fully lossless, byte-exact)
-./build/arcs decompress out.arcs reads_restored.fastq
+# Compress with fast-decode (~8–30× faster decompress, ~2% larger archive)
+arcs compress --fast-decode reads.fastq out.arcs
 
-# Reference-free variant calling
-./build/arcs call reads.fastq variants.vcf
+# Decompress (fully lossless, byte-exact — format auto-detected)
+arcs decompress out.arcs reads_restored.fastq
+
+# Reference-free variant calling (standalone)
+arcs call reads.fastq variants.vcf
+
+# Fused compress + call (single pass, byte-identical archive)
+arcs compress --call reads.fastq out.arcs
+
+# Archive inspection
+arcs info out.arcs
 ```
 
-### Environment knobs (all optional — defaults are tuned)
+### Optional environment knobs
+
+All defaults are tuned for best ratio. These are for advanced users.
 
 | Variable | Effect |
 |---|---|
-| `ARCS_PG_BLOCKS=1` | Single-stream sequence codec for absolute best ratio (slightly slower decode) |
+| `ARCS_PG_BLOCKS=1` | Single-stream sequence codec — absolute best ratio, slightly slower decode |
 | `ARCS_QUAL_BLOCKS=N` | Override quality coder thread/block count |
 | `ARCS_NAMES_BLOCKS=N` | Override name coder block count |
-| `ARCS_PG_FAST_DECODE=1` | LZMA-ASCII sequence codec: 2.8× faster decompress, +0.23% archive (GIAB) |
-| `ARCS_MERGE_OFF=1` | Disable contig merge step (default on; merge collapses fragmented contigs for better ratio) |
-| `ARCS_ORDER_FREE=1` | Opt into multiset mode (smaller archive, loses read order) |
+| `ARCS_MERGE_OFF=1` | Disable contig merge (default on; merge collapses fragmented contigs) |
+| `ARCS_ORDER_FREE=1` | Multiset mode — smaller archive, loses read order |
+| `ARCS_PAR_SHARDS=N` | Override parallel shard count for assembly (default: min(4, cores)) |
 | `ARCS_ENC_TIMING=1` | Per-phase encode timing |
 | `ARCS_DEC_TIMING=1` | Per-phase decode timing |
 
@@ -105,25 +180,31 @@ brew install cmake xz
 ```
 src/          C++17 source — encoder, decoder, chain assembler, quality coder, variant caller
 tests/        7 CTest roundtrip and unit tests
-test_data/    50-read sample FASTQs for 10 organisms (36 KB total) — run immediately after build
-third_party/  rans_byte.h (rANS entropy coder, public domain) + libbsc (BWT+QLFC, MIT)
+test_data/    50-read sample FASTQs for 10 organisms (36 KB) — run immediately after build
+third_party/  rans_byte.h (rANS, public domain) + libbsc (BWT+QLFC, MIT)
 docs/         Benchmark results and algorithm notes
 scripts/      Evaluation scripts (variant calling, indel bench, polyploid sim)
-benchmark/    Linux benchmark runner
+benchmark/    Parametric Linux benchmark runner (DATA_DIR ARCS_BIN [OUT_DIR])
 .github/      CI: build + ctest on Ubuntu 22.04 and macOS 13
 ```
 
 ---
 
-## Quick test
+## Design
 
-Sample FASTQs (50 reads, 10 organisms) are included in [`test_data/`](test_data/):
-
-```bash
-./build/arcs compress test_data/ecoli_sample.gz out.arcs
-./build/arcs decompress out.arcs restored.fastq
-diff <(zcat test_data/ecoli_sample.gz) restored.fastq && echo "LOSSLESS OK"
-```
+- **Multi-contig self-assembled pseudogenome** — greedy k-NN chain walk builds a pseudogenome
+  from reads without a reference; sequence compresses ~10× smaller than k-mer models alone.
+- **Adaptive quality coder** — conditioned on local sequence context + run-length; sits at
+  the conditional-entropy floor of binned Illumina quality (matches fqzcomp at 1.574 bpq).
+- **Tokenized read-name model** — splits Illumina names into template + binary-packed X:Y
+  flowcell coordinates; names near their information-theoretic floor.
+- **Block-parallel codecs** — sequence, quality, and name coders auto-scale with core count.
+- **Parallel shard assembly** — reads split round-robin into N shards, assembled in parallel,
+  merged with globally-remapped indices; 4× compress speedup on multi-core.
+- **Fast-decode mode** — 2-bit packed DNA (zstd-6) + precomputed 2D quality table;
+  Genozip-class decode speed while retaining the smallest lossless archive.
+- **Byte-lossless on adversarial input** — empty reads, sub-seed reads, lowercase/IUPAC bases,
+  full Phred 0–93, CRLF line endings, control-char names all round-trip correctly.
 
 ---
 
@@ -134,20 +215,14 @@ Full benchmark data is not stored in this repository. Download separately:
 - **GIAB HG002 / HG001 (NA12878)** — [NIST Genome in a Bottle](https://www.nist.gov/programs-projects/genome-bottle)
 - **E. coli K-12** — NCBI accession NC_000913.3
 
-See [docs/RESULTS.md](docs/RESULTS.md) for full multi-dataset tables and dataset descriptions.
+See [docs/RESULTS.md](docs/RESULTS.md) for full multi-dataset tables, dataset accessions,
+and dataset descriptions.
 
----
+The parametric benchmark script for Linux:
 
-## Design
-
-- **Multi-contig self-assembled pseudogenome** — greedy k-NN chain walk builds a pseudogenome
-  from reads without a reference; sequence compresses ~10× smaller than k-mer models.
-- **Adaptive quality coder** — conditioned on local sequence context + run-length; sits at
-  the conditional-entropy floor of binned Illumina quality.
-- **Tokenized read-name model** — splits Illumina names into template + binary-packed X:Y coordinates.
-- **Block-parallel codecs** — sequence, quality, and name coders auto-scale with core count.
-- **Byte-lossless on adversarial input** — empty reads, sub-seed reads, lowercase/IUPAC bases,
-  full Phred 0–93, CRLF line endings, control-char names all round-trip correctly.
+```bash
+bash benchmark/run_linux.sh ~/fastq_datasets ./build/arcs ./results
+```
 
 ---
 
@@ -155,11 +230,23 @@ See [docs/RESULTS.md](docs/RESULTS.md) for full multi-dataset tables and dataset
 
 If you use ARCS in your research, please cite:
 
-> Thackshanaramana B et al. (2026). *ARCS: reference-free lossless FASTQ compression
-> with integrated heterozygous variant calling.* (manuscript in preparation)
+> Thackshanaramana B (2026). *ARCS: reference-free lossless FASTQ compression
+> with integrated heterozygous variant calling.* Manuscript in preparation.
+
+---
+
+## Author
+
+**Thackshanaramana B**
+SRM Institute of Science and Technology
+📧 tb2138@srmist.edu.in · thackshanaramanab@gmail.com
+🔬 [ORCID: 0009-0005-9453-316X](https://orcid.org/0009-0005-9453-316X)
 
 ---
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+`third_party/libbsc/` is distributed under the Apache 2.0 license (see `third_party/libbsc/LICENSE`).
+`third_party/rans_byte.h` is public domain (Fabian Giesen).
