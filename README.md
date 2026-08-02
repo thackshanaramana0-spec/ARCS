@@ -56,6 +56,12 @@ ctest --test-dir build          # 7/7 lossless roundtrip tests
 
 **Dependencies:** C++17 compiler, CMake ≥ 3.16, zlib, liblzma.
 
+> **Portability:** by default the build targets your CPU (`-march=native`).
+> To build a binary that runs on any x86-64 machine (e.g. for distribution):
+> ```bash
+> cmake -B build -DCMAKE_BUILD_TYPE=Release -DARCS_NATIVE=OFF -DARCS_PORTABLE=ON
+> ```
+
 ```bash
 # Ubuntu / Debian
 sudo apt-get install cmake build-essential zlib1g-dev liblzma-dev

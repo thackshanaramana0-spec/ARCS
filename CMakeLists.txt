@@ -6,17 +6,21 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # ── Compiler flags ────────────────────────────────────────────────────────────
+option(ARCS_NATIVE    "Build with -march=native (fastest on this machine, not portable)" ON)
+option(ARCS_PORTABLE  "Build with -msse4.1 (runs on any x86-64 with SSE4.1, ~2010+)" OFF)
+
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    add_compile_options(
-        -O3
-        -march=native
-        -funroll-loops
-        -Wall
-        -Wextra
-        -Wno-unused-parameter
-    )
+    add_compile_options(-O3 -funroll-loops -Wall -Wextra -Wno-unused-parameter)
+    if(ARCS_PORTABLE)
+        add_compile_options(-msse4.1)
+    elseif(ARCS_NATIVE)
+        add_compile_options(-march=native)
+    endif()
 elseif(MSVC)
-    add_compile_options(/O2 /W4 /arch:AVX2)
+    add_compile_options(/O2 /W4)
+    if(ARCS_NATIVE)
+        add_compile_options(/arch:AVX2)
+    endif()
 endif()
 
 # ── OpenMP ────────────────────────────────────────────────────────────────────
