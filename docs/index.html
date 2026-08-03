@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ARCS — Unified Lossless FASTQ Compression and Reference-Free Variant Calling</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --accent: #58a6ff;
+      --accent2: #3fb950;
+      --warn: #e3b341;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 16px;
+      line-height: 1.6;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 48px 24px 40px;
+      text-align: center;
+    }
+    header h1 {
+      font-size: 2rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 12px;
+    }
+    header h1 span { color: var(--accent); }
+    header p.tagline {
+      color: var(--muted);
+      font-size: 1.05rem;
+      max-width: 680px;
+      margin: 0 auto 20px;
+    }
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 8px;
+      margin-bottom: 28px;
+    }
+    .badges img { height: 20px; }
+    .cta {
+      display: inline-flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    .btn {
+      display: inline-block;
+      padding: 10px 20px;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    .btn:hover { opacity: 0.85; text-decoration: none; }
+    .btn-primary { background: var(--accent); color: #0d1117; }
+    .btn-secondary { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
+
+    main { max-width: 960px; margin: 0 auto; padding: 48px 24px; }
+
+    section { margin-bottom: 56px; }
+    h2 {
+      font-size: 1.4rem;
+      font-weight: 700;
+      margin-bottom: 20px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    h3 { font-size: 1.05rem; font-weight: 600; margin: 20px 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+
+    /* Stat cards */
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      text-align: center;
+    }
+    .stat-card .num {
+      font-size: 2rem;
+      font-weight: 700;
+      color: var(--accent2);
+      line-height: 1;
+      margin-bottom: 6px;
+    }
+    .stat-card .num.yellow { color: var(--warn); }
+    .stat-card .num.blue { color: var(--accent); }
+    .stat-card .label { font-size: 0.82rem; color: var(--muted); }
+
+    /* Tables */
+    .tbl-wrap { overflow-x: auto; margin-bottom: 16px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.88rem;
+      font-family: var(--mono);
+    }
+    th {
+      background: var(--surface);
+      color: var(--muted);
+      padding: 10px 14px;
+      text-align: left;
+      border: 1px solid var(--border);
+      font-family: var(--font);
+      font-size: 0.82rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    td {
+      padding: 9px 14px;
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+    tr:nth-child(even) td { background: #0f141a; }
+    td.best { color: var(--accent2); font-weight: 700; }
+    td.arcs { background: rgba(63,185,80,0.06); }
+
+    /* Figure */
+    .fig-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 24px;
+      text-align: center;
+      margin-bottom: 16px;
+    }
+    .fig-wrap img {
+      max-width: 100%;
+      border-radius: 4px;
+    }
+    .fig-caption {
+      margin-top: 12px;
+      font-size: 0.84rem;
+      color: var(--muted);
+      max-width: 680px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+
+    /* Code block */
+    pre {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      overflow-x: auto;
+      font-family: var(--mono);
+      font-size: 0.85rem;
+      line-height: 1.6;
+      margin-bottom: 16px;
+    }
+    code { font-family: var(--mono); }
+    .comment { color: var(--muted); }
+
+    /* Features grid */
+    .features {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+    }
+    .feature-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+    }
+    .feature-card .icon { font-size: 1.3rem; margin-bottom: 8px; }
+    .feature-card strong { display: block; margin-bottom: 6px; color: var(--text); }
+    .feature-card p { font-size: 0.88rem; color: var(--muted); margin: 0; }
+
+    /* Author */
+    .author-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 24px 28px;
+      display: flex;
+      align-items: flex-start;
+      gap: 20px;
+    }
+    .author-card .avi {
+      width: 56px;
+      height: 56px;
+      background: var(--accent);
+      border-radius: 50%;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.4rem;
+      font-weight: 700;
+      color: #0d1117;
+    }
+    .author-card .info { flex: 1; }
+    .author-card .info strong { font-size: 1.05rem; display: block; margin-bottom: 4px; }
+    .author-card .info p { font-size: 0.88rem; color: var(--muted); margin: 2px 0; }
+    .author-card .info a { font-size: 0.88rem; }
+
+    /* Citation */
+    .citation-box {
+      background: var(--surface);
+      border-left: 3px solid var(--accent);
+      border-radius: 4px;
+      padding: 16px 20px;
+      font-size: 0.88rem;
+      font-family: var(--mono);
+      color: var(--muted);
+    }
+
+    footer {
+      border-top: 1px solid var(--border);
+      text-align: center;
+      padding: 28px 24px;
+      font-size: 0.82rem;
+      color: var(--muted);
+    }
+    footer a { color: var(--muted); }
+
+    .pill {
+      display: inline-block;
+      background: rgba(88,166,255,0.12);
+      color: var(--accent);
+      border: 1px solid rgba(88,166,255,0.3);
+      border-radius: 20px;
+      padding: 2px 10px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      margin-right: 6px;
+    }
+    .pill.green {
+      background: rgba(63,185,80,0.12);
+      color: var(--accent2);
+      border-color: rgba(63,185,80,0.3);
+    }
+
+    @media (max-width: 640px) {
+      header h1 { font-size: 1.5rem; }
+      .author-card { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ─── Header ─── -->
+<header>
+  <h1><span>ARCS</span> — Unified Lossless FASTQ Compression<br>and Reference-Free Variant Calling</h1>
+  <p class="tagline">
+    Compress Illumina short reads to the smallest lossless archive and call heterozygous SNVs
+    and indels — single pass, single binary, no reference genome.
+  </p>
+  <div class="badges">
+    <img src="https://github.com/thackshanaramana0-spec/ARCS/actions/workflows/ci.yml/badge.svg" alt="CI">
+    <img src="https://img.shields.io/badge/release-v2.2.0-blue.svg" alt="Release">
+    <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License">
+    <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg" alt="Platform">
+    <img src="https://img.shields.io/badge/C%2B%2B-17-blue.svg" alt="C++17">
+    <img src="https://img.shields.io/badge/lossless-byte--exact-brightgreen.svg" alt="Lossless">
+  </div>
+  <div class="cta">
+    <a class="btn btn-primary" href="https://github.com/thackshanaramana0-spec/ARCS">GitHub Repository</a>
+    <a class="btn btn-secondary" href="https://github.com/thackshanaramana0-spec/ARCS/releases/tag/v2.2.0">Download v2.2.0</a>
+    <a class="btn btn-secondary" href="https://github.com/thackshanaramana0-spec/ARCS/blob/main/docs/RESULTS.md">Full Results</a>
+  </div>
+</header>
+
+<!-- ─── Main ─── -->
+<main>
+
+  <!-- Stats row -->
+  <section>
+    <div class="stats">
+      <div class="stat-card">
+        <div class="num">−23%</div>
+        <div class="label">smaller archive than SPRING on GIAB</div>
+      </div>
+      <div class="stat-card">
+        <div class="num">−14%</div>
+        <div class="label">smaller archive than Genozip on GIAB</div>
+      </div>
+      <div class="stat-card">
+        <div class="num yellow">0.936</div>
+        <div class="label">het-SNV F1 across 4 GIAB individuals</div>
+      </div>
+      <div class="stat-card">
+        <div class="num blue">8/8</div>
+        <div class="label">dataset wins vs SPRING, 4 organisms</div>
+      </div>
+      <div class="stat-card">
+        <div class="num">0 s</div>
+        <div class="label">extra time for variant calls<br>(byproduct of compression)</div>
+      </div>
+      <div class="stat-card">
+        <div class="num blue">1</div>
+        <div class="label">binary, no reference genome,<br>no external aligner</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Architecture -->
+  <section>
+    <h2>Architecture</h2>
+    <div class="fig-wrap">
+      <img src="figures/fig2.png" alt="ARCS two-phase pipeline: de novo assembly then parallel encoding streams" />
+      <p class="fig-caption">
+        <strong>Figure 1.</strong>
+        Phase 1 (De Novo Assembly): k-mer graph construction, contig building, and read placement.
+        Phase 2 (Parallel Encoding Streams): sequence through pseudogenome construction and FCM
+        arithmetic coder; quality through block-parallel context model; names through Illumina
+        tokenizer and LZMA-9. All three streams merge into a single lossless <code>.arcs</code> binary
+        archive. The placement index simultaneously feeds bubble detection, producing reference-free
+        VCF output at zero additional cost.
+      </p>
+    </div>
+  </section>
+
+  <!-- Key features -->
+  <section>
+    <h2>Key Features</h2>
+    <div class="features">
+      <div class="feature-card">
+        <div class="icon">📦</div>
+        <strong>Smallest lossless archive</strong>
+        <p>Beats Genozip by 14% and SPRING by 23% on GIAB HG002. Wins 8/8 public datasets vs SPRING spanning 4 organisms and read lengths 51–221 bp.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">🧬</div>
+        <strong>Reference-free variant calling</strong>
+        <p>Het-SNV F1 = 0.936 averaged across 4 GIAB individuals (3 ancestries). Zero additional runtime — calls are a byproduct of the compression assembly.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">✅</div>
+        <strong>Byte-exact lossless</strong>
+        <p>Verified byte-for-byte identical roundtrip on all inputs including CRLF line endings, full Phred 0–93, lowercase/IUPAC bases, and variable-length reads.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">⚡</div>
+        <strong>Fast-decode mode</strong>
+        <p><code>--fast-decode</code>: 8–30× faster decompress (0.28 s on GIAB) at only 2% archive overhead. Archive still 12% smaller than Genozip.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">🔧</div>
+        <strong>Single binary</strong>
+        <p>No runtime dependencies beyond zlib, liblzma, and pthreads. Builds with CMake on Linux and macOS. Pre-built Linux binary available.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">🌿</div>
+        <strong>Polyploid support</strong>
+        <p>Triploid synthetic data F1 = 0.994–1.000 with <code>ARCS_PLOIDY=3</code>. Homopolymer indel strata: 0.538 vs DiscoSNP++ 0.417.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Compression results -->
+  <section>
+    <h2>Compression Results</h2>
+    <p style="color:var(--muted);font-size:0.88rem;margin-bottom:16px;">
+      GIAB HG002 chr20 · 39 MB · 113,987 reads · 150 bp Illumina · native Linux ext4 · byte-lossless roundtrip verified.
+    </p>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Tool</th>
+            <th>Archive size</th>
+            <th>Compress</th>
+            <th>Decompress</th>
+            <th>Peak RAM</th>
+            <th>Byte-lossless</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="arcs"><strong>ARCS</strong></td>
+            <td class="arcs best">4.31 MB</td>
+            <td class="arcs">4.4 s</td>
+            <td class="arcs">1.9 s</td>
+            <td class="arcs">366 MB</td>
+            <td class="arcs best">✅ yes</td>
+          </tr>
+          <tr>
+            <td>Genozip 15</td>
+            <td>5.03 MB</td>
+            <td>4.8 s</td>
+            <td>0.45 s</td>
+            <td>382 MB</td>
+            <td>✅ yes</td>
+          </tr>
+          <tr>
+            <td>SPRING</td>
+            <td>5.60 MB</td>
+            <td>5.0 s</td>
+            <td>4.3 s</td>
+            <td>319 MB</td>
+            <td>✅ yes</td>
+          </tr>
+          <tr>
+            <td>PgRC2</td>
+            <td>0.245 MB †</td>
+            <td>4.5 s</td>
+            <td>0.07 s</td>
+            <td>88 MB</td>
+            <td>❌ lossy quality</td>
+          </tr>
+          <tr>
+            <td>fqzcomp v4.6</td>
+            <td>7.26 MB</td>
+            <td>0.6 s</td>
+            <td>0.9 s</td>
+            <td>60 MB</td>
+            <td>❌ quality remapping</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="color:var(--muted);font-size:0.82rem;">† PgRC2 default applies lossy quality binning — not a lossless comparison. With <code>--fast-decode</code>: ARCS decompresses in 0.28 s, archive 4.41 MB (still −12% vs Genozip).</p>
+  </section>
+
+  <!-- Variant calling -->
+  <section>
+    <h2>Reference-Free Variant Calling</h2>
+    <p style="color:var(--muted);font-size:0.88rem;margin-bottom:16px;">
+      Het-SNV benchmark · 4 GIAB individuals (HG002–HG005) · 3 ancestries · 5 chr20 windows each · scored by rtg vcfeval · frozen parameters.
+    </p>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Tool</th>
+            <th>Het-SNV F1</th>
+            <th>Precision</th>
+            <th>Recall</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="arcs"><strong>ARCS</strong></td>
+            <td class="arcs best">0.936</td>
+            <td class="arcs">0.991</td>
+            <td class="arcs">0.886</td>
+            <td class="arcs">zero-cost byproduct of compression</td>
+          </tr>
+          <tr>
+            <td>DiscoSNP++</td>
+            <td>0.918</td>
+            <td>—</td>
+            <td>—</td>
+            <td>dedicated reference-free caller</td>
+          </tr>
+          <tr>
+            <td>Kmer2SNP</td>
+            <td>0.532</td>
+            <td>—</td>
+            <td>—</td>
+            <td>dedicated reference-free caller</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="color:var(--muted);font-size:0.82rem;">
+      ARCS also calls het-indels (GIAB F1 = 0.505, wins DiscoSNP++ in homopolymer and tandem-repeat strata)
+      and supports polyploid calling via <code>ARCS_PLOIDY=k</code>.
+    </p>
+  </section>
+
+  <!-- Algorithm figure -->
+  <section>
+    <h2>Detailed Algorithm</h2>
+    <div class="fig-wrap">
+      <img src="figures/fig1.png" alt="ARCS detailed algorithm: from FASTQ to archive and VCF" />
+      <p class="fig-caption">
+        <strong>Figure 2.</strong>
+        (A) FASTQ reads are loaded and pilot-scored.
+        (B) A de novo string graph is assembled without a reference.
+        (C) Reads are placed against assembled contigs.
+        (D) A compact placement index stores read-to-contig mappings.
+        (E) The pseudogenome is constructed from linearised contigs; variant evidence is simultaneously extracted via pileup base counts.
+        (F) Sequences are entropy-coded with an FCM arithmetic coder; heterozygous bubbles in the assembly graph are detected as variant candidates.
+        (G) The final output is a lossless <code>.arcs</code> binary archive and a reference-free VCF file, produced in a single pass over the input.
+      </p>
+    </div>
+  </section>
+
+  <!-- Quick start -->
+  <section>
+    <h2>Quick Start</h2>
+    <h3>Install (Linux pre-built binary)</h3>
+    <pre><span class="comment"># Download and install the v2.2.0 pre-built Linux binary</span>
+wget https://github.com/thackshanaramana0-spec/ARCS/releases/download/v2.2.0/arcs-linux-x86_64
+chmod +x arcs-linux-x86_64
+sudo mv arcs-linux-x86_64 /usr/local/bin/arcs</pre>
+
+    <h3>Build from source</h3>
+    <pre>git clone https://github.com/thackshanaramana0-spec/ARCS.git
+cd ARCS
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel $(nproc)
+ctest --test-dir build</pre>
+
+    <h3>Compress and decompress</h3>
+    <pre><span class="comment"># Best-ratio lossless archive</span>
+arcs compress reads.fastq out.arcs
+
+<span class="comment"># Fast-decode mode (8-30× faster decompress, ~2% larger archive)</span>
+arcs compress --fast-decode reads.fastq out.arcs
+
+<span class="comment"># Decompress (byte-exact; format auto-detected)</span>
+arcs decompress out.arcs reads_restored.fastq</pre>
+
+    <h3>Variant calling</h3>
+    <pre><span class="comment"># Standalone reference-free het-SNV and indel caller</span>
+arcs call reads.fastq variants.vcf
+
+<span class="comment"># Fused compress + call in a single pass (byte-identical archive)</span>
+arcs compress --call reads.fastq out.arcs</pre>
+
+    <h3>Quick lossless test (sample data included)</h3>
+    <pre>./build/arcs compress test_data/ecoli_sample.gz out.arcs
+./build/arcs decompress out.arcs restored.fastq
+diff &lt;(zcat test_data/ecoli_sample.gz) restored.fastq &amp;&amp; echo "LOSSLESS OK"</pre>
+  </section>
+
+  <!-- Citation -->
+  <section>
+    <h2>Citation</h2>
+    <p style="margin-bottom:14px;font-size:0.9rem;color:var(--muted);">If you use ARCS in your research, please cite:</p>
+    <div class="citation-box">
+      Thackshanaramana B (2026). <em>ARCS: reference-free lossless FASTQ compression with
+      integrated heterozygous variant calling.</em> Manuscript in preparation.
+    </div>
+  </section>
+
+  <!-- Author -->
+  <section>
+    <h2>Author</h2>
+    <div class="author-card">
+      <div class="avi">T</div>
+      <div class="info">
+        <strong>Thackshanaramana B</strong>
+        <p>SRM Institute of Science and Technology</p>
+        <p>
+          <span class="pill green">ORCID</span>
+          <a href="https://orcid.org/0009-0005-9453-316X" target="_blank">0009-0005-9453-316X</a>
+        </p>
+        <p style="margin-top:6px;">
+          <a href="mailto:tb2138@srmist.edu.in">tb2138@srmist.edu.in</a>
+          &nbsp;·&nbsp;
+          <a href="mailto:thackshanaramanab@gmail.com">thackshanaramanab@gmail.com</a>
+        </p>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <p>
+    ARCS is MIT-licensed. <a href="https://github.com/thackshanaramana0-spec/ARCS">GitHub</a>
+    &nbsp;·&nbsp;
+    <a href="https://github.com/thackshanaramana0-spec/ARCS/releases">Releases</a>
+    &nbsp;·&nbsp;
+    <a href="https://github.com/thackshanaramana0-spec/ARCS/blob/main/docs/RESULTS.md">Full Benchmark Results</a>
+  </p>
+</footer>
+
+</body>
+</html>
