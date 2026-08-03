@@ -116,6 +116,7 @@ All notable changes to ARCS are documented here.
   validated by rtg vcfeval (GA4GH engine). Beats DiscoSNP++ (0.912) and Kmer2SNP (0.533).
 - Het-indel calling via contig-bubble detection. Real GIAB HG002 chr20 F1 = 0.505
   (DiscoSNP++ 0.513 — zero-cost byproduct ties the dedicated tool).
+  *(Precision updated in v2.2.0 scoring run; see docs/RESULTS.md Table 7 for final numbers.)*
 - Polyploid support (`ARCS_PLOIDY=k`): triploid synthetic F1 = 0.994–1.000 (4 seeds).
 - `arcs compress --call` — fused single-pass compress + call (byte-identical archive).
 

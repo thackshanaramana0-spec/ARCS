@@ -147,11 +147,11 @@ cmake --build build --parallel $(nproc)
 ctest --test-dir build
 ```
 
-**Dependencies:** C++17 compiler, CMake 3.16 or later, zlib, liblzma.
+**Dependencies:** C++17 compiler, CMake 3.16 or later, zlib, liblzma. libzstd is optional but required for `--fast-decode` mode.
 
 ```bash
 # Ubuntu / Debian
-sudo apt-get install cmake build-essential zlib1g-dev liblzma-dev
+sudo apt-get install cmake build-essential zlib1g-dev liblzma-dev libzstd-dev
 
 # macOS (Homebrew)
 brew install cmake xz

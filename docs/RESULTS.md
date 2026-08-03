@@ -76,7 +76,7 @@ ARCS compress is slower than SPRING/Genozip on most datasets — the assembly (d
 | HUMAN_127bp | 8.6 s | 0.45 s | 5.1 s |
 | MTB_51bp | 4.3 s | 0.60 s | 1.9 s |
 | SARS2_AMP | **1.1 s** | 0.39 s | 4.9 s |
-| GIAB_HG002 | **2.4 s** | 0.37 s | 8.2 s |
+| GIAB_HG002 | **1.9 s** | 0.37 s | 8.2 s |
 | GIAB_HG001 | **8.5 s** | 2.3 s | 9.8 s |
 | ECOLI_30x | 12.2 s | 3.7 s | 10.0 s |
 | HUMAN_30x | **8.2 s** | 5.0 s | 11.4 s |
