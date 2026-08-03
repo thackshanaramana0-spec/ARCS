@@ -11,6 +11,9 @@ on:
         required: true
         default: 'v2.2.0'
 
+permissions:
+  contents: write
+
 jobs:
   build-linux:
     name: Build Linux binary and publish release
