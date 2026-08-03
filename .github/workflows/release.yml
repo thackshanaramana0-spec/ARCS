@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v2.2.0)'
+        required: true
+        default: 'v2.2.0'
+
+jobs:
+  build-linux:
+    name: Build Linux binary and publish release
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake build-essential zlib1g-dev liblzma-dev libzstd-dev
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "TAG=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build portable binary
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DARCS_NATIVE=OFF \
+            -DARCS_PORTABLE=ON
+          cmake --build build --parallel $(nproc)
+          strip build/arcs
+          mv build/arcs arcs-linux-x86_64
+
+      - name: Run tests
+        working-directory: build
+        run: ctest --output-on-failure -j$(nproc)
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          TAG=${{ steps.tag.outputs.TAG }}
+          VERSION="${TAG#v}"
+          # Extract section from CHANGELOG.md between this version header and the next
+          awk "/^## v${VERSION}/{found=1; next} found && /^## v/{exit} found{print}" CHANGELOG.md > release_notes.md
+          echo "Release notes:"
+          cat release_notes.md
+
+      - name: Create source tarball
+        run: |
+          TAG=${{ steps.tag.outputs.TAG }}
+          git archive --format=tar.gz --prefix=ARCS-${TAG}/ HEAD \
+            -o ARCS-${TAG}-source.tar.gz
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=${{ steps.tag.outputs.TAG }}
+          gh release create "$TAG" \
+            --title "ARCS ${TAG}" \
+            --notes-file release_notes.md \
+            arcs-linux-x86_64 \
+            ARCS-${TAG}-source.tar.gz
