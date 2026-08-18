@@ -2,6 +2,7 @@
 build/
 build_wsl/
 build_win/
+build_test/
 cmake-build-*/
 *.o
 *.obj

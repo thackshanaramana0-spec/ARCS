@@ -1003,7 +1003,11 @@ void ARCSEncoder::encode_amplicon(const std::vector<Read>& reads,
                                    EncodeProgress& prog) {
     prog.mapped_reads   = 0;
     prog.unmapped_reads = reads.size();
-    int L = reads.empty() ? 0 : (int)reads[0].seq.size();
+    // Use max read length as stride so mixed-length amplicon reads (e.g. SARS2
+    // 97bp + 221bp) are stored without truncation. For uniform-length inputs
+    // max_L == reads[0].size(), so the format is byte-identical to the old encoder.
+    int L = 0;
+    for (const auto& r : reads) if ((int)r.seq.size() > L) L = (int)r.seq.size();
 
     // ── 1. PCR exact deduplication ────────────────────────────────────────────
     // Track both quality strings AND original read indices per cluster.

@@ -5,6 +5,7 @@
 #include "chain_encoder.h"
 #include "caller.h"
 #include "fastq_io.h"
+#include "tensor.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -29,7 +30,8 @@ static void print_usage(const char* prog) {
         "  %s info        <input.arcs>\n"
         "  %s akc         <input.fastq[.gz]>   (show AKC score only)\n"
         "  %s call        <reads.fastq[.gz]> <out.vcf>   (reference-free SNV calling)\n"
-        "  %s compress --call <out.vcf> <reads.fastq[.gz]> <out.arcs>  (archive + call, one pass)\n\n"
+        "  %s compress --call <out.vcf> <reads.fastq[.gz]> <out.arcs>  (archive + call, one pass)\n"
+        "  %s tensor      <input.arcs> <output_prefix>   (GU-256: export ML-ready feature tensors)\n\n"
         "Options (set before subcommand):\n"
         "  --fast           fast mode: lean FCM (5 orders) + sparse merge/place + static quality;\n"
         "                   speed/RAM optimized, always lossless; parallel encode phases preserved\n"
@@ -262,6 +264,21 @@ int main(int argc, char** argv) {
         (void)build_multicontig_pg(reads, &cd);
         int nc = run_variant_call(reads, cd, vcf_path);
         return nc < 0 ? 1 : 0;
+
+    } else if (cmd == "tensor") {
+        // GU-256 tensor export: read placement records from archive → ML feature tensors.
+        // No FASTQ or reference genome required.
+        if (i + 1 >= argc) { fprintf(stderr, "tensor: need <input.arcs> <output_prefix>\n"); return 1; }
+        std::string inp    = argv[i++];
+        std::string prefix = argv[i++];
+        TensorOptions opts;
+        while (i < argc) {
+            std::string flag = argv[i++];
+            if      (flag == "--coverage") opts.emit_coverage = true;
+            else if (flag == "--no-reads") opts.emit_reads    = false;
+            else { fprintf(stderr, "tensor: unknown flag: %s\n", flag.c_str()); return 1; }
+        }
+        return run_tensor_export(inp, prefix, opts);
 
     } else {
         fprintf(stderr, "Unknown command: %s\n", cmd.c_str());

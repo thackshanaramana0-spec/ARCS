@@ -123,6 +123,7 @@ set(ARCS_SOURCES
     src/encoder.cpp
     src/decoder.cpp
     src/caller.cpp
+    src/tensor.cpp
     src/bsc_codec.cpp
     ${LIBBSC_SOURCES}
 )

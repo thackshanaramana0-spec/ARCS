@@ -655,9 +655,6 @@ void ARCSDecoder::decode_amplicon(const ARCSReader& rdr, FASTQWriter& out_writer
 
     // ── V7* BYTE-EXACT path ───────────────────────────────────────────────────
     if (is_v7star) {
-        // Determine read length L from first unique sequence
-        int L = unique_seqs.empty() ? 0 : (int)unique_seqs[0].size();
-
         // Read permutation: perm[p] = original read index at cluster pos p
         auto perm_blob = rdr.read_blob(BlobType::QUALITY_PERM);
         auto perm_raw  = arcs_decompress(perm_blob.data(), perm_blob.size());
@@ -673,6 +670,16 @@ void ARCSDecoder::decode_amplicon(const ARCSReader& rdr, FASTQWriter& out_writer
         // Read flat quality: n_reads × L bytes in cluster order
         auto q_blob = rdr.read_blob(BlobType::QUALITY_DATA);
         auto q_raw  = arcs_decompress(q_blob.data(), q_blob.size());
+
+        // Derive L from the stored data: encoder wrote n_reads × L bytes total.
+        // Do NOT use unique_seqs[0].size() — after canonical-key sorting, the first
+        // unique sequence may differ from reads[0] (which the encoder used as L),
+        // causing a per-read drift of ΔL bytes in every quality slice. Dividing
+        // q_raw.size() by n_perm recovers the exact L the encoder used, regardless
+        // of sequence length variation or sort order.
+        int L = (n_perm > 0 && !q_raw.empty() && q_raw.size() % n_perm == 0)
+                ? (int)(q_raw.size() / n_perm)
+                : (unique_seqs.empty() ? 0 : (int)unique_seqs[0].size());
 
         // Use n_perm as the authoritative read count (equals n_reads for valid archives)
         size_t n = (n_reads > 0) ? n_reads : n_perm;
@@ -697,13 +704,16 @@ void ARCSDecoder::decode_amplicon(const ARCSReader& rdr, FASTQWriter& out_writer
 
                 output[oi].seq = unique_seqs[ci];
 
-                // Quality slice: flat_qual[p * L .. (p+1)*L - 1]
+                // Quality slice: stride is L (= max_L for mixed-length inputs).
+                // Trim to the actual sequence length so shorter reads in a
+                // mixed-length file recover their original quality strings exactly.
+                int actual_L = (int)unique_seqs[ci].size();
                 size_t q_off = p * (size_t)L;
-                if (L > 0 && q_off + L <= q_raw.size()) {
+                if (actual_L > 0 && q_off + actual_L <= q_raw.size()) {
                     output[oi].qual.assign(
-                        (const char*)q_raw.data() + q_off, L);
+                        (const char*)q_raw.data() + q_off, actual_L);
                 } else {
-                    output[oi].qual.assign(L, '!');
+                    output[oi].qual.assign(actual_L > 0 ? actual_L : L, '!');
                 }
             }
         }
