@@ -171,7 +171,7 @@ done
 
 # ── STEP 3: Compress all datasets into ARCS archives ─────────────────────────
 step "3/8 Build ARCS archives (compress all datasets)"
-export ARCS_PAR_SHARDS=$(( NPROC > 8 ? 8 : NPROC ))
+# ARCS_PAR_SHARDS not set — C++ default min(4, hw_concurrency) gives best ratio/speed balance
 _DSI=0
 for DS in $DS_ORDER; do
     _DSI=$((_DSI+1))

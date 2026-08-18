@@ -96,7 +96,7 @@ for SRC in "${FQ_FILES[@]}"; do
     A="$WD/$DS.arcs"
     DEC="$WD/$DS.arcs.dec"
     TF=/tmp/time_arcs_c_$$
-    export ARCS_PAR_SHARDS=$(( NPROC > 8 ? 8 : NPROC ))
+    # ARCS_PAR_SHARDS not set — C++ default min(4, hw_concurrency) gives best ratio/speed balance
     /usr/bin/time -v "$ARCS_BIN" compress "$IN" "$A" 2>"$TF"
     read -r CWALL CRAMKB <<< "$(parse_time_v "$TF")"
     ARCH=$(stat -c %s "$A")

@@ -390,7 +390,7 @@ with open('$SUB_FQ','w') as f:
     RAW=$(stat -c %s "$SUB_FQ")
     ARC="$WD/hg002_${DEPTH}x.arcs"
     TF="$WD/t4_${DEPTH}x_time.txt"
-    export ARCS_PAR_SHARDS=$(( NPROC > 8 ? 8 : NPROC ))
+    # ARCS_PAR_SHARDS not set — C++ default min(4, hw_concurrency) gives best ratio/speed balance
     /usr/bin/time -v "$ARCS_BIN" compress "$SUB_FQ" "$ARC" 2>"$TF"
     ARCH=$(stat -c %s "$ARC")
     read -r T_WALL T_RAM <<< "$(parse_time_v "$TF")"
