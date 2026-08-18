@@ -38,7 +38,7 @@ Meanwhile, reference-free variant callers rebuild the **exact same assembly from
 1. Load all reads into memory
 2. Count k-mers (k=16 seeds) across all reads — `FlatPlaceIndex` open-addressed hash table (~35 bytes/distinct k-mer)
 3. Build contig chains: greedy k-NN walk through high-frequency k-mers (`build_multicontig_pg`)
-4. Parallel shard assembly: reads split round-robin into N shards, each assembled in its own thread, merged with globally remapped indices — 4× compress speedup, zero ratio cost (`parallel_shard_assemble`)
+4. Parallel shard assembly: reads split round-robin into N shards (default: min(4, hw_concurrency)), each assembled in its own thread, merged with globally remapped indices — up to 4× assembly speedup, ±0.3% ratio cost (`parallel_shard_assemble`)
 5. Place each read against the assembled contigs — `FlatPlaceIndex` maps reads to positions
 
 **Phase 2 — Parallel Encoding (3 streams):**
@@ -95,7 +95,7 @@ Both share `build(pseudogenome)`. ARCS does it once. Everyone else does it twice
 |---|---|---|
 | `AUTO_MB` | 2000 MB | Auto-chunk threshold — files >2000 MB chunk into 1M-read pieces. All 10 benchmark datasets are ≤2 GB → single-pass assembly guaranteed |
 | `DEDUP_K` | 16 | Seed k-mer length for assembly |
-| `ARCS_PAR_SHARDS` | min(4,cores) default | Parallel assembly shards. Set to `$(nproc)` in scripts for server |
+| `ARCS_PAR_SHARDS` | min(4,cores) default | Parallel assembly shards. **Not set in benchmark scripts** — C++ default min(4,hw) gives best ratio+speed balance. Override only if you want to trade ratio for speed. |
 | `ARCS_CHUNK_THREADS` | = nproc default | Outer parallel chunk threads (only relevant for >2000 MB files) |
 | `ARCS_PG_BLOCKS` | 1 (default=1) | FCM codec block count. 1 = best ratio (long-range context). >1 = faster decode but worse ratio |
 | `ARCS_ORDER_FREE` | off | Multiset mode: smaller archive but loses read order. Default OFF = order-preserving |
@@ -108,7 +108,7 @@ int N_shards = std::min(4, hw > 0 ? hw : 1);  // fallback to 1 if hw=0
 if (const char* sv = getenv("ARCS_PAR_SHARDS")) N_shards = std::max(1, atoi(sv));
 if (call_capture_ || n < 8000) N_shards = 1;  // serial for small datasets
 ```
-The code is safe on any core count including 1. `ARCS_PAR_SHARDS=1` forces serial. `ARCS_PAR_SHARDS=16` on a 16-core server gives 4× assembly speedup at zero ratio cost.
+The code is safe on any core count including 1. `ARCS_PAR_SHARDS=1` forces serial. **Do not override in benchmark scripts** — the default min(4,hw) is the validated sweet spot. Above 4 shards: each shard gets lower coverage → fragmented assembly → ratio regression. FCM sequence coder is single-threaded and dominates compress time regardless of shard count. Quality and names codecs scale independently with hw_concurrency beyond 4 cores.
 
 ### RAM formula (critical for server sizing)
 ```
