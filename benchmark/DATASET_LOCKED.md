@@ -29,20 +29,23 @@ All are complete, unsubsampled SRA runs as deposited by sequencing labs.
 
 ---
 
-## The 5 Human Subset Datasets (Claim 1 supplementary + Claim 2)
+## Claim 2 Datasets — HG002-HG005 chr20 at 30× (NOT part of Claim 1)
 
-Full human WGS (~150 GB) cannot be single-pass assembled on current hardware; these chr20 subsets demonstrate ARCS on human data. Limitation stated in paper.
+GIAB chr20 reads are used exclusively for Claim 2 variant calling (T3/T4/T5).
+They are NOT included in Claim 1 compression — at ~0.7× chr20 coverage, assembly
+is impossible and SPRING would win trivially. Dropping them keeps Claim 1 honest.
 
-| # | File | Individual | Ancestry | Size | Source |
-|---|------|-----------|---------|------|--------|
-| S1 | HG001_pooled.fq | NA12878 (HG001) | European CEU | ~37 MB | GIAB S3 |
-| S2 | HG002_pooled.fq | NA24385 (HG002) | Ashkenazi Jewish son | ~37 MB | GIAB S3 |
-| S3 | HG003_pooled.fq | NA24149 (HG003) | Ashkenazi Jewish father | ~37 MB | GIAB S3 |
-| S4 | HG004_pooled.fq | NA24143 (HG004) | Ashkenazi Jewish mother | ~37 MB | GIAB S3 |
-| S5 | HG005_pooled.fq | NA24631 (HG005) | Han Chinese son | ~37 MB | GIAB S3 |
+Coverage varies across GIAB S3 BAMs (HG002/HG005 ~300×, HG003/HG004 ~60×).
+All four are downsampled to 30× chr20 so T3 F1 comparison is apples-to-apples.
 
-**All 5 are under 2 GB. Auto-chunk does NOT fire. ARCS runs single-pass assembly on all 5.**  
-**Ancestry diversity:** European, Ashkenazi Jewish (trio), Han Chinese — demonstrates reference-free advantage on non-European genomes.
+| # | File | Individual | Ancestry | Source coverage | Standardized |
+|---|------|-----------|---------|----------------|-------------|
+| C2-1 | HG002_pooled.fq | NA24385 (HG002) | Ashkenazi son | ~300× | 30× chr20 |
+| C2-2 | HG003_pooled.fq | NA24149 (HG003) | Ashkenazi father | ~60× | 30× chr20 |
+| C2-3 | HG004_pooled.fq | NA24143 (HG004) | Ashkenazi mother | ~60× | 30× chr20 |
+| C2-4 | HG005_pooled.fq | NA24631 (HG005) | Han Chinese son | ~300× | 30× chr20 |
+
+**Method:** stream chr20 reads from GIAB S3 WGS BAMs via samtools, downsample to 30× with seqtk sample --seed 42. Reproducible and exact.
 
 ---
 
@@ -60,7 +63,7 @@ Full human WGS (~150 GB) cannot be single-pass assembled on current hardware; th
 | 8 | SRR870667 | ~74M SE | 69 bp | 430 Mb | ~12× |
 | 9 | SRR36741279 | 9.49M | ~75 bp | 32 Mb | ~22× |
 | 10 | SRR37283774 | 2.91M | ~100 bp | 23 Mb | ~12.6× |
-| S1-S5 | GIAB HG001-HG005 | ~240K each | 150 bp | chr20 50 Mb | ~0.7× (subset) |
+| C2-1..4 | GIAB HG002-HG005 | ~12.6M each | 150 bp | chr20 63 Mb | 30× (Claim 2 only) |
 
 ## Download Command
 

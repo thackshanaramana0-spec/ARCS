@@ -142,52 +142,124 @@ for ACC in "${SRA_IDS[@]}"; do
     fi
 done
 
-# ── Phase 3: GIAB HG001-HG005 chr20 from S3 ─────────────────────────────────
-phase "3" "Download GIAB HG001-HG005 chr20 reads from S3 (5 human subset datasets)"
-pinfo "Using s3://giab — public bucket, no credentials needed"
-pinfo "These 5 chr20 subsets are used for BOTH Claim 1 compression AND Claim 2 variant calling"
+# ── Phase 3: GIAB HG002-HG005 chr20 from S3 BAMs (Claim 2 only) ─────────────
+# These files are NOT used in Claim 1 compression — Claim 1 uses only the 10
+# full SRA datasets above. These chr20 reads are used exclusively for Claim 2
+# (T3 het-SNV F1, T4 coverage sweep, T5 indel).
+#
+# Coverage varies across GIAB individuals in S3 (HG002/HG005 ~300x,
+# HG003/HG004 ~60x). All four are downsampled to a uniform 30x chr20 depth
+# so T3 F1 comparisons across individuals are apples-to-apples.
+#
+# Method:
+#   1. Auto-discover the largest WGS BAM for each individual in s3://giab
+#   2. Stream just chr20 reads via samtools (requires htslib S3 support + samtools ≥1.15)
+#   3. Downsample to exactly TARGET_COV × chr20 reads (seqtk sample or python fallback)
+#
+# If samtools cannot reach S3, list the bucket and set the BAM path manually:
+#   aws s3 ls --no-sign-request s3://giab/data/AshkenazimTrio/HG002_NA24385_son/ --recursive | grep '\.bam$' | grep -v '\.bai'
 
-# HG001-HG005 chr20 subsets from GIAB S3
-# If any path 404s, list bucket to find correct path:
-#   aws s3 ls --no-sign-request s3://giab/data/AshkenazimTrio/HG002_NA24385_son/ --recursive | grep chr20
+phase "3" "Prepare GIAB HG002-HG005 chr20 reads at uniform 30x (Claim 2 only)"
+pinfo "Streaming chr20 from GIAB S3 BAMs — no full WGS download needed"
 
-declare -A GIAB_S3
-GIAB_S3[HG001]="s3://giab/data/NA12878_HG001/NIST_HiSeq_HG001_Homogeneity-10953946/HG001_HiSeq300x_subsetN_chr20.fastq.gz"
-GIAB_S3[HG002]="s3://giab/data/AshkenazimTrio/HG002_NA24385_son/NIST_HiSeq_HG002_Homogeneity-10953946/HG002_HiSeq300x_subsetN_chr20.fastq.gz"
-GIAB_S3[HG003]="s3://giab/data/AshkenazimTrio/HG003_NA24149_father/NIST_HiSeq_HG003_Homogeneity-10953946/HG003_HiSeq300x_subsetN_chr20.fastq.gz"
-GIAB_S3[HG004]="s3://giab/data/AshkenazimTrio/HG004_NA24143_mother/NIST_HiSeq_HG004_Homogeneity-10953946/HG004_HiSeq300x_subsetN_chr20.fastq.gz"
-GIAB_S3[HG005]="s3://giab/data/ChineseTrio/HG005_NA24631_son/NIST_HiSeq_HG005_Homogeneity-10953946/HG005_HiSeq300x_subsetN_chr20.fastq.gz"
+CHR20_LEN=63025520   # GRCh37 chr20 length in bp
+TARGET_COV=30        # uniform depth for fair T3 comparison
+READ_LEN=150         # assumed read length for depth calculation
+N_NEEDED=$(( TARGET_COV * CHR20_LEN / READ_LEN ))   # ~12.6M reads
+pinfo "Target: ${TARGET_COV}x chr20 = ${N_NEEDED} reads (at ${READ_LEN} bp)"
 
-for IND in HG001 HG002 HG003 HG004 HG005; do
-    phase "3.${IND}" "Download $IND chr20 FASTQ"
+# S3 base paths per individual
+declare -A GIAB_BASE
+GIAB_BASE[HG002]="s3://giab/data/AshkenazimTrio/HG002_NA24385_son"
+GIAB_BASE[HG003]="s3://giab/data/AshkenazimTrio/HG003_NA24149_father"
+GIAB_BASE[HG004]="s3://giab/data/AshkenazimTrio/HG004_NA24143_mother"
+GIAB_BASE[HG005]="s3://giab/data/ChineseTrio/HG005_NA24631_son"
+
+for IND in HG002 HG003 HG004 HG005; do
+    phase "3.${IND}" "$IND chr20 → 30x"
     OUT="$DATA_DIR/${IND}_pooled.fq"
     if [ -s "$OUT" ]; then
-        pskip "$IND already downloaded: $OUT"
+        N_EXIST=$(( $(wc -l < "$OUT") / 4 ))
+        pskip "$IND already present — $N_EXIST reads: $OUT"
         continue
     fi
-    S3PATH="${GIAB_S3[$IND]}"
-    pinfo "S3: $S3PATH"
-    # Try direct gz download; fall back to listing if path wrong
-    TMPGZ="$DATA_DIR/${IND}_chr20.fastq.gz"
-    if aws s3 cp --no-sign-request "$S3PATH" "$TMPGZ" 2>/dev/null; then
-        pinfo "decompressing $TMPGZ"
-        if command -v pigz &>/dev/null; then
-            pigz -d -c "$TMPGZ" > "$OUT"
-        else
-            gzip -d -c "$TMPGZ" > "$OUT"
-        fi
-        rm -f "$TMPGZ"
-        verify_fq "$OUT" "$IND"
-        pdone "$IND chr20 ready: $OUT"
-    else
-        pinfo "Direct path failed — listing S3 to find correct path"
-        pinfo "Run: aws s3 ls --no-sign-request s3://giab/data/ --recursive | grep -i 'chr20.*fastq'"
-        pfail "$IND: S3 download failed — check path in download.sh GIAB_S3 table"
+
+    BASE="${GIAB_BASE[$IND]}"
+    pinfo "Discovering BAM in $BASE"
+
+    # Find the largest WGS BAM (highest coverage) in the bucket
+    BAM_KEY=$(aws s3 ls --no-sign-request "$BASE/" --recursive 2>/dev/null \
+        | grep '\.bam$' | grep -v '\.bai' | grep -iv 'indel\|sv\|snv\|phased\|trio' \
+        | sort -k3 -n -r | head -1 | awk '{print $4}')
+
+    if [ -z "$BAM_KEY" ]; then
+        pfail "$IND: no WGS BAM found under $BASE — list with: aws s3 ls --no-sign-request $BASE/ --recursive | grep bam"
     fi
+
+    S3_BAM="s3://giab/${BAM_KEY}"
+    S3_BAI="${S3_BAM}.bai"
+    pinfo "Using BAM: $S3_BAM"
+
+    # Check index exists
+    if ! aws s3 ls --no-sign-request "$S3_BAI" &>/dev/null; then
+        S3_BAI="${S3_BAM%.bam}.bai"
+        if ! aws s3 ls --no-sign-request "$S3_BAI" &>/dev/null; then
+            pfail "$IND: no .bai index found alongside $S3_BAM — cannot do random-access chr20 stream"
+        fi
+    fi
+
+    # Stream chr20 reads and convert to FASTQ (samtools must have htslib S3 support)
+    TMPFQ="$DATA_DIR/${IND}_chr20_full.fq"
+    pinfo "Streaming chr20 reads from S3 (this takes a few minutes)..."
+    export HTS_S3_ADDRESS_STYLE=path
+    samtools view -b --no-sign-request "$S3_BAM" chr20 2>/dev/null \
+        | samtools sort -n -@ "$JOBS" \
+        | samtools fastq -0 "$TMPFQ" - 2>/dev/null \
+        || pfail "$IND: samtools S3 stream failed — check htslib S3 support: samtools view --version"
+
+    N_FULL=$(( $(wc -l < "$TMPFQ") / 4 ))
+    pinfo "$IND chr20 full: $N_FULL reads"
+    if [ "$N_FULL" -eq 0 ]; then
+        pfail "$IND: chr20 stream produced 0 reads"
+    fi
+
+    # Downsample to TARGET_COV
+    if [ "$N_FULL" -le "$N_NEEDED" ]; then
+        pinfo "$IND: source has only ${N_FULL} reads (< ${N_NEEDED} needed for ${TARGET_COV}x) — using all"
+        mv "$TMPFQ" "$OUT"
+    else
+        FRAC=$(awk "BEGIN{printf \"%.6f\", $N_NEEDED / $N_FULL}")
+        pinfo "$IND: downsampling $N_FULL → $N_NEEDED reads (frac=$FRAC)"
+        if command -v seqtk &>/dev/null; then
+            seqtk sample -s 42 "$TMPFQ" "$FRAC" > "$OUT"
+        else
+            python3 -c "
+import sys, random
+random.seed(42)
+frac = $FRAC
+with open('$TMPFQ') as f, open('$OUT','w') as o:
+    while True:
+        h=f.readline()
+        if not h: break
+        s=f.readline(); p=f.readline(); q=f.readline()
+        if random.random() < frac:
+            o.write(h+s+p+q)
+"
+        fi
+        rm -f "$TMPFQ"
+    fi
+
+    N_OUT=$(( $(wc -l < "$OUT") / 4 ))
+    COV_ACTUAL=$(awk "BEGIN{printf \"%.1f\", $N_OUT * $READ_LEN / $CHR20_LEN}")
+    pinfo "$IND: $N_OUT reads → ${COV_ACTUAL}x chr20 coverage"
+    verify_fq "$OUT" "$IND"
+    pdone "$IND chr20 ready: $OUT (${COV_ACTUAL}x)"
 done
 
 # ── Phase 4: Verify all expected files ───────────────────────────────────────
 phase "4" "Final verification of all dataset files"
+# Claim 1 primary: 10 full SRA datasets
+# Claim 2 only:    HG002-HG005_pooled.fq (not part of Claim 1 compression benchmark)
 EXPECTED=(
     "$DATA_DIR/SRR2584863_1.fq"
     "$DATA_DIR/ERR552797_1.fq"
@@ -199,7 +271,9 @@ EXPECTED=(
     "$DATA_DIR/SRR870667_1.fq"
     "$DATA_DIR/SRR36741279_1.fq"
     "$DATA_DIR/SRR37283774_1.fq"
-    "$DATA_DIR/HG001_pooled.fq"
+)
+# Also verify Claim 2 files if they exist (not a hard failure — Claim 2 can be run later)
+CLAIM2_FILES=(
     "$DATA_DIR/HG002_pooled.fq"
     "$DATA_DIR/HG003_pooled.fq"
     "$DATA_DIR/HG004_pooled.fq"
@@ -216,10 +290,23 @@ for F in "${EXPECTED[@]}"; do
 done
 
 if [ "$MISSING" -gt 0 ]; then
-    pfail "$MISSING file(s) missing — fix above errors before running benchmark"
+    pfail "$MISSING Claim 1 file(s) missing — fix above errors before running benchmark"
 fi
 
-pdone "All $(( ${#EXPECTED[@]} - MISSING )) files verified"
+pdone "All ${#EXPECTED[@]} Claim 1 files verified"
+
+# Soft-check Claim 2 files (warn but don't fail)
+C2_MISSING=0
+for F in "${CLAIM2_FILES[@]}"; do
+    if [ -s "$F" ]; then
+        N=$(( $(wc -l < "$F") / 4 ))
+        pinfo "Claim 2: $(basename "$F") — $N reads"
+    else
+        pinfo "Claim 2: $(basename "$F") — not yet downloaded"
+        C2_MISSING=$(( C2_MISSING + 1 ))
+    fi
+done
+[ "$C2_MISSING" -gt 0 ] && pinfo "WARNING: $C2_MISSING Claim 2 file(s) missing — Claim 1 can still run now"
 
 # ── Phase 5: Claim 2 prerequisites — chr20.fa + GIAB truth VCFs ──────────────
 phase "5" "Download Claim 2 prerequisites (chr20 reference + GIAB truth VCFs)"
@@ -285,9 +372,10 @@ pdone "All Claim 2 prerequisites ready"
 echo ""
 echo "========================================"
 echo "  DOWNLOAD COMPLETE"
-echo "  DATA_DIR  : $DATA_DIR"
-echo "  REFS_DIR  : $REFS_DIR  (chr20.fa)"
-echo "  TRUTH_DIR : $TRUTH_DIR (GIAB HG002-HG005 VCFs)"
-echo "  Run benchmark with:"
+echo "  DATA_DIR  : $DATA_DIR  (10 SRA datasets for Claim 1)"
+echo "  REFS_DIR  : $REFS_DIR  (chr20.fa for Claim 2)"
+echo "  TRUTH_DIR : $TRUTH_DIR (GIAB truth VCFs for Claim 2)"
+echo "  Claim 2 FASTQ: $(( 4 - C2_MISSING ))/4 HGX_pooled.fq present (30x chr20 each)"
+echo "  Run Claim 1 now:"
 echo "    bash benchmark/benchmark.sh claim1 $DATA_DIR <ARCS_BIN> ./results"
 echo "========================================"

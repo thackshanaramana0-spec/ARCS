@@ -47,15 +47,16 @@ Source of truth: `benchmark/DATASET_LOCKED.md`. Reproduced here for fast referen
 
 **† `ARCS_AUTOCHUNK_MB=25000` is set in run_block1.sh — an env var, not a command-line flag. Ensures single-pass assembly on the 90 GB server.**
 
-**5 human chr20 subset datasets (supplementary — Claim 1 + Claim 2):**
+**Claim 2 only — HG002-HG005 chr20 at standardized 30× (NOT in Claim 1):**
 
-| # | File | Individual | Size |
-|---|------|-----------|------|
-| S1 | HG001_pooled.fq | NA12878 (European) | ~37 MB |
-| S2 | HG002_pooled.fq | NA24385 (Ashkenazi son) | ~37 MB |
-| S3 | HG003_pooled.fq | NA24149 (Ashkenazi father) | ~37 MB |
-| S4 | HG004_pooled.fq | NA24143 (Ashkenazi mother) | ~37 MB |
-| S5 | HG005_pooled.fq | NA24631 (Han Chinese son) | ~37 MB |
+| # | File | Individual | Standardized depth |
+|---|------|-----------|-------------------|
+| C2-1 | HG002_pooled.fq | NA24385 Ashkenazi son | 30× chr20 |
+| C2-2 | HG003_pooled.fq | NA24149 Ashkenazi father | 30× chr20 |
+| C2-3 | HG004_pooled.fq | NA24143 Ashkenazi mother | 30× chr20 |
+| C2-4 | HG005_pooled.fq | NA24631 Han Chinese son | 30× chr20 |
+
+Sourced from GIAB S3 WGS BAMs (chr20 stream via samtools), downsampled to 30× for fair T3 comparison. GIAB S3 source coverage varies per individual (60-300×); standardization removes this confound.
 
 **Slots 6 and 8 exceed 2 GB; auto-chunk is suppressed via `ARCS_AUTOCHUNK_MB=25000` in run_block1.sh.**
 
