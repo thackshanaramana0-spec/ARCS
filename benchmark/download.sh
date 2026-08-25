@@ -214,7 +214,7 @@ for IND in HG002 HG003 HG004 HG005; do
     export HTS_S3_ADDRESS_STYLE=path
     samtools view -b --no-sign-request "$S3_BAM" chr20 2>/dev/null \
         | samtools sort -n -@ "$JOBS" \
-        | samtools fastq -0 "$TMPFQ" - 2>/dev/null \
+        | samtools fastq -o "$TMPFQ" - 2>/dev/null \
         || pfail "$IND: samtools S3 stream failed — check htslib S3 support: samtools view --version"
 
     N_FULL=$(( $(wc -l < "$TMPFQ") / 4 ))
