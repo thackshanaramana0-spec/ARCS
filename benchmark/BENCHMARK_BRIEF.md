@@ -93,7 +93,7 @@ Both share `build(pseudogenome)`. ARCS does it once. Everyone else does it twice
 ### Critical constants and env vars
 | Constant/Env | Value | Effect |
 |---|---|---|
-| `AUTO_MB` | 2000 MB | Auto-chunk threshold — files >2000 MB chunk into 1M-read pieces. All 10 benchmark datasets are ≤2 GB → single-pass assembly guaranteed |
+| `AUTO_MB` | 2000 MB | Auto-chunk threshold — files >2000 MB chunk into 1M-read pieces. Datasets #6,7,9,10 exceed 2 GB → auto-chunk fires. Datasets #1–5,8 are ≤2 GB → single-pass assembly |
 | `DEDUP_K` | 16 | Seed k-mer length for assembly |
 | `ARCS_PAR_SHARDS` | min(4,cores) default | Parallel assembly shards. **Not set in benchmark scripts** — C++ default min(4,hw) gives best ratio+speed balance. Override only if you want to trade ratio for speed. |
 | `ARCS_CHUNK_THREADS` | = nproc default | Outer parallel chunk threads (only relevant for >2000 MB files) |
@@ -178,55 +178,50 @@ Expected:
 
 ## 5. Dataset Details (All 10 Datasets)
 
-All benchmark datasets are single-end reads, ≤2 GB, no auto-chunk triggered.
+All benchmark datasets are full SRA accession files, single-end reads (_1 file for PE experiments). Datasets #1–5 and #8 are ≤2 GB (no auto-chunk). Datasets #6, 7, 9, 10 exceed 2 GB; ARCS default auto-chunk handles them transparently. All tools run at defaults — no special flags. **See DATASET_LOCKED.md — do not change accessions.**
 
-| # | Accession | Organism | Read len | True size | Peak RAM | Notes |
-|---|-----------|----------|----------|-----------|----------|-------|
-| 1 | SRR390728_1 | H. sapiens (chr1 subset) | 101 bp | ~1.8 GB | ~6 GB | large human |
-| 2 | SRR1296601_1 | M. tuberculosis H37Rv | 100 bp | ~350 MB | ~1.5 GB | bacterial |
-| 3 | ERR015526_1 | E. coli K-12 MG1655 | 36 bp | ~450 MB | ~2 GB | very short reads |
-| 4 | SRR554369_1 | P. aeruginosa PAO1 | 100 bp | ~334 MB | ~1.5 GB | was mislabeled H.sapiens in old list |
-| 5 | SRR1294122_1 | H. sapiens WGS (subset) | 101 bp | ~1.5 GB | ~5 GB | |
-| 6 | SRR988075_1 | D. melanogaster | 101 bp | ~800 MB | ~3 GB | was mislabeled D.rerio |
-| 7 | ERR174310_1 | C. elegans (≤2 GB subset) | 100 bp | ~2 GB | ~7 GB | original file ~21 GB — take first 2 GB |
-| 8 | SRR870667_1 | T. cacao Matina1-6 | 100 bp | ~1.5 GB | ~5 GB | crop plant |
-| 9 | SRR870667_2 | T. cacao (PE mate, use as SE) | 100 bp | ~1.5 GB | ~5 GB | paired-end mate |
-| 10 | HG002_chr20_pooled | H. sapiens GIAB HG002 | 150 bp | ~37 MB | ~450 MB | GIAB gold standard |
+| # | Accession | Organism | Kingdom | Read len | _1 file size (uncompressed) | Auto-chunk? |
+|---|-----------|----------|---------|---------|----------------------------|------------|
+| 1 | SRR2584863_1 | E. coli B REL606 | Bacteria | ~108 bp | ~576 MB | No |
+| 2 | ERR552797_1 | M. tuberculosis H37Rv | Bacteria | ~301 bp | ~217 MB | No |
+| 3 | SRR554369_1 | P. aeruginosa PAO1 | Bacteria | 100 bp | ~334 MB | No |
+| 4 | ERR5181310_1 | SARS-CoV-2 | Virus | ~150 bp | ~30 MB | No |
+| 5 | HG002_chr20.fq | H. sapiens GIAB HG002 | Animalia | 150 bp | ~37 MB | No |
+| 6 | SRR065390_1 | C. elegans N2 | Animalia | 101 bp | ~7.8 GB | Yes |
+| 7 | SRR327342_1 | S. cerevisiae I14 | Fungi | ~100 bp | ~3.4 GB | Yes |
+| 8 | SRR1945765_1 | Arabidopsis thaliana | Plantae | 102 bp | ~1.95 GB | No |
+| 9 | SRR1663585_1 | D. melanogaster WGS | Animalia | 101 bp | ~2.33 GB | Yes |
+| 10 | SRR870667_1 | T. cacao Matina1-6 | Plantae | 109 bp | ~17 GB | Yes |
 
-**CRITICAL dataset corrections (mislabeled in old list — DO NOT use old labels):**
-- `SRR554369_1` = P. aeruginosa (NOT H. sapiens)
-- `SRR065390_1` was E. coli 8.5 GB (NOT C. elegans 1 GB) — replaced by ERR015526
-- `SRR1294122_1` = H. sapiens (NOT D. melanogaster)
-- `SRR988075_1` = D. melanogaster (NOT D. rerio)
-- `ERR174310_1` = ~21 GB full file — take ≤2 GB subset only
+**Organism diversity:** 3 bacteria · 1 virus · 3 animals · 1 fungus · 2 plants — 5 kingdoms of life.  
+**All accession labels verified via NCBI SRA** (2026-08-22/23). Old labels (SRR390728, SRR988075, ERR174310, etc.) were RNA-Seq, mis-annotated, or too large — do not use.
 
-**Server RAM budget:** Peak across all datasets ≤8 GB. A 32 GB server handles any single dataset easily. Never run two benchmark jobs simultaneously (contaminates timing).
+**Server RAM budget:** Peak ARCS RAM ≤8 GB for no-chunk datasets, up to ~20 GB for T. cacao with auto-chunk. 96 GB server is trivially sufficient. Never run two timed jobs concurrently (contaminates measurements).
 
 ---
 
 ## 6. Projected Results and Numbers
 
-### T1 — Archive size (projected from prior runs on laptop, will be cleaner on server)
+### T1 — Archive size (projected — to be replaced with server measurements)
 
-| Dataset | ARCS (KB) | SPRING (KB) | Genozip (KB) | ARCS wins? |
-|---------|-----------|-------------|--------------|------------|
-| ECOLI_35x | 6,107 | 6,350 | 7,847 | ✅ vs both |
-| HUMAN_127bp | 4,706 | 4,800 | 4,962 | ✅ vs both |
-| MTB_51bp | 2,990 | 3,060 | 3,154 | ✅ vs both |
-| SARS2_AMP | 1,233 | 1,340 | 1,312 | ✅ vs both |
-| GIAB_HG002 | 4,210 | 5,340 | 4,929 | ✅ vs both |
-| GIAB_HG001 | 16,850 | 19,410 | **16,763** | ✅ SPRING, ❌ Genozip (-0.5%) |
-| ECOLI_30x | 35,289 | 35,610 | 62,442 | ✅ vs both |
-| HUMAN_30x | 46,774 | 66,070 | 57,589 | ✅ vs both |
+All 10 datasets from DATASET_LOCKED.md. Sizes are estimated from organism type and prior ARCS runs; server measurements replace these.
 
-New datasets (8-10) — projected by organism type:
-- P. aeruginosa (bacterial, 100bp) → ARCS wins ~5-10% vs SPRING
-- D. melanogaster (eukaryote, 101bp) → ARCS wins ~5-15% vs SPRING
-- T. cacao (plant, 100bp) → ARCS wins ~5-10% vs SPRING
+| # | Dataset | Raw _1 | Est. ARCS | Est. SPRING | Est. Genozip | ARCS wins? |
+|---|---------|--------|-----------|-------------|--------------|-----------|
+| 1 | SRR2584863 (E. coli) | 576 MB | ~50 MB | ~53 MB | ~63 MB | ✅ vs both |
+| 2 | ERR552797 (M. tuberculosis) | 217 MB | ~14 MB | ~15 MB | ~17 MB | ✅ vs both |
+| 3 | SRR554369 (P. aeruginosa) | 334 MB | ~4 MB | ~4.4 MB | ~5 MB | ✅ vs both |
+| 4 | ERR5181310 (SARS-CoV-2) | 30 MB | ~2 MB | ~2.2 MB | ~2.5 MB | ✅ vs both |
+| 5 | GIAB HG002 chr20 | 37 MB | ~3.5 MB | ~4.5 MB | ~4.1 MB | ✅ vs both |
+| 6 | SRR065390 (C. elegans) | 7.8 GB | ~800 MB | ~870 MB | ~950 MB | ✅ vs both |
+| 7 | SRR327342 (S. cerevisiae) | 3.4 GB | ~280 MB | ~305 MB | ~350 MB | ✅ vs both |
+| 8 | SRR1945765 (Arabidopsis) | 1.95 GB | ~200 MB | ~220 MB | ~250 MB | ✅ vs both |
+| 9 | SRR1663585 (D. melanogaster) | 2.33 GB | ~220 MB | ~245 MB | ~280 MB | ✅ vs both |
+| 10 | SRR870667 (T. cacao) | 17 GB | ~1,060 MB | ~1,180 MB | ~1,400 MB | ✅ vs both |
 
-**Reviewer check:** If ARCS loses to SPRING on any new dataset, check if auto-chunk triggered (file >2 GB). If it did, use `ARCS_NO_AUTOCHUNK=1` or truncate to 2 GB.
+**Gold cross-validation:** SPRING for SRR554369 = 0.2416 bpb, SRR870667 = 1.2621 bpb (PgRC2 2025). Server measurements must match ±2%.
 
-### T2 — Speed projected (16-core Vultr server, native ext4)
+### T2 — Speed projected (12-core SDC3 Chennai, native ext4)
 
 Compress is 3-4× faster on server vs laptop (assembly is I/O-bound on WSL /mnt/c):
 - GIAB_HG002: ~4s compress (was 13s on laptop)
@@ -260,7 +255,7 @@ Decompress: ARCS typically 1-10s. Genozip fastest. SPRING slowest decode.
 
 ---
 
-## 7. Timing Estimates (16-core Vultr server)
+## 7. Timing Estimates (12-core SDC3 Chennai, 96 GB RAM)
 
 | Step | Time estimate |
 |------|--------------|
@@ -481,7 +476,7 @@ export DISCO_DIR=~/DiscoSnp
 export CONDA_ENV=kmer2snp_r
 
 # Check a specific result
-cat results/claim1/SRR390728__ARCS.log   # format: TOOL=ARCS DS=... archive=... ctime=... lossless=...
+cat results/claim1/SRR2584863__ARCS.log   # format: TOOL=ARCS DS=... archive=... ctime=... lossless=...
 cat results/claim3/t6_results.csv         # CSV: Dataset,Operation,ARCS_time_s,...,Speedup
 
 # Manual ARCS commands (always use the correct binary)

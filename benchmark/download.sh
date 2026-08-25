@@ -49,28 +49,32 @@ verify_fq() {
 }
 
 # ── Dataset table ─────────────────────────────────────────────────────────────
-# Name               Accession       Organism                    Approx size
-# SRR390728_1        SRR390728       H. sapiens chr1 subset      ~1.8 GB
-# SRR1296601_1       SRR1296601      M. tuberculosis H37Rv       ~350 MB
-# ERR015526_1        ERR015526       E. coli K-12 MG1655         ~450 MB
-# SRR554369_1        SRR554369       P. aeruginosa PAO1          ~334 MB
-# SRR1294122_1       SRR1294122      H. sapiens WGS (subset)     ~1.5 GB
-# SRR988075_1        SRR988075       D. melanogaster             ~800 MB
-# ERR174310_1        ERR174310       C. elegans (subset 2GB cap) ~2 GB
-# SRR870667_1        SRR870667       T. cacao Matina1-6          ~1.5 GB (use _1 end)
-# SRR870667_2        SRR870667       T. cacao (PE mate)          ~1.5 GB (use _2 end)
-# SRR1294122_1       already above
+# Name               Accession       Organism                    Approx _1 size  Notes
+# SRR2584863_1       SRR2584863      E. coli B REL606 WGS        ~576 MB         no auto-chunk
+# ERR552797_1        ERR552797       M. tuberculosis H37Rv WGS   ~217 MB         no auto-chunk
+# SRR554369_1        SRR554369       P. aeruginosa PAO1 WGS      ~334 MB         no auto-chunk
+# ERR5181310_1       ERR5181310      SARS-CoV-2 amplicon WGS     ~30 MB          no auto-chunk
+# SRR065390_1        SRR065390       C. elegans N2 WGS 101bp     ~7.8 GB         auto-chunk fires
+# SRR327342_1        SRR327342       S. cerevisiae I14 WGS       ~3.4 GB         auto-chunk fires
+# SRR1945765_1       SRR1945765      Arabidopsis thaliana WGS    ~1.95 GB        no auto-chunk
+# SRR1663585_1       SRR1663585      D. melanogaster WGS 101bp   ~2.33 GB        auto-chunk fires
+# SRR870667_1        SRR870667       T. cacao Matina1-6 WGS      ~17 GB          auto-chunk fires
 #
 # GIAB HG002-HG005 chr20 reads — from S3 (no account needed)
+# Compression benchmark uses HG002_chr20.fq; variant calling uses HG002-HG005 individually.
+#
+# All tools run at ARCS defaults (no special flags). Auto-chunk is ARCS default
+# behaviour for files >2 GB; no ARCS_CHUNK_THREADS override needed.
 
 SRA_IDS=(
-    SRR390728
-    SRR1296601
-    ERR015526
+    SRR2584863
+    ERR552797
     SRR554369
-    SRR1294122
-    SRR988075
-    ERR174310
+    ERR5181310
+    SRR065390
+    SRR327342
+    SRR1945765
+    SRR1663585
     SRR870667
 )
 
@@ -116,6 +120,13 @@ for ACC in "${SRA_IDS[@]}"; do
             pinfo "renamed: ${ACC}${suffix}.fastq → ${ACC}${suffix}.fq"
         fi
     done
+
+    # For SE datasets fasterq-dump emits ${ACC}.fastq (no _1 suffix); normalise to _1
+    SE_SRC="$DATA_DIR/${ACC}.fq"
+    if [ ! -s "$OUT1" ] && [ -s "$SE_SRC" ]; then
+        mv "$SE_SRC" "$OUT1"
+        pinfo "SE read: renamed ${ACC}.fq → ${ACC}_1.fq"
+    fi
 
     # Verify _1 exists
     if [ -s "$OUT1" ]; then
@@ -176,13 +187,14 @@ done
 # ── Phase 4: Verify all expected files ───────────────────────────────────────
 phase "4" "Final verification of all dataset files"
 EXPECTED=(
-    "$DATA_DIR/SRR390728_1.fq"
-    "$DATA_DIR/SRR1296601_1.fq"
-    "$DATA_DIR/ERR015526_1.fq"
+    "$DATA_DIR/SRR2584863_1.fq"
+    "$DATA_DIR/ERR552797_1.fq"
     "$DATA_DIR/SRR554369_1.fq"
-    "$DATA_DIR/SRR1294122_1.fq"
-    "$DATA_DIR/SRR988075_1.fq"
-    "$DATA_DIR/ERR174310_1.fq"
+    "$DATA_DIR/ERR5181310_1.fq"
+    "$DATA_DIR/SRR065390_1.fq"
+    "$DATA_DIR/SRR327342_1.fq"
+    "$DATA_DIR/SRR1945765_1.fq"
+    "$DATA_DIR/SRR1663585_1.fq"
     "$DATA_DIR/SRR870667_1.fq"
     "$DATA_DIR/HG002_chr20.fq"
     "$DATA_DIR/HG003_chr20.fq"
