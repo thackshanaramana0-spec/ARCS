@@ -49,6 +49,25 @@ mapfile -t FQ_FILES < <(find "$DATA_DIR" -maxdepth 1 \( -name "*.fq" -o -name "*
 if [ ${#FQ_FILES[@]} -eq 0 ]; then
     pfail "no .fq or .fastq files found in $DATA_DIR"
 fi
+
+# fasterq-dump on PE runs produces ACCESSION.fq (orphan reads) alongside
+# ACCESSION_1.fq / ACCESSION_2.fq. The bare file is not an independent dataset;
+# skip it when a _1 companion exists. Genuine SE datasets have no _1 companion.
+FILTERED=()
+for f in "${FQ_FILES[@]}"; do
+    base=$(basename "$f"); base="${base%.fastq}"; base="${base%.fq}"
+    dir=$(dirname "$f")
+    if [ -f "$dir/${base}_1.fq" ] || [ -f "$dir/${base}_1.fastq" ]; then
+        pinfo "skip PE orphan: $(basename "$f")"
+        continue
+    fi
+    FILTERED+=("$f")
+done
+FQ_FILES=("${FILTERED[@]}")
+
+if [ ${#FQ_FILES[@]} -eq 0 ]; then
+    pfail "no qualifying datasets after filtering orphans"
+fi
 for f in "${FQ_FILES[@]}"; do pinfo "found: $f"; done
 pdone "${#FQ_FILES[@]} dataset(s) found"
 
