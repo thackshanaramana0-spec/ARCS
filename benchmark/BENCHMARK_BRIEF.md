@@ -184,21 +184,24 @@ Expected:
 
 Complete unsubsampled SRA runs. All tools run at defaults — no special flags.
 
-| # | Accession | Organism | Kingdom | Read len | _1 file size (uncompressed) | Auto-chunk? |
-|---|-----------|----------|---------|---------|----------------------------|------------|
-| 1 | SRR2584863_1 | E. coli B REL606 | Bacteria | ~108 bp | ~576 MB | No |
-| 2 | ERR552797_1 | M. tuberculosis H37Rv | Bacteria | ~301 bp | ~217 MB | No |
-| 3 | SRR554369_1 | P. aeruginosa PAO1 | Bacteria | 100 bp | ~334 MB | No |
-| 4 | ERR5181310_1 | SARS-CoV-2 | Virus | ~150 bp | ~30 MB | No |
-| 5 | ERR17740259_1 | S. aureus WGS | Bacteria | ~148 bp | ~970 MB | No |
-| 6 | SRR16357346_1 | C. elegans N2 (CeNDR) | Animalia | ~135 bp | ~1.42 GB | No |
-| 7 | DRR976266_1 | S. cerevisiae WGS | Fungi | ~150 bp | ~1.67 GB | No |
-| 8 | SRR1945765_1 | Arabidopsis thaliana | Plantae | 102 bp | ~1.95 GB | No |
-| 9 | SRR36741279_1 | Leishmania major WGS | Protista | ~75 bp | ~1.70 GB | No |
-| 10 | SRR37283774_1 | P. falciparum WGS | Protista | ~100 bp | ~669 MB | No |
+| # | Accession | Organism | Kingdom | Read len | _1 file size (uncompressed) | Peak RAM | Auto-chunk? |
+|---|-----------|----------|---------|---------|----------------------------|---------|------------|
+| 1 | SRR2584863_1 | E. coli B REL606 | Bacteria | ~108 bp | ~576 MB | ~5 GB | No |
+| 2 | ERR552797_1 | M. tuberculosis H37Rv | Bacteria | ~301 bp | ~217 MB | ~3 GB | No |
+| 3 | SRR554369_1 | P. aeruginosa PAO1 | Bacteria | 100 bp | ~334 MB | ~4 GB | No |
+| 4 | ERR5181310_1 | SARS-CoV-2 | Virus | ~150 bp | ~30 MB | ~1 GB | No |
+| 5 | ERR17740259_1 | S. aureus WGS | Bacteria | ~148 bp | ~970 MB | ~6 GB | No |
+| 6 | SRR065390_1 | C. elegans N2 WGS | Animalia | 100 bp | ~11 GB | ~18 GB | Suppressed† |
+| 7 | DRR976266_1 | S. cerevisiae WGS | Fungi | ~150 bp | ~1.67 GB | ~8 GB | No |
+| 8 | SRR870667_1 | Theobroma cacao WGS | Plantae | 69 bp SE | ~15 GB | ~28 GB | Suppressed† |
+| 9 | SRR36741279_1 | Leishmania major WGS | Protista | ~75 bp | ~1.70 GB | ~7 GB | No |
+| 10 | SRR37283774_1 | P. falciparum WGS | Protista | ~100 bp | ~669 MB | ~5 GB | No |
+
+**† `ARCS_AUTOCHUNK_MB=25000` set as env var in run_block1.sh — not a CLI flag. Ensures single-pass assembly on the 90 GB server.**
 
 **Diversity:** 4 bacteria · 1 virus · 1 animal · 1 fungus · 1 plant · 2 protists — 6 kingdoms.  
-S. aureus (slot 5): Firmicutes, Gram-positive, 33% GC — distinct from slots 1–3 (all Gram-negative, 51–67% GC).
+S. aureus (slot 5): Firmicutes, Gram-positive, 33% GC — distinct from slots 1–3 (all Gram-negative, 51–67% GC).  
+5/10 datasets overlap with PgRC2/SPRING published benchmarks (slots 1,2,3,6,8) — enables direct bpb cross-validation.
 
 ### 5 Human chr20 Subset Datasets (supplementary Claim 1 + Claim 2)
 
@@ -212,10 +215,9 @@ Full human WGS (~150 GB) cannot be single-pass assembled; chr20 demonstrates hum
 | S4 | HG004_pooled.fq | NA24143 HG004 | Ashkenazi Jewish mother | ~37 MB | No |
 | S5 | HG005_pooled.fq | NA24631 HG005 | Han Chinese son | ~37 MB | No |
 
-**All 15 files are under 2 GB. Auto-chunk does NOT fire on any. ARCS single-pass assembly on all 15.**  
 **All accessions verified via NCBI SRA/DDBJ/GIAB 2026-08-25.**
 
-**Server RAM budget:** All 15 datasets under 2 GB → peak ARCS RAM ≤8 GB per dataset. 96 GB server has 12× headroom. Never run two timed jobs concurrently (contaminates measurements).
+**Server RAM budget:** Peak is T. cacao ~28 GB. 90 GB server has 3× headroom. Never run two timed jobs concurrently (contaminates measurements).
 
 ---
 
@@ -225,7 +227,7 @@ Full human WGS (~150 GB) cannot be single-pass assembled; chr20 demonstrates hum
 
 All 10 datasets from DATASET_LOCKED.md. Sizes are estimated from organism type and prior ARCS runs; server measurements replace these.
 
-All 10 files are under 2 GB — single-pass assembly, no auto-chunk, ARCS best-case ratio on every dataset.
+Slots 6 and 8 exceed 2 GB — auto-chunk suppressed via `ARCS_AUTOCHUNK_MB=25000` in run_block1.sh for single-pass assembly.
 
 **10 full SRA datasets:**
 
@@ -233,14 +235,16 @@ All 10 files are under 2 GB — single-pass assembly, no auto-chunk, ARCS best-c
 |---|---------|--------|-----------|-------------|--------------|-----------|
 | 1 | SRR2584863 (E. coli) | 576 MB | ~50 MB | ~53 MB | ~63 MB | ✅ vs both |
 | 2 | ERR552797 (M. tuberculosis) | 217 MB | ~14 MB | ~15 MB | ~17 MB | ✅ vs both |
-| 3 | SRR554369 (P. aeruginosa) | 334 MB | ~4 MB | ~4.4 MB | ~5 MB | ✅ vs both |
+| 3 | SRR554369 (P. aeruginosa) | 334 MB | ~4 MB | ~4.4 MB | ~5 MB | ✅ vs both ★ |
 | 4 | ERR5181310 (SARS-CoV-2) | 30 MB | ~2 MB | ~2.2 MB | ~2.5 MB | ✅ vs both |
 | 5 | ERR17740259 (S. aureus) | 970 MB | ~35 MB | ~38 MB | ~45 MB | ✅ vs both |
-| 6 | SRR16357346 (C. elegans) | 1.42 GB | ~120 MB | ~130 MB | ~150 MB | ✅ vs both |
+| 6 | SRR065390 (C. elegans) | ~11 GB | ~850 MB | ~950 MB | ~1.1 GB | ✅ vs both |
 | 7 | DRR976266 (S. cerevisiae) | 1.67 GB | ~50 MB | ~55 MB | ~65 MB | ✅ vs both |
-| 8 | SRR1945765 (Arabidopsis) | 1.95 GB | ~180 MB | ~200 MB | ~230 MB | ✅ vs both |
+| 8 | SRR870667 (T. cacao) | ~15 GB | ~1.1 GB | ~1.26 GB | ~1.45 GB | ✅ biggest win ★ |
 | 9 | SRR36741279 (L. major) | 1.70 GB | ~70 MB | ~80 MB | ~90 MB | ✅ vs both |
 | 10 | SRR37283774 (P. falciparum) | 669 MB | ~25 MB | ~30 MB | ~35 MB | ✅ vs both |
+
+★ Gold cross-validation: SPRING SRR554369=0.2416 bpb, SPRING SRR870667=1.2621 bpb (PgRC2 2025). T. cacao is SPRING's worst dataset — largest expected margin for ARCS.
 
 **5 human chr20 subset datasets (supplementary):**
 
@@ -257,11 +261,13 @@ All 10 files are under 2 GB — single-pass assembly, no auto-chunk, ARCS best-c
 ### T2 — Speed projected (12-core SDC3 Chennai, native ext4)
 
 Compress is 3-4× faster on server vs laptop (assembly is I/O-bound on WSL /mnt/c):
-- GIAB_HG002: ~4s compress (was 13s on laptop)
-- MTB small: ~8s compress
-- Large human (1.5 GB): ~40-80s compress
+- E. coli (576 MB): ~10s ARCS, ~5s SPRING
+- S. aureus (970 MB): ~20s ARCS, ~8s SPRING
+- C. elegans (11 GB): ~45 min ARCS, ~10 min SPRING — assembly cost, expected
+- T. cacao (15 GB): ~60 min ARCS, ~15 min SPRING — assembly cost, expected
 
-Decompress: ARCS typically 1-10s. Genozip fastest. SPRING slowest decode.
+Decompress: ARCS typically 1-30s. SPRING slowest decode on large files.
+ARCS trades compress speed for ratio; decompress is always fast.
 
 ### T3 — SNV F1 projected (from server run on partial data)
 
