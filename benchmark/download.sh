@@ -220,10 +220,74 @@ if [ "$MISSING" -gt 0 ]; then
 fi
 
 pdone "All $(( ${#EXPECTED[@]} - MISSING )) files verified"
+
+# ── Phase 5: Claim 2 prerequisites — chr20.fa + GIAB truth VCFs ──────────────
+phase "5" "Download Claim 2 prerequisites (chr20 reference + GIAB truth VCFs)"
+REFS_DIR="${HOME}/refs"
+TRUTH_DIR="${HOME}/giab_truth"
+mkdir -p "$REFS_DIR" "$TRUTH_DIR"
+
+# chr20 reference — GRCh37 (hg19), chromosome named "20" (no chr prefix)
+phase "5.1" "chr20.fa reference (GRCh37 / hg19)"
+CHR20_FA="$REFS_DIR/chr20.fa"
+if [ -s "$CHR20_FA" ]; then
+    pskip "chr20.fa already present ($(stat -c %s "$CHR20_FA") bytes)"
+else
+    pinfo "Downloading chr20 from UCSC hg19 (~65 MB compressed)"
+    TMPGZ="$REFS_DIR/chr20.fa.gz"
+    curl -L -o "$TMPGZ" \
+        "https://hgdownload.soe.ucsc.edu/goldenPath/hg19/chromosomes/chr20.fa.gz" \
+        || pfail "chr20.fa.gz download failed"
+    pinfo "Decompressing and stripping 'chr' prefix from sequence name"
+    zcat "$TMPGZ" | sed 's/^>chr/>/' > "$CHR20_FA"
+    rm -f "$TMPGZ"
+    [ -s "$CHR20_FA" ] && pdone "chr20.fa ready: $CHR20_FA" || pfail "chr20.fa empty after download"
+fi
+
+# GIAB truth VCFs v4.2.1 GRCh37 for HG002-HG005
+# HG001 is unused (Claim 2 benchmarks HG002-HG005 only)
+phase "5.2" "GIAB truth VCFs v4.2.1 GRCh37 (HG002-HG005, ~2.8 GB total)"
+_GIAB_FTP="https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/release"
+
+declare -A VCF_URL BED_URL
+VCF_URL[HG002]="$_GIAB_FTP/AshkenazimTrio/HG002_NA24385_son/NISTv4.2.1/GRCh37/HG002_GRCh37_1_22_v4.2.1_benchmark.vcf.gz"
+BED_URL[HG002]="$_GIAB_FTP/AshkenazimTrio/HG002_NA24385_son/NISTv4.2.1/GRCh37/HG002_GRCh37_1_22_v4.2.1_benchmark_noinconsistent.bed"
+VCF_URL[HG003]="$_GIAB_FTP/AshkenazimTrio/HG003_NA24149_father/NISTv4.2.1/GRCh37/HG003_GRCh37_1_22_v4.2.1_benchmark.vcf.gz"
+BED_URL[HG003]="$_GIAB_FTP/AshkenazimTrio/HG003_NA24149_father/NISTv4.2.1/GRCh37/HG003_GRCh37_1_22_v4.2.1_benchmark_noinconsistent.bed"
+VCF_URL[HG004]="$_GIAB_FTP/AshkenazimTrio/HG004_NA24143_mother/NISTv4.2.1/GRCh37/HG004_GRCh37_1_22_v4.2.1_benchmark.vcf.gz"
+BED_URL[HG004]="$_GIAB_FTP/AshkenazimTrio/HG004_NA24143_mother/NISTv4.2.1/GRCh37/HG004_GRCh37_1_22_v4.2.1_benchmark_noinconsistent.bed"
+VCF_URL[HG005]="$_GIAB_FTP/ChineseTrio/HG005_NA24631_son/NISTv4.2.1/GRCh37/HG005_GRCh37_1_22_v4.2.1_benchmark.vcf.gz"
+BED_URL[HG005]="$_GIAB_FTP/ChineseTrio/HG005_NA24631_son/NISTv4.2.1/GRCh37/HG005_GRCh37_1_22_v4.2.1_benchmark.bed"
+
+for IND in HG002 HG003 HG004 HG005; do
+    VCF="$TRUTH_DIR/${IND}_GRCh37_1_22_v4.2.1_benchmark.vcf.gz"
+    TBI="$VCF.tbi"
+    BED_FILE="$TRUTH_DIR/$(basename "${BED_URL[$IND]}")"
+    phase "5.2.${IND}" "$IND truth VCF + BED"
+    if [ -s "$VCF" ] && [ -s "$TBI" ]; then
+        pskip "$IND VCF already present"
+    else
+        pinfo "Downloading $IND truth VCF (~700 MB)"
+        curl -L -o "$VCF" "${VCF_URL[$IND]}" || pfail "$IND VCF download failed"
+        tabix -p vcf "$VCF" || pfail "$IND VCF tabix failed"
+        pdone "$IND VCF + index ready"
+    fi
+    if [ -s "$BED_FILE" ]; then
+        pskip "$IND BED already present"
+    else
+        pinfo "Downloading $IND confident BED"
+        curl -L -o "$BED_FILE" "${BED_URL[$IND]}" || pfail "$IND BED download failed"
+        pdone "$IND BED ready"
+    fi
+done
+
+pdone "All Claim 2 prerequisites ready"
 echo ""
 echo "========================================"
 echo "  DOWNLOAD COMPLETE"
-echo "  DATA_DIR: $DATA_DIR"
+echo "  DATA_DIR  : $DATA_DIR"
+echo "  REFS_DIR  : $REFS_DIR  (chr20.fa)"
+echo "  TRUTH_DIR : $TRUTH_DIR (GIAB HG002-HG005 VCFs)"
 echo "  Run benchmark with:"
 echo "    bash benchmark/benchmark.sh claim1 $DATA_DIR <ARCS_BIN> ./results"
 echo "========================================"

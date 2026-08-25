@@ -115,7 +115,7 @@ done
 
 **Stop if:** any tool is MISSING — install before continuing
 
-### Phase 1 — Download (30-90 min)
+### Phase 1 — Download (2-4 hours)
 
 ```bash
 bash benchmark/download.sh /data/fastq 2>&1 | tee /data/download.log
@@ -123,8 +123,19 @@ tail -30 /data/download.log
 ```
 
 **Pass condition:** Last line contains `DOWNLOAD COMPLETE`  
-**Stop if:** any line contains `FAIL` — paste the failing phase output for diagnosis  
-**Note:** Large downloads — C. elegans (~3.2 GB SRA), T. cacao (~7.7 GB SRA) — take longest
+**Stop if:** any line contains `FAIL` — paste the failing phase output for diagnosis
+
+**Large file notes:**
+- SRR065390 (C. elegans, ~22 GB SRA) and SRR870667 (T. cacao, ~15 GB SRA) are the slow downloads
+- **AWS speed-up for SRA files:** download from S3 Open Data mirror instead of NCBI prefetch:
+  ```bash
+  aws s3 cp --no-sign-request s3://sra-pub-run-odp/sra/SRR065390/SRR065390 /data/fastq/prefetch/SRR065390/SRR065390.sra
+  aws s3 cp --no-sign-request s3://sra-pub-run-odp/sra/SRR870667/SRR870667 /data/fastq/prefetch/SRR870667/SRR870667.sra
+  ```
+  Then re-run download.sh (it will skip prefetch and proceed to fasterq-dump)
+- Phase 5 of download.sh also fetches Claim 2 prerequisites:
+  - `~/refs/chr20.fa` — GRCh37 chr20 reference (~65 MB, chromosome named "20")
+  - `~/giab_truth/` — GIAB truth VCFs v4.2.1 for HG002-HG005 (~2.8 GB total)
 
 ### Phase 2 — Claim 1: Compression benchmark (2-4 hours)
 
