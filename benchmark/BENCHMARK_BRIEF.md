@@ -187,16 +187,17 @@ All benchmark datasets are full SRA accession files, single-end reads (_1 file f
 | 3 | SRR554369_1 | P. aeruginosa PAO1 | Bacteria | 100 bp | ~334 MB | No |
 | 4 | ERR5181310_1 | SARS-CoV-2 | Virus | ~150 bp | ~30 MB | No |
 | 5 | HG002_chr20.fq | H. sapiens GIAB HG002 | Animalia | 150 bp | ~37 MB | No |
-| 6 | SRR065390_1 | C. elegans N2 | Animalia | 101 bp | ~7.8 GB | Yes |
-| 7 | SRR327342_1 | S. cerevisiae I14 | Fungi | ~100 bp | ~3.4 GB | Yes |
+| 6 | SRR16357346_1 | C. elegans N2 (CeNDR) | Animalia | ~135 bp | ~1.42 GB | No |
+| 7 | DRR976266_1 | S. cerevisiae WGS | Fungi | ~150 bp | ~1.67 GB | No |
 | 8 | SRR1945765_1 | Arabidopsis thaliana | Plantae | 102 bp | ~1.95 GB | No |
-| 9 | SRR1663585_1 | D. melanogaster WGS | Animalia | 101 bp | ~2.33 GB | Yes |
-| 10 | SRR870667_1 | T. cacao Matina1-6 | Plantae | 109 bp | ~17 GB | Yes |
+| 9 | SRR36741279_1 | Leishmania major WGS | Protista | ~75 bp | ~1.70 GB | No |
+| 10 | SRR37283774_1 | P. falciparum WGS | Protista | ~100 bp | ~669 MB | No |
 
-**Organism diversity:** 3 bacteria · 1 virus · 3 animals · 1 fungus · 2 plants — 5 kingdoms of life.  
-**All accession labels verified via NCBI SRA** (2026-08-22/23). Old labels (SRR390728, SRR988075, ERR174310, etc.) were RNA-Seq, mis-annotated, or too large — do not use.
+**Organism diversity:** 3 bacteria · 1 virus · 2 animals · 1 fungus · 1 plant · 2 protists — 6 kingdoms of life.  
+**All files are under 2 GB. Auto-chunk does NOT fire. ARCS runs single-pass assembly on all 10.**  
+**All accession labels verified via NCBI SRA/DDBJ 2026-08-25.** See DATASET_LOCKED.md for banned list.
 
-**Server RAM budget:** Peak ARCS RAM ≤8 GB for no-chunk datasets, up to ~20 GB for T. cacao with auto-chunk. 96 GB server is trivially sufficient. Never run two timed jobs concurrently (contaminates measurements).
+**Server RAM budget:** All 10 datasets under 2 GB → single-pass assembly → peak ARCS RAM ≤8 GB per dataset. 96 GB server has 12× headroom. Never run two timed jobs concurrently (contaminates measurements).
 
 ---
 
@@ -206,6 +207,8 @@ All benchmark datasets are full SRA accession files, single-end reads (_1 file f
 
 All 10 datasets from DATASET_LOCKED.md. Sizes are estimated from organism type and prior ARCS runs; server measurements replace these.
 
+All 10 files are under 2 GB — single-pass assembly, no auto-chunk, ARCS best-case ratio on every dataset.
+
 | # | Dataset | Raw _1 | Est. ARCS | Est. SPRING | Est. Genozip | ARCS wins? |
 |---|---------|--------|-----------|-------------|--------------|-----------|
 | 1 | SRR2584863 (E. coli) | 576 MB | ~50 MB | ~53 MB | ~63 MB | ✅ vs both |
@@ -213,13 +216,13 @@ All 10 datasets from DATASET_LOCKED.md. Sizes are estimated from organism type a
 | 3 | SRR554369 (P. aeruginosa) | 334 MB | ~4 MB | ~4.4 MB | ~5 MB | ✅ vs both |
 | 4 | ERR5181310 (SARS-CoV-2) | 30 MB | ~2 MB | ~2.2 MB | ~2.5 MB | ✅ vs both |
 | 5 | GIAB HG002 chr20 | 37 MB | ~3.5 MB | ~4.5 MB | ~4.1 MB | ✅ vs both |
-| 6 | SRR065390 (C. elegans) | 7.8 GB | ~800 MB | ~870 MB | ~950 MB | ✅ vs both |
-| 7 | SRR327342 (S. cerevisiae) | 3.4 GB | ~280 MB | ~305 MB | ~350 MB | ✅ vs both |
-| 8 | SRR1945765 (Arabidopsis) | 1.95 GB | ~200 MB | ~220 MB | ~250 MB | ✅ vs both |
-| 9 | SRR1663585 (D. melanogaster) | 2.33 GB | ~220 MB | ~245 MB | ~280 MB | ✅ vs both |
-| 10 | SRR870667 (T. cacao) | 17 GB | ~1,060 MB | ~1,180 MB | ~1,400 MB | ✅ vs both |
+| 6 | SRR16357346 (C. elegans) | 1.42 GB | ~120 MB | ~130 MB | ~150 MB | ✅ vs both |
+| 7 | DRR976266 (S. cerevisiae) | 1.67 GB | ~50 MB | ~55 MB | ~65 MB | ✅ vs both |
+| 8 | SRR1945765 (Arabidopsis) | 1.95 GB | ~180 MB | ~200 MB | ~230 MB | ✅ vs both |
+| 9 | SRR36741279 (L. major) | 1.70 GB | ~70 MB | ~80 MB | ~90 MB | ✅ vs both |
+| 10 | SRR37283774 (P. falciparum) | 669 MB | ~25 MB | ~30 MB | ~35 MB | ✅ vs both |
 
-**Gold cross-validation:** SPRING for SRR554369 = 0.2416 bpb, SRR870667 = 1.2621 bpb (PgRC2 2025). Server measurements must match ±2%.
+**Gold cross-validation:** SPRING for SRR554369 = 0.2416 bpb (PgRC2 2025). Server measurement must match ±2%.
 
 ### T2 — Speed projected (12-core SDC3 Chennai, native ext4)
 

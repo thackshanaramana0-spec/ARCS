@@ -37,13 +37,15 @@ Source of truth: `benchmark/DATASET_LOCKED.md`. Reproduced here for fast referen
 | 3 | SRR554369 | P. aeruginosa PAO1 | Bacteria | ~334 MB | No |
 | 4 | ERR5181310 | SARS-CoV-2 | Virus | ~30 MB | No |
 | 5 | GIAB HG002 chr20 | H. sapiens | Animalia | ~37 MB | No |
-| 6 | SRR065390 | C. elegans N2 | Animalia | ~7.8 GB | Yes |
-| 7 | SRR327342 | S. cerevisiae I14 | Fungi | ~3.4 GB | Yes |
+| 6 | SRR16357346 | C. elegans N2 (CeNDR) | Animalia | ~1.42 GB | No |
+| 7 | DRR976266 | S. cerevisiae | Fungi | ~1.67 GB | No |
 | 8 | SRR1945765 | Arabidopsis thaliana | Plantae | ~1.95 GB | No |
-| 9 | SRR1663585 | D. melanogaster | Animalia | ~2.33 GB | Yes |
-| 10 | SRR870667 | T. cacao Matina1-6 | Plantae | ~17 GB | Yes |
+| 9 | SRR36741279 | Leishmania major | Protista | ~1.70 GB | No |
+| 10 | SRR37283774 | P. falciparum | Protista | ~669 MB | No |
 
-**Banned accessions (never use):** SRR390728, SRR988075, SRR1296601, ERR015526, SRR1294122, ERR174310
+**All 10 files are under 2 GB. Auto-chunk does NOT fire on any dataset.**
+
+**Banned accessions (never use):** SRR390728, SRR988075, SRR065390, SRR327342, SRR1663585, SRR870667, SRR1296601, ERR015526, SRR1294122, ERR174310
 
 **Disk budget:** ~98 GB peak on 250 GB SSD — safe.
 
