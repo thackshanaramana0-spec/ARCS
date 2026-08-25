@@ -40,7 +40,12 @@ pinfo()  { echo "[Phase $_PHASE]   → $*"; }
 
 # ── Phase 1: Dataset discovery ───────────────────────────────────────────────
 phase "1" "Dataset discovery in $DATA_DIR"
-mapfile -t FQ_FILES < <(find "$DATA_DIR" -maxdepth 1 \( -name "*.fq" -o -name "*.fastq" \) | sort)
+# Exclude _2.fq mate files (PE R2 — not independent datasets) and HG00x_pooled.fq
+# (GIAB chr20 files belong to Claim 2, not Claim 1). Only _1.fq or SE .fq files count.
+mapfile -t FQ_FILES < <(find "$DATA_DIR" -maxdepth 1 \( -name "*.fq" -o -name "*.fastq" \) \
+    ! -name "*_2.fq" ! -name "*_2.fastq" \
+    ! -name "HG00*.fq" ! -name "HG00*.fastq" \
+    | sort)
 if [ ${#FQ_FILES[@]} -eq 0 ]; then
     pfail "no .fq or .fastq files found in $DATA_DIR"
 fi
