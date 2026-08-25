@@ -49,16 +49,16 @@ verify_fq() {
 }
 
 # ── Dataset table ─────────────────────────────────────────────────────────────
-# 10 full SRA datasets (complete unsubsampled runs, all <2 GB, no auto-chunk)
+# 10 full SRA datasets (complete unsubsampled runs)
 # Name               Accession       Organism                    Approx _1 size  Notes
 # SRR2584863_1       SRR2584863      E. coli B REL606 WGS        ~576 MB         no auto-chunk
 # ERR552797_1        ERR552797       M. tuberculosis H37Rv WGS   ~217 MB         no auto-chunk
-# SRR554369_1        SRR554369       P. aeruginosa PAO1 WGS      ~334 MB         no auto-chunk
+# SRR554369_1        SRR554369       P. aeruginosa PAO1 WGS      ~334 MB         no auto-chunk  [SPRING gold 0.2416 bpb]
 # ERR5181310_1       ERR5181310      SARS-CoV-2 amplicon WGS     ~30 MB          no auto-chunk
-# ERR17740259_1      ERR17740259     S. aureus WGS ~148bp        ~970 MB         no auto-chunk (Firmicutes, 33% GC)
-# SRR16357346_1      SRR16357346     C. elegans N2 WGS ~135bp    ~1.42 GB        no auto-chunk
+# ERR17740259_1      ERR17740259     S. aureus WGS ~148bp        ~970 MB         no auto-chunk  (Firmicutes, 33% GC)
+# SRR065390_1        SRR065390       C. elegans N2 WGS 100bp PE  ~11 GB          ARCS_AUTOCHUNK_MB=25000 required  [SPRING+PgRC2 benchmark]
 # DRR976266_1        DRR976266       S. cerevisiae WGS 150bp     ~1.67 GB        no auto-chunk
-# SRR1945765_1       SRR1945765      Arabidopsis thaliana WGS    ~1.95 GB        no auto-chunk
+# SRR870667_1        SRR870667       T. cacao WGS 69bp SE        ~15 GB          ARCS_AUTOCHUNK_MB=25000 required  [SPRING gold 1.2621 bpb]
 # SRR36741279_1      SRR36741279     Leishmania major WGS ~75bp  ~1.70 GB        no auto-chunk
 # SRR37283774_1      SRR37283774     P. falciparum WGS ~100bp    ~669 MB         no auto-chunk
 #
@@ -76,9 +76,9 @@ SRA_IDS=(
     SRR554369
     ERR5181310
     ERR17740259
-    SRR16357346
+    SRR065390
     DRR976266
-    SRR1945765
+    SRR870667
     SRR36741279
     SRR37283774
 )
@@ -194,9 +194,9 @@ EXPECTED=(
     "$DATA_DIR/SRR554369_1.fq"
     "$DATA_DIR/ERR5181310_1.fq"
     "$DATA_DIR/ERR17740259_1.fq"
-    "$DATA_DIR/SRR16357346_1.fq"
+    "$DATA_DIR/SRR065390_1.fq"
     "$DATA_DIR/DRR976266_1.fq"
-    "$DATA_DIR/SRR1945765_1.fq"
+    "$DATA_DIR/SRR870667_1.fq"
     "$DATA_DIR/SRR36741279_1.fq"
     "$DATA_DIR/SRR37283774_1.fq"
     "$DATA_DIR/HG001_pooled.fq"

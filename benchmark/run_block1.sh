@@ -25,6 +25,11 @@ mkdir -p "$WD"
 
 NPROC=$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
 
+# Raise auto-chunk threshold to 25 GB so SRR065390 (~11 GB) and SRR870667 (~15 GB)
+# run single-pass assembly. Peak RAM: C. elegans ~18 GB, T. cacao ~28 GB.
+# Server has 90 GB — both fit comfortably. No-chunk = better ratio (fewer fragments).
+export ARCS_AUTOCHUNK_MB=25000
+
 # ── Progress helpers ──────────────────────────────────────────────────────────
 _PHASE=""
 phase()  { _PHASE="$1"; echo ""; echo "[Phase $_PHASE] $2"; }

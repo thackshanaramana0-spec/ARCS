@@ -32,18 +32,20 @@ Source of truth: `benchmark/DATASET_LOCKED.md`. Reproduced here for fast referen
 
 **10 full SRA datasets (primary benchmark):**
 
-| # | Accession | Organism | Kingdom | _1 size (uncompressed) | Auto-chunk |
-|---|-----------|----------|---------|------------------------|-----------|
-| 1 | SRR2584863 | E. coli B REL606 | Bacteria | ~576 MB | No |
-| 2 | ERR552797 | M. tuberculosis H37Rv | Bacteria | ~217 MB | No |
-| 3 | SRR554369 | P. aeruginosa PAO1 | Bacteria | ~334 MB | No |
-| 4 | ERR5181310 | SARS-CoV-2 | Virus | ~30 MB | No |
-| 5 | ERR17740259 | S. aureus WGS | Bacteria | ~970 MB | No |
-| 6 | SRR16357346 | C. elegans N2 (CeNDR) | Animalia | ~1.42 GB | No |
-| 7 | DRR976266 | S. cerevisiae | Fungi | ~1.67 GB | No |
-| 8 | SRR1945765 | Arabidopsis thaliana | Plantae | ~1.95 GB | No |
-| 9 | SRR36741279 | Leishmania major | Protista | ~1.70 GB | No |
-| 10 | SRR37283774 | P. falciparum | Protista | ~669 MB | No |
+| # | Accession | Organism | Kingdom | _1 size (uncompressed) | Peak RAM | Auto-chunk |
+|---|-----------|----------|---------|------------------------|---------|-----------|
+| 1 | SRR2584863 | E. coli B REL606 | Bacteria | ~576 MB | ~5 GB | No |
+| 2 | ERR552797 | M. tuberculosis H37Rv | Bacteria | ~217 MB | ~3 GB | No |
+| 3 | SRR554369 | P. aeruginosa PAO1 | Bacteria | ~334 MB | ~4 GB | No |
+| 4 | ERR5181310 | SARS-CoV-2 | Virus | ~30 MB | ~1 GB | No |
+| 5 | ERR17740259 | S. aureus WGS | Bacteria | ~970 MB | ~6 GB | No |
+| 6 | SRR065390 | C. elegans N2 WGS | Animalia | ~11 GB | ~18 GB | Suppressed† |
+| 7 | DRR976266 | S. cerevisiae | Fungi | ~1.67 GB | ~8 GB | No |
+| 8 | SRR870667 | Theobroma cacao WGS | Plantae | ~15 GB | ~28 GB | Suppressed† |
+| 9 | SRR36741279 | Leishmania major | Protista | ~1.70 GB | ~7 GB | No |
+| 10 | SRR37283774 | P. falciparum | Protista | ~669 MB | ~5 GB | No |
+
+**† `ARCS_AUTOCHUNK_MB=25000` is set in run_block1.sh — an env var, not a command-line flag. Ensures single-pass assembly on the 90 GB server.**
 
 **5 human chr20 subset datasets (supplementary — Claim 1 + Claim 2):**
 
@@ -55,13 +57,17 @@ Source of truth: `benchmark/DATASET_LOCKED.md`. Reproduced here for fast referen
 | S4 | HG004_pooled.fq | NA24143 (Ashkenazi mother) | ~37 MB |
 | S5 | HG005_pooled.fq | NA24631 (Han Chinese son) | ~37 MB |
 
-**All 15 files are under 2 GB. Auto-chunk does NOT fire on any dataset.**
+**Slots 6 and 8 exceed 2 GB; auto-chunk is suppressed via `ARCS_AUTOCHUNK_MB=25000` in run_block1.sh.**
 
-**Banned accessions (never use):** SRR390728, SRR988075, SRR065390, SRR327342, SRR1663585, SRR870667, SRR1296601, ERR015526, SRR1294122, ERR174310
+**Banned accessions (never use):** SRR390728, SRR988075, SRR327342, SRR1663585, SRR1296601, ERR015526, SRR1294122, ERR174310, SRR16357346, SRR1945765
 
-**Disk budget:** ~98 GB peak on 250 GB SSD — safe.
+**Disk budget:** ~82 GB peak on 250 GB SSD — safe.
 
-**Cross-validation:** Server SPRING bpb for SRR554369 must be ~0.2416 ±2%, for SRR870667 must be ~1.2621 ±2% (PgRC2 2025 gold values). If they deviate more, something is wrong with the benchmark setup.
+**Cross-validation:** Server SPRING bpb must match published gold values ±2%:
+- SRR554369 = 0.2416 bpb (P. aeruginosa)
+- SRR870667 = 1.2621 bpb (T. cacao — SPRING's worst; ARCS expected to win largest margin here)
+
+If either deviates >2%, SPRING benchmark setup is wrong — stop and investigate.
 
 ---
 
