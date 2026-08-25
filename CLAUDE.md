@@ -30,20 +30,32 @@ This file governs all AI-assisted work in this repository. Read it fully before 
 
 Source of truth: `benchmark/DATASET_LOCKED.md`. Reproduced here for fast reference.
 
+**10 full SRA datasets (primary benchmark):**
+
 | # | Accession | Organism | Kingdom | _1 size (uncompressed) | Auto-chunk |
 |---|-----------|----------|---------|------------------------|-----------|
 | 1 | SRR2584863 | E. coli B REL606 | Bacteria | ~576 MB | No |
 | 2 | ERR552797 | M. tuberculosis H37Rv | Bacteria | ~217 MB | No |
 | 3 | SRR554369 | P. aeruginosa PAO1 | Bacteria | ~334 MB | No |
 | 4 | ERR5181310 | SARS-CoV-2 | Virus | ~30 MB | No |
-| 5 | GIAB HG002 chr20 | H. sapiens | Animalia | ~37 MB | No |
+| 5 | ERR17740259 | S. aureus WGS | Bacteria | ~970 MB | No |
 | 6 | SRR16357346 | C. elegans N2 (CeNDR) | Animalia | ~1.42 GB | No |
 | 7 | DRR976266 | S. cerevisiae | Fungi | ~1.67 GB | No |
 | 8 | SRR1945765 | Arabidopsis thaliana | Plantae | ~1.95 GB | No |
 | 9 | SRR36741279 | Leishmania major | Protista | ~1.70 GB | No |
 | 10 | SRR37283774 | P. falciparum | Protista | ~669 MB | No |
 
-**All 10 files are under 2 GB. Auto-chunk does NOT fire on any dataset.**
+**5 human chr20 subset datasets (supplementary — Claim 1 + Claim 2):**
+
+| # | File | Individual | Size |
+|---|------|-----------|------|
+| S1 | HG001_pooled.fq | NA12878 (European) | ~37 MB |
+| S2 | HG002_pooled.fq | NA24385 (Ashkenazi son) | ~37 MB |
+| S3 | HG003_pooled.fq | NA24149 (Ashkenazi father) | ~37 MB |
+| S4 | HG004_pooled.fq | NA24143 (Ashkenazi mother) | ~37 MB |
+| S5 | HG005_pooled.fq | NA24631 (Han Chinese son) | ~37 MB |
+
+**All 15 files are under 2 GB. Auto-chunk does NOT fire on any dataset.**
 
 **Banned accessions (never use):** SRR390728, SRR988075, SRR065390, SRR327342, SRR1663585, SRR870667, SRR1296601, ERR015526, SRR1294122, ERR174310
 

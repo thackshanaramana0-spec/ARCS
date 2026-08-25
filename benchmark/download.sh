@@ -49,28 +49,33 @@ verify_fq() {
 }
 
 # ── Dataset table ─────────────────────────────────────────────────────────────
+# 10 full SRA datasets (complete unsubsampled runs, all <2 GB, no auto-chunk)
 # Name               Accession       Organism                    Approx _1 size  Notes
 # SRR2584863_1       SRR2584863      E. coli B REL606 WGS        ~576 MB         no auto-chunk
 # ERR552797_1        ERR552797       M. tuberculosis H37Rv WGS   ~217 MB         no auto-chunk
 # SRR554369_1        SRR554369       P. aeruginosa PAO1 WGS      ~334 MB         no auto-chunk
 # ERR5181310_1       ERR5181310      SARS-CoV-2 amplicon WGS     ~30 MB          no auto-chunk
+# ERR17740259_1      ERR17740259     S. aureus WGS ~148bp        ~970 MB         no auto-chunk (Firmicutes, 33% GC)
 # SRR16357346_1      SRR16357346     C. elegans N2 WGS ~135bp    ~1.42 GB        no auto-chunk
 # DRR976266_1        DRR976266       S. cerevisiae WGS 150bp     ~1.67 GB        no auto-chunk
 # SRR1945765_1       SRR1945765      Arabidopsis thaliana WGS    ~1.95 GB        no auto-chunk
 # SRR36741279_1      SRR36741279     Leishmania major WGS ~75bp  ~1.70 GB        no auto-chunk
 # SRR37283774_1      SRR37283774     P. falciparum WGS ~100bp    ~669 MB         no auto-chunk
 #
-# GIAB HG002-HG005 chr20 reads — from S3 (no account needed)
-# Compression benchmark uses HG002_chr20.fq; variant calling uses HG002-HG005 individually.
-#
-# All tools run at ARCS defaults (no special flags). Auto-chunk is ARCS default
-# behaviour for files >2 GB; no ARCS_CHUNK_THREADS override needed.
+# 5 human chr20 subset datasets — from GIAB S3 (no account needed)
+# HG001_pooled.fq   HG001 NA12878   European CEU chr20           ~37 MB          no auto-chunk
+# HG002_pooled.fq   HG002 NA24385   Ashkenazi son chr20          ~37 MB          no auto-chunk
+# HG003_pooled.fq   HG003 NA24149   Ashkenazi father chr20       ~37 MB          no auto-chunk
+# HG004_pooled.fq   HG004 NA24143   Ashkenazi mother chr20       ~37 MB          no auto-chunk
+# HG005_pooled.fq   HG005 NA24631   Han Chinese son chr20        ~37 MB          no auto-chunk
+# Human full WGS (~150 GB) exceeds single-pass assembly; chr20 subsets shown as supplementary.
 
 SRA_IDS=(
     SRR2584863
     ERR552797
     SRR554369
     ERR5181310
+    ERR17740259
     SRR16357346
     DRR976266
     SRR1945765
@@ -137,28 +142,25 @@ for ACC in "${SRA_IDS[@]}"; do
     fi
 done
 
-# ── Phase 3: GIAB HG002-HG005 chr20 from S3 ─────────────────────────────────
-phase "3" "Download GIAB HG002-HG005 chr20 reads from S3"
+# ── Phase 3: GIAB HG001-HG005 chr20 from S3 ─────────────────────────────────
+phase "3" "Download GIAB HG001-HG005 chr20 reads from S3 (5 human subset datasets)"
 pinfo "Using s3://giab — public bucket, no credentials needed"
+pinfo "These 5 chr20 subsets are used for BOTH Claim 1 compression AND Claim 2 variant calling"
 
-# HG002-HG005 novaseq 2×150 chr20 subsets
-# These are pre-subset chr20 BAMs from GIAB; we use the FASTQs where available
-# Strategy: download from s3://giab/data/AshkenazimTrio/HG002_NA24385_son/NIST_HiSeq_HG002_Homogeneity-10953946/
-#           filter chr20 reads from sorted BAM using samtools view
+# HG001-HG005 chr20 subsets from GIAB S3
+# If any path 404s, list bucket to find correct path:
+#   aws s3 ls --no-sign-request s3://giab/data/AshkenazimTrio/HG002_NA24385_son/ --recursive | grep chr20
 
-declare -A GIAB_S3 GIAB_OUT
+declare -A GIAB_S3
+GIAB_S3[HG001]="s3://giab/data/NA12878_HG001/NIST_HiSeq_HG001_Homogeneity-10953946/HG001_HiSeq300x_subsetN_chr20.fastq.gz"
 GIAB_S3[HG002]="s3://giab/data/AshkenazimTrio/HG002_NA24385_son/NIST_HiSeq_HG002_Homogeneity-10953946/HG002_HiSeq300x_subsetN_chr20.fastq.gz"
 GIAB_S3[HG003]="s3://giab/data/AshkenazimTrio/HG003_NA24149_father/NIST_HiSeq_HG003_Homogeneity-10953946/HG003_HiSeq300x_subsetN_chr20.fastq.gz"
 GIAB_S3[HG004]="s3://giab/data/AshkenazimTrio/HG004_NA24143_mother/NIST_HiSeq_HG004_Homogeneity-10953946/HG004_HiSeq300x_subsetN_chr20.fastq.gz"
 GIAB_S3[HG005]="s3://giab/data/ChineseTrio/HG005_NA24631_son/NIST_HiSeq_HG005_Homogeneity-10953946/HG005_HiSeq300x_subsetN_chr20.fastq.gz"
 
-# Note: exact S3 paths may differ — if the above 404, list with:
-#   aws s3 ls --no-sign-request s3://giab/data/AshkenazimTrio/HG002_NA24385_son/ --recursive | grep chr20
-# Then update GIAB_S3 paths accordingly.
-
-for IND in HG002 HG003 HG004 HG005; do
+for IND in HG001 HG002 HG003 HG004 HG005; do
     phase "3.${IND}" "Download $IND chr20 FASTQ"
-    OUT="$DATA_DIR/${IND}_chr20.fq"
+    OUT="$DATA_DIR/${IND}_pooled.fq"
     if [ -s "$OUT" ]; then
         pskip "$IND already downloaded: $OUT"
         continue
@@ -191,15 +193,17 @@ EXPECTED=(
     "$DATA_DIR/ERR552797_1.fq"
     "$DATA_DIR/SRR554369_1.fq"
     "$DATA_DIR/ERR5181310_1.fq"
+    "$DATA_DIR/ERR17740259_1.fq"
     "$DATA_DIR/SRR16357346_1.fq"
     "$DATA_DIR/DRR976266_1.fq"
     "$DATA_DIR/SRR1945765_1.fq"
     "$DATA_DIR/SRR36741279_1.fq"
     "$DATA_DIR/SRR37283774_1.fq"
-    "$DATA_DIR/HG002_chr20.fq"
-    "$DATA_DIR/HG003_chr20.fq"
-    "$DATA_DIR/HG004_chr20.fq"
-    "$DATA_DIR/HG005_chr20.fq"
+    "$DATA_DIR/HG001_pooled.fq"
+    "$DATA_DIR/HG002_pooled.fq"
+    "$DATA_DIR/HG003_pooled.fq"
+    "$DATA_DIR/HG004_pooled.fq"
+    "$DATA_DIR/HG005_pooled.fq"
 )
 MISSING=0
 for F in "${EXPECTED[@]}"; do

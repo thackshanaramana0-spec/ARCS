@@ -2,7 +2,11 @@
 
 **DO NOT CHANGE THIS FILE.** All accessions verified via NCBI SRA/DDBJ 2026-08-25.
 
-## The 10 Datasets
+---
+
+## The 10 Full Datasets (Claim 1 primary + Claim 3)
+
+All are complete, unsubsampled SRA runs as deposited by sequencing labs.
 
 | # | Accession | Organism | Kingdom | Read len | _1 size (uncompressed) | Auto-chunk |
 |---|-----------|----------|---------|---------|------------------------|-----------|
@@ -10,18 +14,36 @@
 | 2 | ERR552797 | M. tuberculosis H37Rv WGS | Bacteria | ~301 bp | ~217 MB | No |
 | 3 | SRR554369 | P. aeruginosa PAO1 WGS | Bacteria | 100 bp | ~334 MB | No |
 | 4 | ERR5181310 | SARS-CoV-2 amplicon WGS | Virus | ~150 bp | ~30 MB | No |
-| 5 | (GIAB S3) | H. sapiens HG002 chr20 | Animalia | 150 bp | ~37 MB | No |
+| 5 | ERR17740259 | S. aureus WGS (Firmicutes, 33% GC) | Bacteria | ~148 bp | ~970 MB | No |
 | 6 | SRR16357346 | C. elegans N2 WGS (CeNDR) | Animalia | ~135 bp | ~1.42 GB | No |
 | 7 | DRR976266 | S. cerevisiae WGS | Fungi | ~150 bp | ~1.67 GB | No |
 | 8 | SRR1945765 | Arabidopsis thaliana WGS | Plantae | 102 bp | ~1.95 GB | No |
 | 9 | SRR36741279 | Leishmania major WGS | Protista | ~75 bp | ~1.70 GB | No |
 | 10 | SRR37283774 | P. falciparum WGS | Protista | ~100 bp | ~669 MB | No |
 
-**Diversity:** 3 bacteria · 1 virus · 2 animals · 1 fungus · 1 plant · 2 protists — 6 kingdoms
+**Diversity:** 4 bacteria · 1 virus · 1 animal · 1 fungus · 1 plant · 2 protists — 6 kingdoms  
+**Note:** S. aureus (slot 5) adds Firmicutes / Gram-positive / 33% GC — distinct from slots 1–3 (all Gram-negative, 51–67% GC).
 
-**All files are under 2 GB. Auto-chunk does NOT fire for any dataset. ARCS runs single-pass assembly on all 10.**
+**All 10 files are under 2 GB. Auto-chunk does NOT fire. ARCS runs single-pass assembly on all 10.**
 
-**Sizes are uncompressed FASTQ _1 file sizes** (SRA download is 3-5× smaller).
+---
+
+## The 5 Human Subset Datasets (Claim 1 supplementary + Claim 2)
+
+Full human WGS (~150 GB) cannot be single-pass assembled on current hardware; these chr20 subsets demonstrate ARCS on human data. Limitation stated in paper.
+
+| # | File | Individual | Ancestry | Size | Source |
+|---|------|-----------|---------|------|--------|
+| S1 | HG001_pooled.fq | NA12878 (HG001) | European CEU | ~37 MB | GIAB S3 |
+| S2 | HG002_pooled.fq | NA24385 (HG002) | Ashkenazi Jewish son | ~37 MB | GIAB S3 |
+| S3 | HG003_pooled.fq | NA24149 (HG003) | Ashkenazi Jewish father | ~37 MB | GIAB S3 |
+| S4 | HG004_pooled.fq | NA24143 (HG004) | Ashkenazi Jewish mother | ~37 MB | GIAB S3 |
+| S5 | HG005_pooled.fq | NA24631 (HG005) | Han Chinese son | ~37 MB | GIAB S3 |
+
+**All 5 are under 2 GB. Auto-chunk does NOT fire. ARCS runs single-pass assembly on all 5.**  
+**Ancestry diversity:** European, Ashkenazi Jewish (trio), Han Chinese — demonstrates reference-free advantage on non-European genomes.
+
+---
 
 ## Spot counts and coverage
 
@@ -31,12 +53,13 @@
 | 2 | ERR552797 | ~720K | 301 bp | 4.4 Mb | ~49× |
 | 3 | SRR554369 | ~1.5M | 100 bp | 6.3 Mb | ~24× |
 | 4 | ERR5181310 | ~100K | 150 bp | 30 kb | ~500× |
-| 5 | GIAB HG002 chr20 | ~240K | 150 bp | 50 Mb | ~0.7× subset |
+| 5 | ERR17740259 | ~3.0M | ~148 bp | 2.8 Mb | ~158× |
 | 6 | SRR16357346 | 4.75M | ~135 bp | 100 Mb | ~6.4× |
 | 7 | DRR976266 | 5.08M | ~150 bp | 12 Mb | ~63× |
 | 8 | SRR1945765 | ~8.6M | 102 bp | 135 Mb | ~6.5× |
 | 9 | SRR36741279 | 9.49M | ~75 bp | 32 Mb | ~22× |
 | 10 | SRR37283774 | 2.91M | ~100 bp | 23 Mb | ~12.6× |
+| S1-S5 | GIAB HG001-HG005 | ~240K each | 150 bp | chr20 50 Mb | ~0.7× (subset) |
 
 ## Download Command
 

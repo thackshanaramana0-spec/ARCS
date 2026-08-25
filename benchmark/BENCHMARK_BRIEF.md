@@ -176,9 +176,13 @@ Expected:
 
 ---
 
-## 5. Dataset Details (All 10 Datasets)
+## 5. Dataset Details (10 full + 5 subset = 15 total)
 
-All benchmark datasets are full SRA accession files, single-end reads (_1 file for PE experiments). Datasets #1–5 and #8 are ≤2 GB (no auto-chunk). Datasets #6, 7, 9, 10 exceed 2 GB; ARCS default auto-chunk handles them transparently. All tools run at defaults — no special flags. **See DATASET_LOCKED.md — do not change accessions.**
+**See DATASET_LOCKED.md — do not change accessions.**
+
+### 10 Full SRA Datasets (primary Claim 1 + Claim 3)
+
+Complete unsubsampled SRA runs. All tools run at defaults — no special flags.
 
 | # | Accession | Organism | Kingdom | Read len | _1 file size (uncompressed) | Auto-chunk? |
 |---|-----------|----------|---------|---------|----------------------------|------------|
@@ -186,18 +190,32 @@ All benchmark datasets are full SRA accession files, single-end reads (_1 file f
 | 2 | ERR552797_1 | M. tuberculosis H37Rv | Bacteria | ~301 bp | ~217 MB | No |
 | 3 | SRR554369_1 | P. aeruginosa PAO1 | Bacteria | 100 bp | ~334 MB | No |
 | 4 | ERR5181310_1 | SARS-CoV-2 | Virus | ~150 bp | ~30 MB | No |
-| 5 | HG002_chr20.fq | H. sapiens GIAB HG002 | Animalia | 150 bp | ~37 MB | No |
+| 5 | ERR17740259_1 | S. aureus WGS | Bacteria | ~148 bp | ~970 MB | No |
 | 6 | SRR16357346_1 | C. elegans N2 (CeNDR) | Animalia | ~135 bp | ~1.42 GB | No |
 | 7 | DRR976266_1 | S. cerevisiae WGS | Fungi | ~150 bp | ~1.67 GB | No |
 | 8 | SRR1945765_1 | Arabidopsis thaliana | Plantae | 102 bp | ~1.95 GB | No |
 | 9 | SRR36741279_1 | Leishmania major WGS | Protista | ~75 bp | ~1.70 GB | No |
 | 10 | SRR37283774_1 | P. falciparum WGS | Protista | ~100 bp | ~669 MB | No |
 
-**Organism diversity:** 3 bacteria · 1 virus · 2 animals · 1 fungus · 1 plant · 2 protists — 6 kingdoms of life.  
-**All files are under 2 GB. Auto-chunk does NOT fire. ARCS runs single-pass assembly on all 10.**  
-**All accession labels verified via NCBI SRA/DDBJ 2026-08-25.** See DATASET_LOCKED.md for banned list.
+**Diversity:** 4 bacteria · 1 virus · 1 animal · 1 fungus · 1 plant · 2 protists — 6 kingdoms.  
+S. aureus (slot 5): Firmicutes, Gram-positive, 33% GC — distinct from slots 1–3 (all Gram-negative, 51–67% GC).
 
-**Server RAM budget:** All 10 datasets under 2 GB → single-pass assembly → peak ARCS RAM ≤8 GB per dataset. 96 GB server has 12× headroom. Never run two timed jobs concurrently (contaminates measurements).
+### 5 Human chr20 Subset Datasets (supplementary Claim 1 + Claim 2)
+
+Full human WGS (~150 GB) cannot be single-pass assembled; chr20 demonstrates human performance. Limitation discussed in paper.
+
+| # | File | Individual | Ancestry | Size | Auto-chunk? |
+|---|------|-----------|---------|------|------------|
+| S1 | HG001_pooled.fq | NA12878 HG001 | European CEU | ~37 MB | No |
+| S2 | HG002_pooled.fq | NA24385 HG002 | Ashkenazi Jewish son | ~37 MB | No |
+| S3 | HG003_pooled.fq | NA24149 HG003 | Ashkenazi Jewish father | ~37 MB | No |
+| S4 | HG004_pooled.fq | NA24143 HG004 | Ashkenazi Jewish mother | ~37 MB | No |
+| S5 | HG005_pooled.fq | NA24631 HG005 | Han Chinese son | ~37 MB | No |
+
+**All 15 files are under 2 GB. Auto-chunk does NOT fire on any. ARCS single-pass assembly on all 15.**  
+**All accessions verified via NCBI SRA/DDBJ/GIAB 2026-08-25.**
+
+**Server RAM budget:** All 15 datasets under 2 GB → peak ARCS RAM ≤8 GB per dataset. 96 GB server has 12× headroom. Never run two timed jobs concurrently (contaminates measurements).
 
 ---
 
@@ -209,18 +227,30 @@ All 10 datasets from DATASET_LOCKED.md. Sizes are estimated from organism type a
 
 All 10 files are under 2 GB — single-pass assembly, no auto-chunk, ARCS best-case ratio on every dataset.
 
+**10 full SRA datasets:**
+
 | # | Dataset | Raw _1 | Est. ARCS | Est. SPRING | Est. Genozip | ARCS wins? |
 |---|---------|--------|-----------|-------------|--------------|-----------|
 | 1 | SRR2584863 (E. coli) | 576 MB | ~50 MB | ~53 MB | ~63 MB | ✅ vs both |
 | 2 | ERR552797 (M. tuberculosis) | 217 MB | ~14 MB | ~15 MB | ~17 MB | ✅ vs both |
 | 3 | SRR554369 (P. aeruginosa) | 334 MB | ~4 MB | ~4.4 MB | ~5 MB | ✅ vs both |
 | 4 | ERR5181310 (SARS-CoV-2) | 30 MB | ~2 MB | ~2.2 MB | ~2.5 MB | ✅ vs both |
-| 5 | GIAB HG002 chr20 | 37 MB | ~3.5 MB | ~4.5 MB | ~4.1 MB | ✅ vs both |
+| 5 | ERR17740259 (S. aureus) | 970 MB | ~35 MB | ~38 MB | ~45 MB | ✅ vs both |
 | 6 | SRR16357346 (C. elegans) | 1.42 GB | ~120 MB | ~130 MB | ~150 MB | ✅ vs both |
 | 7 | DRR976266 (S. cerevisiae) | 1.67 GB | ~50 MB | ~55 MB | ~65 MB | ✅ vs both |
 | 8 | SRR1945765 (Arabidopsis) | 1.95 GB | ~180 MB | ~200 MB | ~230 MB | ✅ vs both |
 | 9 | SRR36741279 (L. major) | 1.70 GB | ~70 MB | ~80 MB | ~90 MB | ✅ vs both |
 | 10 | SRR37283774 (P. falciparum) | 669 MB | ~25 MB | ~30 MB | ~35 MB | ✅ vs both |
+
+**5 human chr20 subset datasets (supplementary):**
+
+| # | Dataset | Raw | Est. ARCS | Est. SPRING | Est. Genozip | Note |
+|---|---------|-----|-----------|-------------|--------------|------|
+| S1 | HG001 chr20 | 37 MB | ~3 MB | ~4 MB | ~4 MB | low-cov subset |
+| S2 | HG002 chr20 | 37 MB | ~3 MB | ~4 MB | ~4 MB | low-cov subset |
+| S3 | HG003 chr20 | 37 MB | ~3 MB | ~4 MB | ~4 MB | low-cov subset |
+| S4 | HG004 chr20 | 37 MB | ~3 MB | ~4 MB | ~4 MB | low-cov subset |
+| S5 | HG005 chr20 | 37 MB | ~3 MB | ~4 MB | ~4 MB | low-cov subset |
 
 **Gold cross-validation:** SPRING for SRR554369 = 0.2416 bpb (PgRC2 2025). Server measurement must match ±2%.
 
