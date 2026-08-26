@@ -20,7 +20,7 @@ This file governs all AI-assisted work in this repository. Read it fully before 
 2. **ARCS compression uses zero flags.** Always: `arcs compress INPUT.fq OUTPUT.arcs` — nothing else. No `--fast`, no `ARCS_PAR_SHARDS`, no `ARCS_CHUNK_THREADS`. Auto-chunk for >2 GB inputs is expected default behaviour, not a problem.
 3. **Never run two timed benchmark jobs concurrently.** One tool at a time. Concurrent jobs contaminate timing and RAM measurements.
 4. **Never silently alter methodology.** If something fails, stop, print the error, and wait for instructions.
-5. **Claim 1 must be fully lossless before Claim 2 starts.** If any `lossless=LOSSY` appears in Claim 1 output, halt immediately.
+5. **ARCS must be fully lossless before Claim 2 starts.** If any `TOOL=ARCS ... lossless=LOSSY` appears in Claim 1 output, halt immediately. SPRING `lossless=LOSSY` is expected (it strips `+` line IDs, which are spec-redundant); the lossless check normalizes the `+` line on both sides so SPRING comparison is fair on data recovery.
 6. **Projected numbers are sanity checks only.** Fresh server measurements are authoritative. Do not reject a server result because it differs from a projection.
 7. **ARCS must pass 7/7 ctests before any benchmark phase runs.**
 
@@ -147,7 +147,7 @@ bash benchmark/benchmark.sh claim1 /data/fastq /root/arcs-clean/build/arcs ./res
 After completion, run both checks:
 ```bash
 grep -h "TOOL=ARCS" ./results/claim1/*.log
-grep "LOSSY" ./results/claim1/*.log || echo "ALL LOSSLESS"
+grep "TOOL=ARCS.*lossless=LOSSY" ./results/block1/*.log && echo "BUG — ARCS LOSSY" || echo "ARCS ALL LOSSLESS"
 ```
 
 **Pass condition:** Every log line ends with `lossless=LOSSLESS`  

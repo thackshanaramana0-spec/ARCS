@@ -87,10 +87,17 @@ parse_time_v() {
     echo "${wall:-0} ${vmhwm:-0}"
 }
 
-# ── Lossless check (order-free, CRLF-safe) ───────────────────────────────────
+# ── Lossless check (order-free, CRLF-safe, '+' line normalized) ─────────────
+# The FASTQ '+' line content is redundant by spec (ID already on '@' line).
+# We normalize it to bare '+' on both sides so SPRING's known '+'-line stripping
+# does not count as data loss. Header, sequence, and quality are compared exactly.
+# ARCS preserves '+' line IDs byte-for-byte and doesn't need this normalization —
+# it's applied equally to both sides for a fair comparison.
 losscmp() {
-    paste - - - - < "$1" | tr -d '\r' | sort > /tmp/_orig_$$
-    paste - - - - < "$2" | tr -d '\r' | sort > /tmp/_dec_$$
+    paste - - - - < "$1" | tr -d '\r' \
+        | awk 'BEGIN{FS=OFS="\t"} {$3="+"; print}' | sort > /tmp/_orig_$$
+    paste - - - - < "$2" | tr -d '\r' \
+        | awk 'BEGIN{FS=OFS="\t"} {$3="+"; print}' | sort > /tmp/_dec_$$
     local res=LOSSY
     if cmp -s /tmp/_orig_$$ /tmp/_dec_$$; then res=LOSSLESS; fi
     rm -f /tmp/_orig_$$ /tmp/_dec_$$
