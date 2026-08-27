@@ -39,3 +39,9 @@ arcs_cpp/
 .DS_Store
 *.swp
 __pycache__/
+
+# Third-party PgRC2 (GPL-3), cloned for benchmarking only — never vendored
+# into this repo. Reproduce with:
+#   git clone https://github.com/kowallus/PgRC.git method_c
+#   cd method_c && mkdir build && cd build && cmake .. && make PgRC
+method_c/
