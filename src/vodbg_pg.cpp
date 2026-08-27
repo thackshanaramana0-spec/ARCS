@@ -401,6 +401,31 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
     // narrowest), so concurrency leaves cores idle exactly when it matters.
     int growth_threads = (int)std::thread::hardware_concurrency();
     if (growth_threads < 1) growth_threads = 1;
+    // ARCS_DETERMINISTIC=1: byte-identical archives for a given input.
+    //
+    // Everything else in the pipeline is already deterministic -- the APSP walk
+    // is a pure parallel map, and the fallback k-mer index scatter was made
+    // order-independent (see flat_kmer_index.h). This loop is the only
+    // remaining source, and it is not an oversight: threads claim reads from
+    // the GLOBAL read set by atomic compare-exchange, so which thread wins a
+    // contested read depends on timing.
+    //
+    // That global contention is the point. Confining each thread to its own
+    // range of reads would remove the race and make this deterministic for
+    // free -- and would also reintroduce exactly the sharding mistake that
+    // makes the legacy assembler 23% worse and Method A's read-sharded variant
+    // 77% worse on pg length: a thread that can only see 1/T of the reads
+    // cannot find the overlaps that make the pseudogenome short. A round-based
+    // parallel commit would preserve visibility but needs a barrier per read
+    // appended, which is the whole algorithm.
+    //
+    // So determinism here costs real time and is opt-in. Measured on yeast
+    // (1M reads), the three growth trials take 3.13s across 12 threads and
+    // 17.23s on one, taking a ~19.3s compress to ~33s. The nondeterminism it
+    // buys off is small -- pg length varies about 0.05% run to run, and every
+    // run is equally lossless -- so paying 70% of the wall clock for it is the
+    // wrong default, but reproducing an exact archive is worth having.
+    if (getenv("ARCS_DETERMINISTIC")) growth_threads = 1;
     if (const char* s = getenv("ARCS_VODBG_GROWTH_THREADS")) { int v = atoi(s); if (v >= 1) growth_threads = v; }
     if ((size_t)growth_threads > n) growth_threads = std::max(1, (int)n);
     std::vector<ThreadState> tstate((size_t)growth_threads);

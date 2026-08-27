@@ -96,26 +96,33 @@ FlatKmerIndex build_flat_kmer_index_parallel(size_t n_items, int bucket_cap,
     idx.km.assign(table_size * (size_t)bucket_cap, UINT64_MAX);
     idx.val.assign(table_size * (size_t)bucket_cap, 0);
 
-    std::vector<std::atomic<uint32_t>> bucket_count(table_size);
-    for (auto& c : bucket_count) c.store(0, std::memory_order_relaxed);
-
-    {
-        std::vector<std::thread> ths;
-        ths.reserve((size_t)T);
-        for (int t = 0; t < T; ++t) {
-            ths.emplace_back([&, t]{
-                for (auto& kv : local[(size_t)t]) {
-                    uint64_t b = flat_kmer_index_mix64(kv.first) & idx.table_mask;
-                    uint32_t slot = bucket_count[b].fetch_add(1, std::memory_order_relaxed);
-                    if (slot < (uint32_t)bucket_cap) {
-                        size_t pos = (size_t)b * (size_t)bucket_cap + slot;
-                        idx.km[pos]  = kv.first;
-                        idx.val[pos] = kv.second;
-                    }
-                }
-            });
+    // Scatter SERIALLY, in global emission order (thread 0's slice, then
+    // thread 1's, ...). Each thread's slice is a fixed range of [0, n_items),
+    // so that concatenation IS the single global order, which makes the
+    // finished index identical no matter how many threads emitted it.
+    //
+    // This was a parallel scatter using bucket_count[b].fetch_add(). That made
+    // the index depend on which thread reached a bucket first -- and not only
+    // in slot ORDER: once a bucket reaches bucket_cap the remaining items are
+    // DROPPED, so the race decided *which occurrences the index forgets*, and
+    // therefore which fallback placement each read found. That is a semantic
+    // difference, and it was one of the two reasons the same input did not
+    // produce the same archive twice.
+    //
+    // Serialising costs almost nothing: the expensive phase is emit() computing
+    // the k-mers (still parallel above); this loop only hashes and stores, over
+    // an item count on the order of the pseudogenome length.
+    std::vector<uint32_t> bucket_count(table_size, 0);
+    for (int t = 0; t < T; ++t) {
+        for (auto& kv : local[(size_t)t]) {
+            uint64_t b = flat_kmer_index_mix64(kv.first) & idx.table_mask;
+            uint32_t slot = bucket_count[b]++;
+            if (slot < (uint32_t)bucket_cap) {
+                size_t pos = (size_t)b * (size_t)bucket_cap + slot;
+                idx.km[pos]  = kv.first;
+                idx.val[pos] = kv.second;
+            }
         }
-        for (auto& th : ths) th.join();
     }
     return idx;
 }
