@@ -424,3 +424,58 @@ bash giab_one.sh HG003 "s3://giab/data/AshkenazimTrio/HG003_NA24149_father" 4
 bash giab_one.sh HG004 "s3://giab/data/AshkenazimTrio/HG004_NA24143_mother" 4
 bash giab_one.sh HG005 "s3://giab/data/ChineseTrio/HG005_NA24631_son" 4
 ```
+
+---
+
+## 13. Measured timing (Phase 1)
+
+### 13.1 SRA downloads via `prefetch` (NCBI direct HTTPS), post tool-fix
+
+Measured from `download.sh`'s own log timestamps, `prefetch` step only (not including `fasterq-dump` conversion):
+
+| Accession | Prefetch time |
+|---|---|
+| SRR2584863 | ~25 s |
+| ERR552797 | ~20 s |
+| SRR554369 | ~23 s |
+| ERR5181310 | ~10 s |
+| ERR17740259 | ~40 s |
+| SRR065390, DRR976266, SRR870667, SRR36741279, SRR37283774 | not individually timestamped in retained logs — SRR065390/SRR870667 skipped `prefetch` entirely via the AWS S3 pre-fetch shortcut below; the remaining three were small and completed in the same fast range as the ones above |
+
+**Why bother timing this at all**: it's the empirical basis for the rule-of-thumb in `CLAUDE.md` that only `SRR065390`/`SRR870667` need the AWS S3 shortcut — every other accession's plain NCBI `prefetch` finished in under a minute, so there's no benefit to complicating their download path.
+
+### 13.2 AWS S3 Open Data mirror, for the two large accessions
+
+`SRR065390` (3.2 GiB actual `.sra` size) and `SRR870667` (7.7 GiB actual `.sra` size) were pulled from `s3://sra-pub-run-odp/sra/<ACC>/<ACC>` instead of NCBI direct. Measured sustained transfer rate: **~89.5 MiB/s**. Extrapolated one-file durations from that rate: `SRR065390` ~40–60 s, `SRR870667` ~90 s–2 min. (These two extrapolated figures were not stopwatched start-to-finish as a single clean measurement — the rate is real and measured, the total-duration figures are a calculation from that rate, not a direct clock reading.)
+
+### 13.3 GIAB chr20 BAM streaming + uniform-30× downsample, per individual (solo run, post disk-fix)
+
+Measured directly from process `ps -o etime` and output-file timestamps, once each individual was running **alone** (not in the earlier failed parallel batch):
+
+| Individual | Wall-clock time (view → sort → fastq → downsample) |
+|---|---|
+| HG005 | ~25 min |
+| HG002 | ~24 min |
+| HG004 | ~25 min |
+| HG003 | ~22 min |
+
+Consistent across all four (~22–25 min each), regardless of native source coverage (60×–300× before downsampling) — the bottleneck is dominated by the `samtools sort -n` (name-sort) pass over the full chr20-region extract, not by the final `seqtk` downsample step, which is fast.
+
+### 13.4 Total Phase 1 wall-clock — honest caveat
+
+The 10 SRA datasets + Phase 5 (chr20.fa + truth VCFs) downloaded cleanly and quickly once the `prefetch`/`fasterq-dump` symlink-flattening bug (Section 9.4) was fixed — well under an hour of actual transfer time combined.
+
+**Phase 3 (GIAB) took substantially longer than its own transfer time alone** because of the debugging cycle documented in Section 9: the `samtools fastq -0` bug (had to be found, fixed, and re-run from scratch for all 4 individuals), the `trio`-keyword bug, the SIGPIPE/pipefail issue, and — the biggest cost — the disk-exhaustion incident (Section 9.16), which killed 3 of the 4 individuals mid-stream, required ~51 GB of cleanup, and forced a switch from parallel to sequential execution. **Do not read the ~22–25 min/individual figures above as "Phase 3 took ~90–100 minutes total"** — the actual elapsed time from first GIAB attempt to final completion spanned several hours across this session, most of it debugging and re-running failed attempts, not productive transfer. If re-running Phase 3 cleanly on a fresh server with all fixes already in place (Section 8), budget roughly **~25 min × 4 individuals sequentially ≈ 1.5–2 hours**, plus the disk headroom noted in Section 9.16.
+
+---
+
+## 14. Verification evidence for key claims
+
+Facts asserted elsewhere in this document that were specifically checked, not assumed:
+
+- **All 10 SRA datasets are genuine full/unsubsampled runs, not truncated or substituted**: `SRR065390`'s spot count (33,808,546) matches `DATASET_LOCKED.md`'s documented ~33.8M exactly, via `sra-stat --xml --quick`. `ERR5181310`'s read count (912,571 in `_1.fq`) was cross-checked against ENA's official portal API (`read_count=1,828,186` total across both mates) and matched to within 0.17%. `ERR17740259`'s read count (2,999,934) matches the documented ~3.0M spot count.
+- **The `samtools fastq -0` → `-o` fix actually works**: verified with a live 500 kb test region (`chr20:1-500000`) on the HG002 BAM before trusting it across all 4 full-size streams — recovered 883,467 correctly-paired reads with `samtools`'s own "discarded 0 singletons" confirmation, versus the `-0` version leaking raw FASTQ into stdout/log files instead of the output file.
+- **The `run_block1.sh` discovery-glob fix produces exactly 10 files**: re-ran the actual `find | grep` pipeline from the fixed script directly against the live `/data/fastq` directory and counted the output (`wc -l` → 10), rather than trusting a code read-through alone.
+- **All 4 GIAB individuals hit exactly 30.0× chr20 coverage**: each script run computed and printed `N_OUT * READ_LEN / CHR20_LEN` and independently re-verified the read count via `wc -l` on the actual output file, not just trusting the `seqtk` fraction calculation.
+- **`sshd` has no idle timeout on this server**: checked via `sshd -T | grep -i clientalive` — `clientaliveinterval 0`, ruling out server-side SSH timeout as the cause of the one simultaneous-background-job-kill incident (Section 9.14).
+- **CMakeLists.txt's `LANGUAGES C` fix was necessary, not cosmetic**: confirmed via `compile_commands.json` showing zero compile entries for `divsufsort.c` before the fix, and a correct `Building C object ...divsufsort.c.o` entry after — not just inferred from the linker error message.
