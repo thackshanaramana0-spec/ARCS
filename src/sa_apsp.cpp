@@ -187,7 +187,22 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates(
     // speed win, not free; at far larger inputs (hundreds of GB text) this
     // would add proportionally, which matters for that scale's own
     // already-tighter memory budget (see SuffixArray::build_libsais notes).
-    std::vector<uint32_t> pos_to_seg;
+    // SAMPLED, not dense: seg_sample[b] is the segment owning the FIRST
+    // position of 64-position block b. seg_of() starts there and walks
+    // forward over seg_start until it finds the true owner. Segments here are
+    // whole reads (~150 chars), so a 64-position block spans a boundary
+    // rarely and the walk is 0 or 1 steps in the overwhelming majority of
+    // lookups, never a binary search over m.
+    //
+    // The dense version (one uint32 per char) cost 4 bytes/char -- ~1.0 GB on
+    // a 257 Mchar read set, inside the construction peak. At 1/64th of that
+    // the table is ~16 MB, which is the real point: the dense array was far
+    // too large to cache, and SA-order lookups have no spatial locality (see
+    // the profiling note above), so nearly every dense lookup was a miss to
+    // DRAM. A 16 MB table plus a mostly-resident seg_start trades one
+    // guaranteed miss for accesses that can actually hit.
+    constexpr int SAMPLE_SHIFT = 6;              // 64 positions per sample
+    std::vector<uint32_t> seg_sample;
     {
         size_t total = 0;
         for (auto& s : reads_both_views) total += s.size() + 1;
@@ -199,19 +214,20 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates(
             throw std::runtime_error("build_apsp_candidates: concatenated text exceeds uint32_t position range");
         }
         T.reserve(total);
-        pos_to_seg.resize(total);
         for (size_t i = 0; i < m; ++i) {
             seg_start[i] = (uint32_t)T.size();
             seg_len[i]   = (uint32_t)reads_both_views[i].size();
             T += reads_both_views[i];
             T += SEP;
-            // Fill this segment's full footprint (content + its own trailing
-            // SEP byte) — matches locate()'s existing convention of
-            // resolving the separator position to its OWNING segment too
-            // (off == seg_len[e] there signals "this is the separator").
-            std::fill(pos_to_seg.begin() + seg_start[i],
-                      pos_to_seg.begin() + seg_start[i] + seg_len[i] + 1,
-                      (uint32_t)i);
+        }
+        // One pass over the blocks; `e` only ever moves forward, so this is
+        // O(blocks + m) total, not O(blocks * m).
+        seg_sample.assign((total >> SAMPLE_SHIFT) + 2, 0);
+        size_t e = 0;
+        for (size_t b = 0; b < seg_sample.size(); ++b) {
+            const size_t p = b << SAMPLE_SHIFT;
+            while (e + 1 < m && (size_t)seg_start[e + 1] <= p) ++e;
+            seg_sample[b] = (uint32_t)e;
         }
     }
 
@@ -260,6 +276,12 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates(
         _sa_t0 = t1;
     }
 
+    auto seg_of = [&](uint32_t pos) -> size_t {
+        size_t e = seg_sample[pos >> SAMPLE_SHIFT];
+        while (e + 1 < m && seg_start[e + 1] <= pos) ++e;
+        return e;
+    };
+
     // rank_at_seg[e] = position in SA order of the suffix that starts at
     // seg_start[e] (i.e. the whole of entry e's read).
     //
@@ -277,7 +299,7 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates(
     std::vector<uint32_t> rank_at_seg(m, 0);
     for (int64_t i = 0; i < n; ++i) {
         const uint32_t p = SA.sa[(size_t)i];
-        const uint32_t e = pos_to_seg[p];
+        const size_t e = seg_of(p);
         if (seg_start[e] == p) rank_at_seg[e] = (uint32_t)i;
     }
 
@@ -287,7 +309,7 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates(
     // single largest cache-miss contributor in the whole compress pipeline —
     // see pos_to_seg's own comment above); now a direct O(1) array read.
     auto locate = [&](uint32_t pos) -> int64_t {
-        size_t e = pos_to_seg[pos];
+        size_t e = seg_of(pos);
         uint32_t off = pos - seg_start[e];
         if (off >= seg_len[e]) return -1; // the separator byte itself
         return (int64_t)((e << 32) | off);

@@ -2095,10 +2095,14 @@ static ChainEncodeResult parallel_shard_assemble(
 //
 //   (1) sa_apsp stores every position as uint32_t and throws above UINT32_MAX
 //       chars (see SuffixArray::build_libsais and build_apsp_candidates).
-//   (2) The build allocates ~25 bytes per char of concatenated text at peak:
-//       T itself (1) + pos_to_seg (4) + SuffixArray::sa (4) + ::lcp (4) +
-//       libsais's own SA/PLCP/LCP int32 triple (12). RAM is therefore the
-//       binding limit long before (1) is.
+//   (2) The build allocates ~13 bytes per char of concatenated text at peak:
+//       SuffixArray::sa (4) + ::lcp (4) + libsais's transient PLCP (4) + T
+//       itself (1) + the sampled seg_sample table (1/16). It was 25 before
+//       libsais was pointed straight at our sa/lcp buffers, the dense inverse
+//       suffix array became one entry per segment, and pos_to_seg was sampled
+//       (all three verified byte-identical). At 13 the uint32 index width in
+//       (1) is now the binding limit on this machine, not RAM -- which is the
+//       right way round, since (1) is a correctness bound and RAM is not.
 //
 // Both Claim-1 slots over 2 GB (C. elegans ~11 GB, T. cacao ~15 GB) suppress
 // auto-chunk on purpose (ARCS_AUTOCHUNK_MB=25000 in run_block1.sh, recorded in
@@ -2143,7 +2147,7 @@ static ChainEncodeResult vodbg_assemble(const std::vector<Read>& reads,
     size_t chars = 0;
     for (const auto& r : reads) chars += 2 * (r.seq.size() + 1);
 
-    const size_t BYTES_PER_CHAR = 25;               // derived above, not fitted
+    const size_t BYTES_PER_CHAR = 13;               // derived above, not fitted
     // Half of what is available: the other half has to hold the reads, the
     // per-read placement arrays, and the pg + DNA encode that follow.
     const size_t avail    = host_available_bytes();
