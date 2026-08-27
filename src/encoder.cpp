@@ -1811,11 +1811,63 @@ static std::vector<uint8_t> serialize_chain_pg_aux(const ChainEncodeResult& r) {
     for (size_t i = 0; i < n; ++i) col_rc[i] = r.pg_rc[i];
 
     for (uint32_t c : r.pg_mm_counts)  write_varint(col_mmcnt, c);
-    for (uint16_t p : r.pg_mm_pos_flat) {
-        col_mmpos.push_back((uint8_t)(p & 0xFF));
-        col_mmpos.push_back((uint8_t)(p >> 8));
+
+    // ── AUX_V1: mismatch position + base re-encoding ─────────────────────────
+    // Both transforms are pure re-encodings of the same information, signalled
+    // by the aux format version so old archives keep decoding as-is.
+    //
+    // POSITIONS: mismatch positions within one read are strictly ascending, so
+    // store the first raw and the rest as gaps. Measured order-0 entropy on
+    // real data drops 6.960 -> 3.491 bits/entry. Emitted as one byte per entry
+    // with 255 as an escape followed by the raw uint16 (read lengths can exceed
+    // 255, and the first-in-read value often does).
+    //
+    // BASES: a mismatch means the read's base differs from the pg's, so only 3
+    // of 4 codes are possible — storing the absolute base wastes log2(4/3).
+    // Store instead the rank among the three non-reference codes.
+    //
+    // The escape (code 3) is REQUIRED, not defensive: the two call sites that
+    // record mismatches use different guards — record_mapped tests
+    // is_acgt_strict (rejects lowercase) while build_multicontig_pg tests
+    // encode_base(b) >= 4 (accepts it). At the latter, a lowercase read byte
+    // against an uppercase pg byte records a BYTE mismatch whose 2-bit codes
+    // are equal. The plain rank map is undefined there — rank == ref is
+    // produced by both abs == ref and abs == ref+1, and the decoder's inverse
+    // can never emit abs == ref. That ambiguity is exactly what corrupted an
+    // earlier attempt at this encoding. Code 3 represents it explicitly.
+    const bool aux_v1 = (getenv("ARCS_AUX_V0") == nullptr);
+    if (aux_v1) {
+        size_t cum = 0;
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t cnt = (i < r.pg_mm_counts.size()) ? r.pg_mm_counts[i] : 0;
+            uint32_t base = (i < r.pg_pos.size()) ? r.pg_pos[i] : 0;
+            uint16_t prev = 0;
+            for (uint32_t k = 0; k < cnt && cum < r.pg_mm_pos_flat.size(); ++k, ++cum) {
+                uint16_t off = r.pg_mm_pos_flat[cum];
+                uint16_t enc = (k == 0) ? off : (uint16_t)(off - prev);
+                prev = off;
+                if (enc < 255) {
+                    col_mmpos.push_back((uint8_t)enc);
+                } else {
+                    col_mmpos.push_back(255);
+                    col_mmpos.push_back((uint8_t)(enc & 0xFF));
+                    col_mmpos.push_back((uint8_t)(enc >> 8));
+                }
+                uint8_t abs_b = r.pg_mm_base_flat[cum];
+                size_t  pgpos = (size_t)base + off;
+                uint8_t ref_b = (pgpos < r.pg.size()) ? encode_base(r.pg[pgpos]) : 0;
+                if (ref_b >= 4) ref_b = 0;   // pg substitutes 'A' for non-ACGT
+                col_mmbase.push_back(abs_b == ref_b ? (uint8_t)3
+                                                    : (uint8_t)(abs_b > ref_b ? abs_b - 1 : abs_b));
+            }
+        }
+    } else {
+        for (uint16_t p : r.pg_mm_pos_flat) {
+            col_mmpos.push_back((uint8_t)(p & 0xFF));
+            col_mmpos.push_back((uint8_t)(p >> 8));
+        }
+        for (uint8_t b : r.pg_mm_base_flat) col_mmbase.push_back(b);
     }
-    for (uint8_t b : r.pg_mm_base_flat) col_mmbase.push_back(b);
 
     // Measurement-only diagnostic (ARCS_AUX_DEBUG=1): mm_base_flat stores the
     // read's ABSOLUTE base at each mismatch position, but a mismatch means
@@ -1898,6 +1950,10 @@ static std::vector<uint8_t> serialize_chain_pg_aux(const ChainEncodeResult& r) {
     pu32(out, (uint32_t)col_readlen.size());
     pu32(out, (uint32_t)col_Nchar.size());     // new field (literal N bytes)
     pu32(out, (uint32_t)n);
+    // Aux format version, appended AFTER n so the reader can identify the
+    // layout by locating n (see the decoder's probe): 0 = original absolute
+    // mm positions/bases, 1 = delta positions + rank-of-3 bases with escape.
+    if (aux_v1) pu32(out, 1u);
 
     // Stream order: col_Nchar + col_readlen before col_qmmpos (size-derived, last).
     for (auto* c : {&col_rc,&col_mmcnt,&col_mmpos,&col_mmbase,

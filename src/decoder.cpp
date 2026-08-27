@@ -1381,9 +1381,17 @@ void ARCSDecoder::decode_wgs_chain_pg(const ARCSReader& rdr, FASTQWriter& out_wr
     // n matches at the new offset.
     uint32_t sz_Nchar = 0;
     size_t   hdr_bytes;
-    if (ru32(ah+36) == (uint32_t)n) {          // new 10-field header
+    uint32_t aux_ver = 0;
+    if (ru32(ah+36) == (uint32_t)n) {          // 10-field header (n at +36)
         sz_Nchar = ru32(ah+32);
         hdr_bytes = 40;
+        // Optional 11th field: aux format version. Present only when the
+        // encoder wrote it, so probe for a plausible version value rather than
+        // assuming the bytes exist — streams written before it decode as v0.
+        if (aux_raw.size() >= 44) {
+            uint32_t v = ru32(ah+40);
+            if (v == 1) { aux_ver = 1; hdr_bytes = 44; }
+        }
     } else {                                    // legacy 9-field header
         ARCS_CHECK(ru32(ah+32) == (uint32_t)n, "chain-pg: n_reads mismatch in AUX");
         hdr_bytes = 36;
@@ -1449,12 +1457,40 @@ void ARCSDecoder::decode_wgs_chain_pg(const ARCSReader& rdr, FASTQWriter& out_wr
         // quality-deviation position (orig-read frame) — derive dev_sets here
         // instead of reading a stored qmm stream.
         uint32_t mm_cnt = (uint32_t)read_varint(p_mmcnt, col_mmcnt_e);
+        uint16_t mm_prev = 0;
         for (uint32_t k = 0; k < mm_cnt; ++k) {
-            uint16_t mpos = (uint16_t)((uint32_t)p_mmpos[0] | ((uint32_t)p_mmpos[1]<<8));
-            p_mmpos += 2;
+            uint16_t mpos;
+            if (aux_ver >= 1) {
+                // Delta positions: 1 byte, 255 escapes to a raw uint16. The
+                // first entry of a read is absolute, the rest are gaps.
+                uint16_t enc = *p_mmpos++;
+                if (enc == 255) {
+                    enc = (uint16_t)((uint32_t)p_mmpos[0] | ((uint32_t)p_mmpos[1]<<8));
+                    p_mmpos += 2;
+                }
+                mpos = (k == 0) ? enc : (uint16_t)(mm_prev + enc);
+                mm_prev = mpos;
+            } else {
+                mpos = (uint16_t)((uint32_t)p_mmpos[0] | ((uint32_t)p_mmpos[1]<<8));
+                p_mmpos += 2;
+            }
             uint8_t  mbase = *p_mmbase++;
             if (mpos < (uint16_t)Li) {
-                enc_seq[mpos] = BASE_TO_CHAR[mbase & 3];
+                uint8_t out_b;
+                if (aux_ver >= 1) {
+                    // Rank among the three non-reference codes; 3 escapes to
+                    // "same code as reference" (see the encoder's note on why
+                    // that case exists and why the plain rank map is ambiguous).
+                    // enc_seq still holds the untouched pg base at this offset —
+                    // this loop is its first and only write.
+                    uint8_t ref_b = encode_base(enc_seq[mpos]);
+                    if (ref_b >= 4) ref_b = 0;
+                    out_b = (mbase == 3) ? ref_b
+                          : (uint8_t)((mbase >= ref_b) ? mbase + 1 : mbase);
+                } else {
+                    out_b = mbase;
+                }
+                enc_seq[mpos] = BASE_TO_CHAR[out_b & 3];
                 uint16_t qp = (uint16_t)(rc ? (Li - 1 - mpos) : mpos);
                 if (qp < (uint16_t)Li) dev_sets[i][(size_t)qp] = true;
             }
