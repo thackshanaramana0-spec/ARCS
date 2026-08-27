@@ -151,9 +151,24 @@ static inline int predict_row(const Row4& c, int node, int hb) {
     else if (hb == 0)   { n1 = c[1];        n0 = c[0]; }
     else                { n1 = c[3];        n0 = c[2]; }
     // p = (n1 + α) / (n0 + n1 + 2α), α = ALPHA_NUM/16, scaled to 12 bits.
-    // (A magic-reciprocal table for this division was tried and REVERTED: den varies
-    // per call, so a 180 KB lookup table thrashed the model-table cache — net slower.
-    // Unlike build_cf, where the divisor is invariant per symbol. See memory.)
+    //
+    // This division has now been attacked TWICE and is not the bottleneck; do
+    // not try a third time without new evidence.
+    //   1st attempt: reciprocal table indexed by `den`, which spans a large
+    //      sparse range (~180 KB) and thrashed the model-table cache.
+    //   2nd attempt: reciprocal indexed by the COUNT SUM instead — den is fully
+    //      determined by s = n0 + n1, and counts are uint8-capped, so the table
+    //      is only 1021 entries (8 KB, L1-resident), avoiding the first
+    //      attempt's flaw. recip[s] = floor(2^40/den)+1 was verified BIT-EXACT
+    //      against this division over the entire reachable domain (n0,n1 in
+    //      [0,510]; 2^32 and 2^34 are NOT exact, so precision matters). It was
+    //      still not faster: measured 6.85/6.87 s against a 6.55/6.94 s
+    //      baseline — inside run-to-run noise.
+    // Reason: the 16 divisions per base (8 models x 2 nodes) are mutually
+    // INDEPENDENT, so the out-of-order engine overlaps them and hides the
+    // latency, while a table lookup adds load pressure competing with the model
+    // tables. Profiling agrees: `code` is ~52% of coder time but that is the
+    // mixer, APM and arithmetic coder, not this divide.
     int num = (n1 * 16 + ALPHA_NUM) * 4096;
     int den = (n0 + n1) * 16 + 2 * ALPHA_NUM;
     int p = num / den;

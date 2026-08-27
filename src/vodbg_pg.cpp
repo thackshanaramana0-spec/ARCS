@@ -783,7 +783,9 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
 
         // Keep the trial with the shortest pg (validated above as the objective
         // that also minimises the final archive).
-        if (!have_best || r.pg.size() < best_r.pg.size()) {
+        const size_t trial_pg = r.pg.size();   // capture before any move
+        const bool   improved = !have_best || trial_pg < best_r.pg.size();
+        if (improved) {
             best_r    = std::move(r);
             best_call = std::move(trial_call);
             best_frac = hq_ov_frac;
@@ -791,8 +793,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
         }
         if (VB_TIMING || getenv("ARCS_VODBG_EXT_DEBUG"))
             fprintf(stderr, "[HQ-TRIAL] frac=%.2f pg_len=%zu%s\n",
-                    hq_ov_frac, best_r.pg.size(),
-                    (best_frac == hq_ov_frac) ? "  <= best so far" : "");
+                    hq_ov_frac, trial_pg, improved ? "  <= best so far" : "");
     }
 
     if (call_out) *call_out = std::move(best_call);
