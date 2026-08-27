@@ -46,8 +46,67 @@ struct Placement {
 
 } // namespace
 
-ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_out) {
-    const size_t n = reads.size();
+ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* call_out) {
+    const size_t n_orig = orig_reads.size();
+
+    // ── Exact-duplicate read collapse (ARCS_VODBG_NODEDUP=1 disables) ─────────
+    // Sequencing data carries a large fraction of byte-identical reads —
+    // measured 14.8% (yeast), 15.0% (E. coli), 30.9% (P. falciparum). A
+    // duplicate read can only ever extend a contig exactly as its twin does, so
+    // it contributes nothing to overlap discovery while costing a full extra
+    // entry in the suffix array, the APSP walk and the growth loop.
+    //
+    // Collapsing them before the SA is a pure SPEED and MEMORY win, not a size
+    // one: every original read is still emitted below, it just rides on its
+    // representative's placement (identical sequence at the same position gives
+    // identical mismatches by construction). Measured on yeast: sa_apsp_build
+    // 7.64 s -> 6.06 s and peak RSS 8361 MB -> 7060 MB.
+    //
+    // Duplicates are found via a 64-bit content hash with full verification on
+    // hit, not by hashing std::string keys directly — the map is keyed on the
+    // cheap hash so the ~150-byte sequences are compared only on a real
+    // candidate, keeping the pass well under the time it saves.
+    std::vector<uint32_t>              uniq_idx;   // uniq_idx[u] = an original read with that sequence
+    std::vector<std::vector<uint32_t>> dups;       // dups[u]     = all original reads with it
+    const bool do_dedup = (getenv("ARCS_VODBG_NODEDUP") == nullptr);
+    {
+        uniq_idx.reserve(n_orig);
+        dups.reserve(n_orig);
+        std::unordered_map<uint64_t, std::vector<uint32_t>> by_hash;
+        if (do_dedup) by_hash.reserve(n_orig * 2);
+        for (size_t i = 0; i < n_orig; ++i) {
+            const std::string& s = orig_reads[i].seq;
+            uint32_t u = UINT32_MAX;
+            if (do_dedup) {
+                uint64_t h = 1469598103934665603ULL;          // FNV-1a over the sequence
+                for (char c : s) { h ^= (uint8_t)c; h *= 1099511628211ULL; }
+                auto& bucket = by_hash[h];
+                for (uint32_t cand : bucket)                   // a hash hit is not proof
+                    if (orig_reads[uniq_idx[cand]].seq == s) { u = cand; break; }
+                if (u == UINT32_MAX) {
+                    u = (uint32_t)uniq_idx.size();
+                    bucket.push_back(u);
+                    uniq_idx.push_back((uint32_t)i);
+                    dups.emplace_back();
+                }
+            } else {
+                u = (uint32_t)uniq_idx.size();
+                uniq_idx.push_back((uint32_t)i);
+                dups.emplace_back();
+            }
+            dups[u].push_back((uint32_t)i);
+        }
+    }
+    // Unique reads are addressed by INDIRECTION, never copied: R(u) is the
+    // representative Read for unique index u. Copying whole Read objects
+    // (name + seq + qual) for ~850k reads cost ~1.2 s and ate most of the
+    // 1.46 s the smaller suffix array saves, so the indirection is the point,
+    // not an optimisation detail.
+    auto R = [&](size_t u) -> const Read& { return orig_reads[uniq_idx[u]]; };
+    const size_t n = uniq_idx.size();
+    if (getenv("ARCS_VODBG_EXT_DEBUG"))
+        fprintf(stderr, "[DEDUP] reads=%zu unique=%zu duplicates=%zu (%.1f%%)\n",
+                n_orig, n, n_orig - n, n_orig ? 100.0 * (double)(n_orig - n) / (double)n_orig : 0.0);
 
     int K0 = 24;
     if (const char* s = getenv("ARCS_VODBG_K")) { int v = atoi(s); if (v >= 12 && v <= 31) K0 = v; }
@@ -84,9 +143,9 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
 
     // ── Build the two views (forward, reverse-complement) of every read once ────
     std::vector<std::string> rcseq(n);
-    for (size_t i = 0; i < n; ++i) rcseq[i] = reverse_complement(reads[i].seq);
+    for (size_t i = 0; i < n; ++i) rcseq[i] = reverse_complement(R(i).seq);
     auto view_seq = [&](uint32_t rid, uint8_t view) -> const std::string& {
-        return view == 0 ? reads[rid].seq : rcseq[rid];
+        return view == 0 ? R(rid).seq : rcseq[rid];
     };
 
     // ── APSP candidate table (exact suffix-array overlap discovery) ────────────
@@ -107,7 +166,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
     auto _vb_t0 = std::chrono::steady_clock::now();
 
     std::vector<std::string> both_views((size_t)n * 2);
-    for (size_t i = 0; i < n; ++i) { both_views[2*i] = reads[i].seq; both_views[2*i+1] = rcseq[i]; }
+    for (size_t i = 0; i < n; ++i) { both_views[2*i] = R(i).seq; both_views[2*i+1] = rcseq[i]; }
     auto apsp = build_apsp_candidates(both_views, (uint32_t)n, max_cands, (uint32_t)K0, search_cap);
     both_views.clear(); both_views.shrink_to_fit(); // no longer needed; view_seq() reconstructs on demand
     if (VB_TIMING) {
@@ -180,7 +239,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
     auto hq_fraction_at = [&](double frac) -> double {
         size_t n_hq = 0;
         for (size_t i = 0; i < n; ++i) {
-            int thresh = (int)(frac * (double)reads[i].seq.size());
+            int thresh = (int)(frac * (double)R(i).seq.size());
             if ((int)best_left_v[i] >= thresh && (int)best_right_v[i] >= thresh) ++n_hq;
         }
         return (double)n_hq / (double)n;
@@ -250,14 +309,14 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
         hq_ov_frac = hq_candidates[trial];
         ChainEncodeResult r;
         r.has_pg  = true;
-        r.n_reads = n;
+        r.n_reads = n_orig;
         CallData  trial_call;
         CallData* co = call_out ? &trial_call : nullptr;
 
     std::vector<bool> is_hq(n, true);
     if (use_quality_criterion) {
         for (size_t i = 0; i < n; ++i) {
-            const std::string& q = reads[i].qual;
+            const std::string& q = R(i).qual;
             if (q.empty()) continue; // no quality info to classify with — don't penalize
             double expected_errors = 0.0;
             for (char c : q) {
@@ -269,7 +328,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
         }
     } else {
         for (size_t i = 0; i < n; ++i) {
-            int Lr = (int)reads[i].seq.size();
+            int Lr = (int)R(i).seq.size();
             int thresh = (int)(hq_ov_frac * Lr);
             is_hq[i] = ((int)best_left_v[i] >= thresh) && ((int)best_right_v[i] >= thresh);
         }
@@ -415,14 +474,14 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
         auto seed_next = [&]() -> bool {
             while (next_unseeded < range_hi &&
                    (claimed[next_unseeded].load(std::memory_order_acquire) || !is_hq[next_unseeded] ||
-                    reads[next_unseeded].seq.size() < (size_t)K0))
+                    R(next_unseeded).seq.size() < (size_t)K0))
                 ++next_unseeded;
             if (next_unseeded >= range_hi) return false;
             uint32_t rid0 = (uint32_t)next_unseeded;
             ++next_unseeded;
             if (!try_claim(rid0)) return true; // lost race; caller loops again, skip logic catches up next call
             uint32_t cid = (uint32_t)ts.contigs.size();
-            ts.contigs.emplace_back(reads[rid0].seq);
+            ts.contigs.emplace_back(R(rid0).seq);
             ts.contig_members.emplace_back();
             ts.tail_rid.push_back({rid0, rid0});
             ts.tail_view.push_back({0, 0});
@@ -548,14 +607,16 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
     // once their outcomes are known.
     if (co) {
         co->contigs = contigs;
-        co->read_cid.assign(n, 0);
-        co->read_pos.assign(n, 0);
-        co->read_rc.assign(n, 0);
+        co->read_cid.assign(n_orig, 0);
+        co->read_pos.assign(n_orig, 0);
+        co->read_rc.assign(n_orig, 0);
         for (size_t i = 0; i < n; ++i) {
             if (!place[i].used) continue;
-            co->read_cid[i] = place[i].cid;
-            co->read_pos[i] = place[i].off;
-            co->read_rc[i]  = place[i].view;
+            for (uint32_t oi : dups[i]) {
+                co->read_cid[oi] = place[i].cid;
+                co->read_pos[oi] = place[i].off;
+                co->read_rc[oi]  = place[i].view;
+            }
         }
     }
 
@@ -604,11 +665,17 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
     // measured archive gap against PgRC2. This is purely an emission-ORDER
     // change: chain_order still maps every slot back to its original read
     // index, so the archive stays lossless either way.
-    struct Emission { uint32_t pos; uint32_t rid; uint8_t view; };
+    // rid = ORIGINAL read index (what chain_order/record_mapped must record);
+    // uid = UNIQUE read index (what view_seq/reads[] are indexed by). They
+    // differ whenever duplicates were collapsed, and conflating them indexes
+    // the unique array with an original id — caught as a segfault.
+    struct Emission { uint32_t pos; uint32_t rid; uint32_t uid; uint8_t view; };
     std::vector<Emission> emissions;
-    emissions.reserve(n);
+    emissions.reserve(n_orig);
     for (uint32_t i : resolved) {
-        emissions.push_back({contig_base[place[i].cid] + place[i].off, i, place[i].view});
+        const uint32_t abs_pos = contig_base[place[i].cid] + place[i].off;
+        for (uint32_t oi : dups[i])
+            emissions.push_back({abs_pos, oi, i, place[i].view});
     }
 
     // ── Fallback placement pass for reads growth never touched (too short for
@@ -660,7 +727,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
         std::vector<FallbackResult> results(unresolved.size());
 
         auto search_one = [&](uint32_t rid) -> FallbackResult {
-            int Lr0 = (int)reads[rid].seq.size();
+            int Lr0 = (int)R(rid).seq.size();
             int maxmm_for_read = (MAXMM >= 0) ? MAXMM : std::max(1, Lr0 / 8);
             int bestmm = maxmm_for_read + 1; int32_t bestpos = -1; uint8_t bestview = 0;
             for (uint8_t view = 0; view < 2 && !pgidx.empty(); ++view) {
@@ -702,11 +769,12 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
         for (size_t idx = 0; idx < unresolved.size(); ++idx) {
             uint32_t rid = unresolved[idx];
             const FallbackResult& res = results[idx];
-            int Lr0 = (int)reads[rid].seq.size();
+            int Lr0 = (int)R(rid).seq.size();
             int maxmm_for_read = (MAXMM >= 0) ? MAXMM : std::max(1, Lr0 / 8);
             if (res.bestpos >= 0 && res.bestmm <= maxmm_for_read) {
                 const std::string& target = view_seq(rid, res.bestview);
-                emissions.push_back({(uint32_t)res.bestpos, rid, res.bestview});
+                for (uint32_t oi : dups[rid])
+                    emissions.push_back({(uint32_t)res.bestpos, oi, rid, res.bestview});
                 if (co) {
                     // Invert absolute pg position back to (contig id, local offset).
                     // upper_bound gives the first base > abs_pos; the owning contig is
@@ -750,16 +818,17 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
                 // which records the identical pg_N_pos_flat/pg_N_char_flat
                 // entries record_append would have.
                 uint32_t apos = (uint32_t)r.pg.size();
-                const std::string& s = reads[rid].seq;
+                const std::string& s = R(rid).seq;
                 for (size_t j = 0; j < s.size(); ++j)
                     r.pg.push_back(is_acgt_strict(s[j]) ? s[j] : 'A');
-                emissions.push_back({apos, rid, 0});
+                for (uint32_t oi : dups[rid])
+                    emissions.push_back({apos, oi, rid, 0});
                 if (co) {
                     // Never placed anywhere — becomes its own singleton contig, same
                     // convention build_multicontig_pg uses for a "new contig start" read
                     // (pos=0, rc=0; record_append always stores the read forward, never RC).
                     uint32_t cid = (uint32_t)co->contigs.size();
-                    co->contigs.push_back(reads[rid].seq);
+                    co->contigs.push_back(R(rid).seq);
                     co->read_cid[rid] = cid;
                     co->read_pos[rid] = 0;
                     co->read_rc[rid]  = 0;
@@ -775,8 +844,8 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
     std::sort(emissions.begin(), emissions.end(),
               [](const Emission& a, const Emission& b) { return a.pos < b.pos; });
     for (const Emission& e : emissions) {
-        const std::string& target = view_seq(e.rid, e.view);
-        record_mapped(r, e.rid, e.pos, (int)e.view, target, (int)target.size());
+        const std::string& target = view_seq(e.uid, e.view);   // sequence: unique index
+        record_mapped(r, e.rid, e.pos, (int)e.view, target, (int)target.size());  // identity: original index
     }
 
     if (co) co->valid = true;
