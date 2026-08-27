@@ -3,6 +3,7 @@
 #include "decoder.h"
 #include "akc.h"
 #include "chain_encoder.h"
+#include "vodbg_pg.h"
 #include "caller.h"
 #include "fastq_io.h"
 #include "tensor.h"
@@ -251,17 +252,19 @@ int main(int argc, char** argv) {
         if (i + 1 >= argc) { fprintf(stderr, "call: need <reads.fastq[.gz]> <out.vcf>\n"); return 1; }
         std::string reads_path = argv[i++];
         std::string vcf_path   = argv[i++];
-        // Use the COMPRESSION-default assembly (tight placement MAXMM=4/OVERR=0.06 +
-        // merge-on). Measured to call BEST (F1 ~0.95 across 3 regions incl held-out,
-        // robust to exact-position matching) — the loose config the old bwa-pileup
-        // pipeline used force-places paralog/repeat reads and injects noisy columns.
-        // This also means compression and calling share ONE assembly config (enables
-        // the fused compress-and-call one-pass mode). Env vars still override.
+        // Use the COMPRESSION-default assembly. Measured to call BEST (F1 ~0.95
+        // across 3 regions incl held-out, robust to exact-position matching) — the
+        // loose config the old bwa-pileup pipeline used force-places paralog/repeat
+        // reads and injects noisy columns. This also means compression and calling
+        // share ONE assembly config (enables the fused compress-and-call one-pass
+        // mode), so this dispatch MUST track encode_wgs_chain_pg's default:
+        // build_vodbg_pg ("Method B") unless ARCS_LEGACY_ASSEMBLY is set.
         std::vector<Read> reads;
         { FASTQReader rdr(reads_path); Read r; while (rdr.next(r)) reads.push_back(std::move(r)); }
         fprintf(stderr, "[CALL] loaded %zu reads; assembling...\n", reads.size());
         CallData cd;
-        (void)build_multicontig_pg(reads, &cd);
+        if (getenv("ARCS_LEGACY_ASSEMBLY")) (void)build_multicontig_pg(reads, &cd);
+        else                                 (void)build_vodbg_pg(reads, &cd);
         int nc = run_variant_call(reads, cd, vcf_path);
         return nc < 0 ? 1 : 0;
 

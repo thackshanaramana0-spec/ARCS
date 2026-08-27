@@ -1573,18 +1573,22 @@ static std::vector<uint8_t> compress_pg(
                 pg.size(), dna_raw.size() - 8,
                 8.0 * (double)(dna_raw.size() - 8) / (double)pg.size());
     };
-    if (!getenv("ARCS_REPEAT_ELIM")) materialize_dna_baseline();
+    if (getenv("ARCS_NO_REPEAT_ELIM")) materialize_dna_baseline();
 
-    // ── Repeat elimination + ARCS-DNA (format 0x09, opt-in ARCS_REPEAT_ELIM) ──
+    // ── Repeat elimination + ARCS-DNA (format 0x09, DEFAULT; ARCS_NO_REPEAT_ELIM=1 disables) ──
     // Self-referential exact-repeat pass over the finished pg (see repeat_elim.h):
     // catches distant/non-adjacent duplicate content the placement pass's single
     // greedy forward walk doesn't dedupe (transposons, multi-copy genes, etc.).
     // Purely a compression-time transform — repeat_elim_decode always restores
     // the exact original pg before anything else (read positions, variant
     // calling, arcs export/coverage/query) ever sees it. Keep-smaller gated
-    // against plain ARCS-DNA above, so it can never regress the archive.
+    // against plain ARCS-DNA above, so it can never regress the archive — which
+    // is why it is safe as the DEFAULT rather than opt-in. It must be the
+    // default: every locked size result against PgRC2 was measured with it on,
+    // and Claim-1 runs pass zero flags. ARCS_REPEAT_ELIM is still accepted and
+    // ignored (scripts set it); ARCS_NO_REPEAT_ELIM=1 is the escape hatch.
     static thread_local bool in_repeat_elim = false;
-    if (getenv("ARCS_REPEAT_ELIM") && !in_repeat_elim) {
+    if (!getenv("ARCS_NO_REPEAT_ELIM") && !in_repeat_elim) {
         // 20, not growth's own K0=32: growth needs a longer floor because a
         // short overlap is a real ambiguity risk for a MERGE decision: safe
         // once contigs are already finished and fixed, and this pass is pure
@@ -2176,10 +2180,14 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
                    "chain-pg supports reads up to 65535 bp (got " +
                    std::to_string(r.seq.size()) + " bp); use standard mode for long reads");
 
-    // Assembler selection. The multi-contig greedy assembler is the default
-    // (smallest pg + sequence stream). Legacy assemblers remain available:
-    //   ARCS_CHAINPG_CHAIN → greedy linear chain
-    //   ARCS_CHAINPG_DEDUP → single-pass frontier dedup
+    // Assembler selection. build_vodbg_pg ("Method B", suffix-array/APSP global
+    // greedy overlap) is the default — it produces both the smallest archive and
+    // the shortest wall time of every assembler here. Alternatives remain
+    // available for measurement:
+    //   ARCS_LEGACY_ASSEMBLY → previous default (round-robin shard + merge)
+    //   ARCS_KA_ASSEMBLY     → "Method A" k-mer anchor growth
+    //   ARCS_CHAINPG_CHAIN   → greedy linear chain
+    //   ARCS_CHAINPG_DEDUP   → single-pass frontier dedup
     const bool ENC_TIMING = getenv("ARCS_ENC_TIMING") != nullptr;
     auto _en = [] { return std::chrono::steady_clock::now(); };
     auto _ep = _en();
@@ -2190,16 +2198,6 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
         result = chain_enc.encode(reads);
     } else if (getenv("ARCS_CHAINPG_DEDUP")) {
         result = build_dedup_pg(reads);
-    } else if (getenv("ARCS_DBG_ASSEMBLY")) {
-        // Opt-in alternative assembler (see vodbg_pg.h): global greedy-overlap
-        // contig growth over a suffix-array/APSP overlap table, instead of the
-        // default's order-dependent single-pass placement. Produces the same
-        // ChainEncodeResult pg_* fields, so nothing downstream (serialization,
-        // quality, decoder, arcs export/coverage/query) changes. CallData
-        // (--call) support was added directly to build_vodbg_pg — pass
-        // call_capture_ through so Method B can actually serve --call requests
-        // instead of silently falling through to the default assembler.
-        result = build_vodbg_pg(reads, call_capture_);
     } else if (getenv("ARCS_KA_ASSEMBLY")) {
         // Opt-in "Method A" assembler (see kmer_anchor_pg.h): global k-mer
         // occurrence index + mismatch-tolerant anchor growth, isolated into
@@ -2226,7 +2224,15 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
                 fprintf(stderr, "[ENC] parallel_shard_assemble_ka: N_shards=%d\n", N_ka_shards);
             result = parallel_shard_assemble_ka(reads, N_ka_shards);
         }
-    } else {
+    } else if (getenv("ARCS_LEGACY_ASSEMBLY")) {
+        // Legacy assembler (the default before Method B). Kept as an escape
+        // hatch only: measured on three dissimilar datasets it loses on BOTH
+        // axes against build_vodbg_pg — yeast 5,847,911 B / 33.2 s vs
+        // 4,496,990 B / 20.4 s; E. coli 4,037,314 B / 31.0 s vs 3,364,757 B /
+        // 22.4 s; P. falciparum 3,286,098 B / 42.9 s vs 2,963,825 B / 40.6 s.
+        // The gap is structural: this path shards reads round-robin, so each
+        // shard sees only 1/N of the reads and loses global overlap visibility.
+        //
         // Parallel shard assembly: auto-scale to min(4, hw_cores) shards.
         // Disabled when: (1) call_capture_ is set (--call mode requires a unified
         //   assembly so CallData indices are consistent with the full read set);
@@ -2245,6 +2251,19 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
                 fprintf(stderr, "[ENC] parallel_shard_assemble: N_shards=%d\n", N_shards);
             result = parallel_shard_assemble(reads, N_shards);
         }
+    } else {
+        // DEFAULT assembler, "Method B" (see vodbg_pg.h): global greedy-overlap
+        // contig growth over a suffix-array/APSP exact-overlap table, instead of
+        // the legacy path's order-dependent single-pass placement. Produces the
+        // same ChainEncodeResult pg_* fields, so nothing downstream
+        // (serialization, quality, decoder, arcs export/coverage/query) changes.
+        // CallData (--call) support lives directly in build_vodbg_pg — pass
+        // call_capture_ through so --call is served by the same assembly.
+        //
+        // ARCS_DBG_ASSEMBLY=1 used to select this path; it is now the default,
+        // so that variable is accepted and ignored (scripts still set it).
+        // ARCS_LEGACY_ASSEMBLY=1 restores the previous shard-based default.
+        result = build_vodbg_pg(reads, call_capture_);
     }
     ARCS_CHECK(result.has_pg, "chain-pg: pg not built");
     if (getenv("ARCS_DUMP_PG_ENC")) {

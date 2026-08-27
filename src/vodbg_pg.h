@@ -1,7 +1,7 @@
 #pragma once
 #include "chain_encoder.h"
 
-// ── Variable-order-style greedy overlap assembler (opt-in, ARCS_DBG_ASSEMBLY=1) ──
+// ── Variable-order-style greedy overlap assembler — "Method B", the DEFAULT ──
 //
 // Motivation (see repeat_elim.h / session notes for the full diagnosis): ARCS's
 // default assembler (build_multicontig_pg) places each read in a single forward
