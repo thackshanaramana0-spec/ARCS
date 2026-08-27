@@ -588,22 +588,24 @@ std::vector<std::string> ChainSequenceDecoder::decode_sequences(
 
 // ── Dedup pseudogenome assembler ─────────────────────────────────────────────
 // See chain_encoder.h for the design + losslessness argument.
-namespace {
-
 // Strict uppercase-ACGT test. The pg/contigs store ONLY strict A/C/G/T (everything
 // else — 'N', lowercase acgt, IUPAC codes, any other byte — is masked to 'A' and its
 // literal byte saved in pg_N_char_flat for exact restoration). encode_base() is
 // case-insensitive (good for k-mer seeding/mapping) but MUST NOT decide what goes
 // into the pg, or lowercase would silently upcase (a losslessness bug).
-static inline bool is_acgt_strict(char c) {
+// External linkage (declared in chain_encoder.h): shared with vodbg_pg.cpp, which
+// produces the same ChainEncodeResult pg_* fields via this same bookkeeping.
+bool is_acgt_strict(char c) {
     return c == 'A' || c == 'C' || c == 'G' || c == 'T';
 }
 
+namespace {
 constexpr int      DEDUP_K        = 16;    // seed length
 // Initialized once from env vars at startup — const thereafter so parallel
 // calls to build_multicontig_pg can read them without a data race.
 int MAX_CAND   = []{ const char* s = getenv("ARCS_DEDUP_CAND");   return s ? atoi(s) : 96;  }();
 int MAX_BUCKET = []{ const char* s = getenv("ARCS_DEDUP_BUCKET"); return s ? atoi(s) : 200; }();
+} // namespace
 
 // Record a read that maps onto existing pg at (pos, rc). target = RC^rc(orig).
 // Uses the read's ACTUAL length (target.size()) so variable-length reads work.
@@ -659,8 +661,6 @@ void record_append(ChainEncodeResult& r, uint32_t oi, const std::string& orig, i
     r.pg_N_counts.push_back(N_cnt);
     r.pg_qmm_counts.push_back(0);
 }
-
-} // namespace
 
 ChainEncodeResult build_dedup_pg(const std::vector<Read>& reads) {
     ChainEncodeResult r;
@@ -1381,11 +1381,84 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
         // Disable with ARCS_SHARD_NOMINZ=1 to revert to round-robin (diagnostic only).
         minz_route = (getenv("ARCS_SHARD_NOMINZ") == nullptr);
     }
+    // ── Confidence-ordered placement (ARCS_CONF_ORDER=1) ────────────────────────
+    // On repeat-heavy genomes (many near-identical k-mers), placing reads in file
+    // order means reads from a repeat family that happen to arrive BEFORE the
+    // family's first contig is well-established get rejected as "new" even though
+    // a later-arriving read from the same family would have matched fine. PgRC's
+    // greedy-longest-overlap-first strategy avoids this by resolving the most
+    // confident (least ambiguous) matches before the harder ones; we approximate
+    // that cheaply here by processing reads built from HIGH-FREQUENCY k-mers
+    // first, so common/unambiguous genome regions get a solid scaffold before
+    // repeat-adjacent reads are attempted. Measured: yeast (DRR976266) mapped rate
+    // 65.0% -> 83.6%, G* 70.4MB -> 30.6MB. Opt-in: this changes placement quality/
+    // timing but not correctness (still keep-smaller vs plain LZMA downstream, and
+    // is_hq/contig-extension rules are unchanged) -- validate before defaulting on.
+    std::vector<int> conf_order;
+    std::vector<uint32_t> conf;
+    if (getenv("ARCS_CONF_ORDER") != nullptr) {
+        std::unordered_map<uint64_t, uint32_t> kfreq;
+        kfreq.reserve((size_t)n * 2);
+        for (int i = 0; i < n; ++i) {
+            const std::string& s = reads[(size_t)i].seq;
+            const int Ls = (int)s.size();
+            for (int p = 0; p + K <= Ls; p += 4) {
+                uint64_t km;
+                if (pack_kmer(s, p, km)) ++kfreq[km];
+            }
+        }
+        conf.assign((size_t)n, 0);
+        std::vector<uint32_t> tmp;
+        for (int i = 0; i < n; ++i) {
+            const std::string& s = reads[(size_t)i].seq;
+            const int Ls = (int)s.size();
+            tmp.clear();
+            for (int p = 0; p + K <= Ls; p += 8) {
+                uint64_t km;
+                if (pack_kmer(s, p, km)) tmp.push_back(kfreq[km]);
+            }
+            if (!tmp.empty()) {
+                std::nth_element(tmp.begin(), tmp.begin() + tmp.size() / 2, tmp.end());
+                conf[(size_t)i] = tmp[tmp.size() / 2];
+            }
+        }
+        // Windowed mode (ARCS_CONF_WINDOW=<size>): confidence-sort only WITHIN
+        // fixed-size file-order blocks, instead of globally across all n reads.
+        // Global sorting fixed the mapped-rate problem but scrambles chain_order
+        // arbitrarily far from file order (a read can move from position 10 to
+        // position 4,999,990), which is exactly what makes the names/position-
+        // recovery permutation cost so large -- repeat resolution mostly only
+        // needs LOCAL context (a repeat region confuses placement because of
+        // NEARBY ambiguous reads, not reads from the opposite end of the file),
+        // so bounding the reorder to a window should keep most of the mapped-rate
+        // benefit while bounding how far chain_order can drift from file order,
+        // keeping the permutation cost small everywhere instead of large everywhere.
+        int window = 0;
+        if (const char* w = getenv("ARCS_CONF_WINDOW")) { int v = atoi(w); if (v > 0) window = v; }
+        conf_order.resize((size_t)n);
+        std::iota(conf_order.begin(), conf_order.end(), 0);
+        if (window > 0) {
+            for (int start = 0; start < n; start += window) {
+                int stop = std::min(n, start + window);
+                std::stable_sort(conf_order.begin() + start, conf_order.begin() + stop,
+                    [&](int a, int b){ return conf[(size_t)a] > conf[(size_t)b]; });
+            }
+        } else {
+            std::stable_sort(conf_order.begin(), conf_order.end(),
+                [&](int a, int b){ return conf[(size_t)a] > conf[(size_t)b]; });
+        }
+    }
+
     if (SHARD <= 1 || (size_t)n < 4 * (size_t)SHARD) {
-        std::vector<int> ids((size_t)n); std::iota(ids.begin(), ids.end(), 0);
-        // HQ reads process first: they build clean assembly; LQ reads find placements
-        // on already-built contigs rather than seeding fragmented singleton contigs.
-        std::stable_partition(ids.begin(), ids.end(), [&](int i){ return is_hq[(size_t)i]; });
+        std::vector<int> ids;
+        if (!conf_order.empty()) {
+            ids = conf_order;
+        } else {
+            ids.resize((size_t)n); std::iota(ids.begin(), ids.end(), 0);
+            // HQ reads process first: they build clean assembly; LQ reads find placements
+            // on already-built contigs rather than seeding fragmented singleton contigs.
+            std::stable_partition(ids.begin(), ids.end(), [&](int i){ return is_hq[(size_t)i]; });
+        }
         place_range(ids, contigs, index);
     } else {
         const int T = SHARD;
@@ -1412,9 +1485,16 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
                 shard_ids[sh].push_back(oi);
             }
         }
-        // Within each shard: HQ reads first so they build clean assembly before LQ reads place.
-        for (auto& sh : shard_ids)
-            std::stable_partition(sh.begin(), sh.end(), [&](int i){ return is_hq[(size_t)i]; });
+        // Within each shard: HQ reads first so they build clean assembly before LQ reads place
+        // (or, with ARCS_CONF_ORDER, highest-confidence reads first -- see above).
+        if (!conf.empty()) {
+            for (auto& sh : shard_ids)
+                std::stable_sort(sh.begin(), sh.end(),
+                    [&](int a, int b){ return conf[(size_t)a] > conf[(size_t)b]; });
+        } else {
+            for (auto& sh : shard_ids)
+                std::stable_partition(sh.begin(), sh.end(), [&](int i){ return is_hq[(size_t)i]; });
+        }
         std::vector<std::vector<std::string>> sc((size_t)T);
         std::vector<FlatPlaceIndex> si((size_t)T);
         for (auto& x : si) x.set_cap(MAX_BUCKET);
@@ -2050,10 +2130,36 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
     // Emit reads sorted by pg position so pg_pos is monotonic → the position
     // stream delta-codes to almost nothing. Names/quality follow chain_order,
     // so the output is a valid reordering of the read set (lossless).
+    //
+    // This global gpos-sort is EXACTLY why chain_order (and everything that
+    // follows it -- names, the order-preserving permutation) ends up scrambled
+    // arbitrarily far from original file order: genome position has no relation
+    // to file index for real unsorted input, so a full sort by gpos can move a
+    // read from file position 10 to chain position 4,999,990. That scramble is
+    // what makes the read-name permutation cost close to its info-theoretic
+    // ceiling (measured: matches n*log2(n)/8 almost exactly on real data).
+    //
+    // ARCS_GPOS_WINDOW=<size>: sort by gpos only WITHIN fixed-size file-order
+    // blocks instead of globally. This bounds how far any read can move from its
+    // original file index to at most one window, which bounds the permutation
+    // cost proportionally (entropy ~ log2(window) per read instead of log2(n)),
+    // while pg_pos stays monotonic WITHIN each window (a small reset jump only
+    // at window boundaries, of which there are only n/window) -- trading a
+    // little position-delta efficiency for a large names-cost reduction.
     std::vector<uint32_t> ord(n);
     std::iota(ord.begin(), ord.end(), 0u);
-    std::sort(ord.begin(), ord.end(),
-              [&](uint32_t a, uint32_t b){ return gpos[a] < gpos[b]; });
+    int gpos_window = 0;
+    if (const char* w = getenv("ARCS_GPOS_WINDOW")) { int v = atoi(w); if (v > 0) gpos_window = v; }
+    if (gpos_window > 0) {
+        for (int start = 0; start < n; start += gpos_window) {
+            int stop = std::min(n, start + gpos_window);
+            std::sort(ord.begin() + start, ord.begin() + stop,
+                      [&](uint32_t a, uint32_t b){ return gpos[a] < gpos[b]; });
+        }
+    } else {
+        std::sort(ord.begin(), ord.end(),
+                  [&](uint32_t a, uint32_t b){ return gpos[a] < gpos[b]; });
+    }
 
     for (uint32_t oi : ord) {
         int rc = pl_rc[oi];

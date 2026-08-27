@@ -3,6 +3,8 @@
 #include <chrono>
 #include "decoder.h"
 #include "dna_coder.h"
+#include "repeat_elim.h"
+#include "position_enc.h"
 #include "qual_cm.h"
 #include "fastq_io.h"
 #include "mst_encoder.h"
@@ -667,19 +669,9 @@ void ARCSDecoder::decode_amplicon(const ARCSReader& rdr, FASTQWriter& out_writer
                       ((uint32_t)perm_raw[i*4+3] << 24);
         }
 
-        // Read flat quality: n_reads × L bytes in cluster order
+        // QUALITY_DATA is now an opaque adaptive-CM bitstream (qual_cm_encode),
+        // not a flat n_reads×L buffer — read it raw, do NOT arcs_decompress it.
         auto q_blob = rdr.read_blob(BlobType::QUALITY_DATA);
-        auto q_raw  = arcs_decompress(q_blob.data(), q_blob.size());
-
-        // Derive L from the stored data: encoder wrote n_reads × L bytes total.
-        // Do NOT use unique_seqs[0].size() — after canonical-key sorting, the first
-        // unique sequence may differ from reads[0] (which the encoder used as L),
-        // causing a per-read drift of ΔL bytes in every quality slice. Dividing
-        // q_raw.size() by n_perm recovers the exact L the encoder used, regardless
-        // of sequence length variation or sort order.
-        int L = (n_perm > 0 && !q_raw.empty() && q_raw.size() % n_perm == 0)
-                ? (int)(q_raw.size() / n_perm)
-                : (unique_seqs.empty() ? 0 : (int)unique_seqs[0].size());
 
         // Use n_perm as the authoritative read count (equals n_reads for valid archives)
         size_t n = (n_reads > 0) ? n_reads : n_perm;
@@ -692,30 +684,41 @@ void ARCSDecoder::decode_amplicon(const ARCSReader& rdr, FASTQWriter& out_writer
             output[i].name = (i < names.size()) ? names[i] : ("read_" + std::to_string(i));
         }
 
-        // Assign sequences and qualities via permutation
-        // Also need to map cluster position p → cluster index → sequence
-        size_t cluster_pos = 0; // current position in flat cluster-sorted sequence
+        // ── Pass 1: resolve sequences only (qual_cm_decode needs them first,
+        // exactly as the encoder saw them, for sequence-conditioned quality) ──
+        size_t cluster_pos = 0;
         for (size_t ci = 0; ci < unique_seqs.size() && cluster_pos < n; ++ci) {
             uint32_t cnt = (ci < counts.size()) ? counts[ci] : 1;
             for (uint32_t j = 0; j < cnt && cluster_pos < n; ++j, ++cluster_pos) {
                 size_t p    = cluster_pos;
                 uint32_t oi = (p < perm.size()) ? perm[p] : (uint32_t)p;
                 if (oi >= n) continue; // guard against corrupt archive
-
                 output[oi].seq = unique_seqs[ci];
-
-                // Quality slice: stride is L (= max_L for mixed-length inputs).
-                // Trim to the actual sequence length so shorter reads in a
-                // mixed-length file recover their original quality strings exactly.
-                int actual_L = (int)unique_seqs[ci].size();
-                size_t q_off = p * (size_t)L;
-                if (actual_L > 0 && q_off + actual_L <= q_raw.size()) {
-                    output[oi].qual.assign(
-                        (const char*)q_raw.data() + q_off, actual_L);
-                } else {
-                    output[oi].qual.assign(actual_L > 0 ? actual_L : L, '!');
-                }
             }
+        }
+        for (size_t i = 0; i < n; ++i)
+            if (output[i].seq.empty())
+                output[i].seq.assign(1, 'N'); // corrupt-archive guard, L unknown yet
+
+        int L = 0;
+        for (size_t i = 0; i < n; ++i)
+            if ((int)output[i].seq.size() > L) L = (int)output[i].seq.size();
+
+        // ── Pass 2: adaptive-CM quality decode, conditioned on resolved seqs ──
+        std::vector<std::string> seqvec(n);
+        std::vector<int>         rlens(n);
+        for (size_t i = 0; i < n; ++i) { seqvec[i] = output[i].seq; rlens[i] = (int)output[i].seq.size(); }
+        std::vector<std::vector<bool>> dev_sets(n);
+        for (size_t i = 0; i < n; ++i) dev_sets[i].assign((size_t)rlens[i], false);
+
+        std::vector<std::vector<uint8_t>> rq_out(n);
+        for (size_t i = 0; i < n; ++i) rq_out[i].assign((size_t)rlens[i], 0);
+        bool q_ok = qual_cm_decode(q_blob, perm, dev_sets, L, rq_out, &seqvec, &rlens);
+        ARCS_CHECK(q_ok, "amplicon: adaptive-CM quality decode failed");
+        for (size_t i = 0; i < n; ++i) {
+            output[i].qual.resize(rlens[i]);
+            for (int j = 0; j < rlens[i]; ++j)
+                output[i].qual[(size_t)j] = (char)(rq_out[i][(size_t)j] + 33);
         }
 
         // Write in original order
@@ -1162,6 +1165,67 @@ static std::string decompress_pg(const std::vector<uint8_t>& blob) {
         std::string pg; for (auto& p : parts) pg += p;
         return pg;
     }
+    if (flag == 0x09) {
+        // Repeat-elimination wrapper (see repeat_elim.h): [0x09]
+        // [u32 orig_pg_len][u32 min_match_len]
+        // [u32 literal_blob_len][literal_blob]           -- nested pg_blob, recurse
+        // [u32 n_matches]
+        // [u32 off_blob_len][off_blob]                   -- arcs_compress'd u32 LE src offsets
+        // [u32 len_blob_len][len_blob]                   -- arcs_compress'd varint (len-min_match_len)
+        auto rd_u32 = [&](size_t& p) -> uint32_t {
+            uint32_t v = (uint32_t)blob[p] | ((uint32_t)blob[p+1]<<8)
+                       | ((uint32_t)blob[p+2]<<16) | ((uint32_t)blob[p+3]<<24);
+            p += 4; return v;
+        };
+        size_t p = 1;
+        if (blob.size() < p + 4) return {};
+        uint32_t orig_pg_len = rd_u32(p);
+        if (blob.size() < p + 4) return {};
+        uint32_t min_match_len = rd_u32(p);
+        if (blob.size() < p + 4) return {};
+        uint32_t literal_blob_len = rd_u32(p);
+        if (blob.size() < p + literal_blob_len) return {};
+        std::vector<uint8_t> literal_blob(blob.begin() + p, blob.begin() + p + literal_blob_len);
+        p += literal_blob_len;
+        std::string literal = decompress_pg(literal_blob);
+
+        if (blob.size() < p + 4) return {};
+        uint32_t n_matches = rd_u32(p);
+        if (blob.size() < p + 4) return {};
+        uint32_t off_blob_len = rd_u32(p);
+        if (blob.size() < p + off_blob_len) return {};
+        auto off_raw = arcs_decompress(blob.data() + p, off_blob_len);
+        p += off_blob_len;
+        if (blob.size() < p + 4) return {};
+        uint32_t len_blob_len = rd_u32(p);
+        if (blob.size() < p + len_blob_len) return {};
+        auto len_raw = arcs_decompress(blob.data() + p, len_blob_len);
+        p += len_blob_len;
+
+        // rc_blob: packed is_rc bitset, appended after len_blob (see encoder.cpp).
+        std::vector<uint8_t> rc_bits;
+        if (blob.size() >= p + 4) {
+            uint32_t rc_blob_len = rd_u32(p);
+            if (blob.size() >= p + rc_blob_len) {
+                rc_bits = arcs_decompress(blob.data() + p, rc_blob_len);
+                p += rc_blob_len;
+            }
+        }
+
+        if (off_raw.size() < (size_t)n_matches * 4) return {};
+        std::vector<RepeatMatch> matches; matches.reserve(n_matches);
+        const uint8_t* lp = len_raw.data();
+        const uint8_t* lend = lp + len_raw.size();
+        for (uint32_t k = 0; k < n_matches; ++k) {
+            uint32_t src = (uint32_t)off_raw[k*4] | ((uint32_t)off_raw[k*4+1]<<8)
+                         | ((uint32_t)off_raw[k*4+2]<<16) | ((uint32_t)off_raw[k*4+3]<<24);
+            uint64_t run_len   = read_varint(lp, lend);
+            uint64_t len_extra = read_varint(lp, lend);
+            uint8_t is_rc = (k/8 < rc_bits.size()) ? (uint8_t)((rc_bits[k/8] >> (k%8)) & 1u) : 0;
+            matches.push_back({(uint32_t)run_len, src, (uint32_t)(len_extra + min_match_len), is_rc});
+        }
+        return repeat_elim_decode(literal, matches, orig_pg_len);
+    }
     if (flag == 0x01) {
         auto raw = arcs_decompress(payload, plen);
         return std::string(raw.begin(), raw.end());
@@ -1437,15 +1501,27 @@ void ARCSDecoder::decode_wgs_chain_pg(const ARCSReader& rdr, FASTQWriter& out_wr
     if (qmode == 0x07) {
         // Adaptive CM quality coder (fqzcomp-style). No transmitted model.
         // Per-read length (rlens) supports variable-length reads.
+        // Leading self-describing header (see encoder.cpp): byte 0 = dense-alphabet
+        // remap table size (0 = no remap applied), followed by that many raw Phred
+        // values (dense index d -> raw value raw_of_dense[d]).
+        ARCS_CHECK(!q_data.empty(), "chain-pg: adaptive-CM quality data empty");
+        uint8_t remap_n = q_data[0];
+        ARCS_CHECK(q_data.size() >= (size_t)(1 + remap_n), "chain-pg: adaptive-CM remap header truncated");
+        std::vector<uint8_t> raw_of_dense(q_data.begin() + 1, q_data.begin() + 1 + remap_n);
+        std::vector<uint8_t> q_body(q_data.begin() + 1 + remap_n, q_data.end());
+
         std::vector<std::vector<uint8_t>> rq_out(n);
         for (size_t i = 0; i < n; ++i) rq_out[i].assign((size_t)rlens[i], 0);
-        bool ok = qual_cm_decode(q_data, sorted_order, dev_sets, L, rq_out, &seqs, &rlens);
+        bool ok = qual_cm_decode(q_body, sorted_order, dev_sets, L, rq_out, &seqs, &rlens);
         ARCS_CHECK(ok, "chain-pg: adaptive-CM quality decode failed");
         quals.assign(n, std::string());
         for (size_t i = 0; i < n; ++i) {
             quals[i].resize((size_t)rlens[i]);
-            for (int j = 0; j < rlens[i]; ++j)
-                quals[i][(size_t)j] = (char)(rq_out[i][(size_t)j] + 33);
+            for (int j = 0; j < rlens[i]; ++j) {
+                uint8_t dv = rq_out[i][(size_t)j];
+                uint8_t raw = (remap_n > 0 && dv < raw_of_dense.size()) ? raw_of_dense[dv] : dv;
+                quals[i][(size_t)j] = (char)(raw + 33);
+            }
         }
     } else {
         MSTSequenceDecoder mst_dec;

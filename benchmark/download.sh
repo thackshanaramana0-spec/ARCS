@@ -188,8 +188,10 @@ for IND in HG002 HG003 HG004 HG005; do
     pinfo "Discovering BAM in $BASE"
 
     # Find the largest WGS BAM (highest coverage) in the bucket
-    BAM_KEY=$(aws s3 ls --no-sign-request "$BASE/" --recursive 2>/dev/null \
-        | grep '\.bam$' | grep -v '\.bai' | grep -iv 'indel\|sv\|snv\|phased\|trio' \
+    # (pipefail disabled in this subshell: `sort | head -1` SIGPIPEs sort when
+    # head exits early, which pipefail would otherwise treat as a failure)
+    BAM_KEY=$(set +o pipefail; aws s3 ls --no-sign-request "$BASE/" --recursive 2>/dev/null \
+        | grep '\.bam$' | grep -v '\.bai' | grep -iv 'indel\|sv\|snv\|phased' \
         | sort -k3 -n -r | head -1 | awk '{print $4}')
 
     if [ -z "$BAM_KEY" ]; then
@@ -212,8 +214,8 @@ for IND in HG002 HG003 HG004 HG005; do
     TMPFQ="$DATA_DIR/${IND}_chr20_full.fq"
     pinfo "Streaming chr20 reads from S3 (this takes a few minutes)..."
     export HTS_S3_ADDRESS_STYLE=path
-    samtools view -b --no-sign-request "$S3_BAM" chr20 2>/dev/null \
-        | samtools sort -n -@ "$JOBS" \
+    samtools view -b "$S3_BAM" chr20 2>/dev/null \
+        | samtools sort -n -@ "$JOBS" -T "/tmp/samtools_sort_tmp/${IND}" \
         | samtools fastq -o "$TMPFQ" - 2>/dev/null \
         || pfail "$IND: samtools S3 stream failed — check htslib S3 support: samtools view --version"
 

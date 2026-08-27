@@ -45,7 +45,7 @@ phase "1" "Dataset discovery in $DATA_DIR"
 mapfile -t FQ_FILES < <(find "$DATA_DIR" -maxdepth 1 \( -name "*.fq" -o -name "*.fastq" \) \
     ! -name "*_2.fq" ! -name "*_2.fastq" \
     ! -name "HG00*.fq" ! -name "HG00*.fastq" \
-    | sort)
+    -printf '%s %p\n' | sort -n | cut -d' ' -f2-)
 if [ ${#FQ_FILES[@]} -eq 0 ]; then
     pfail "no .fq or .fastq files found in $DATA_DIR"
 fi
@@ -158,12 +158,12 @@ for SRC in "${FQ_FILES[@]}"; do
         A="$WD/$DS.spring"
         DEC="$WD/$DS.spring.dec"
         TF=/tmp/time_spring_c_$$
-        /usr/bin/time -v spring -c -i "$IN" -o "$A" -t "$NPROC" -g 2>"$TF"
+        /usr/bin/time -v spring -c -i "$IN" -o "$A" -t "$NPROC" 2>"$TF"
         read -r CWALL CRAMKB <<< "$(parse_time_v "$TF")"
         ARCH=$(stat -c %s "$A")
         pinfo "SPRING compress done — archive=${ARCH}B  time=${CWALL}s  ram=${CRAMKB}KB"
         TF2=/tmp/time_spring_d_$$
-        /usr/bin/time -v spring -d -i "$A" -o "$DEC" -t "$NPROC" -g 2>"$TF2"
+        /usr/bin/time -v spring -d -i "$A" -o "$DEC" -t "$NPROC" 2>"$TF2"
         read -r DWALL DRAMKB <<< "$(parse_time_v "$TF2")"
         LL=$(losscmp "$IN" "$DEC")
         rm -f "$TF" "$TF2" "$A" "$DEC"

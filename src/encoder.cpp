@@ -1,6 +1,10 @@
 #include "encoder.h"
 #include "chain_encoder.h"
+#include "vodbg_pg.h"
+#include "kmer_anchor_pg.h"
 #include "dna_coder.h"
+#include "repeat_elim.h"
+#include "position_enc.h"
 #include "qual_cm.h"
 #include "name_num_codec.h"
 #include "bsc_codec.h"
@@ -220,16 +224,68 @@ static void arcs_tokenize(const std::string& s,
         i = j;
     }
 }
+// Separator-based alternative to arcs_tokenize. Raw digit-run splitting explodes
+// on datasets pooling multiple sequencing runs: a flowcell ID like "H73TDADXX" vs
+// "H73R4ADXX" has digits in different positions, so per-read column COUNT differs
+// and both arcs_tokenize consumers (build_columnar_names, find_monotonic_name_
+// index_column) bail entirely on the first such read — even though the file is
+// otherwise perfectly structured (measured: 74% of reads in SRR2584863 mismatch
+// read 0's column count this way).
+//
+// Fix: split on separator chars first (". _ - : = /" and space — the actual field
+// boundaries in every naming convention seen: SRA "ACC.N", Illumina ":tile:X:Y",
+// "key=value"). A separator run is always a text column. A non-separator run is
+// sub-split into digit/alpha runs ONLY if that yields <=2 pieces (a simple
+// "prefix+digits" shape like "SRR2584863" -> "SRR"+"2584863", or bare "244"):
+// this still extracts the valuable sequential/numeric fields. A run needing MORE
+// than 2 pieces (an opaque alphanumeric ID like a flowcell ID) is kept as ONE
+// text token instead — so its column count and type never depend on exactly
+// where its embedded digits happen to fall, and different flowcell IDs pool
+// consistently into the same column structure.
+static void arcs_tokenize2(const std::string& s,
+                           std::vector<std::pair<bool,std::string>>& toks) {
+    toks.clear();
+    auto is_sep = [](char c) {
+        return c=='.' || c=='_' || c=='-' || c==':' || c=='=' || c=='/' || c==' ';
+    };
+    size_t i = 0, n = s.size();
+    while (i < n) {
+        bool sep = is_sep(s[i]);
+        size_t j = i + 1;
+        while (j < n && is_sep(s[j]) == sep) ++j;
+        if (sep) {
+            toks.emplace_back(false, s.substr(i, j - i));
+        } else {
+            std::vector<std::pair<bool,std::string>> sub;
+            size_t k = i;
+            while (k < j) {
+                bool dig = (s[k] >= '0' && s[k] <= '9');
+                size_t l = k + 1;
+                while (l < j && ((s[l] >= '0' && s[l] <= '9') == dig)) ++l;
+                sub.emplace_back(dig, s.substr(k, l - k));
+                k = l;
+            }
+            if (sub.size() <= 2) {
+                for (auto& t : sub) toks.push_back(std::move(t));
+            } else {
+                toks.emplace_back(false, s.substr(i, j - i));
+            }
+        }
+        i = j;
+    }
+}
 // Find a numeric name column whose value is STRICTLY INCREASING across reads in
 // file order (e.g. the SRA sequential accession index ERR….1,.2,.3…). If present,
 // the file is sorted by that column, so read order is recoverable at decode by
 // parsing+ranking that column from the names — no explicit permutation needed.
 // Returns the column index, or -1. Tokenization matches arcs_tokenize (digit runs).
-static int find_monotonic_name_index_column(const std::vector<Read>& reads) {
+using TokenizeFn = void(*)(const std::string&, std::vector<std::pair<bool,std::string>>&);
+
+static int find_monotonic_name_index_column(const std::vector<Read>& reads, TokenizeFn tokfn) {
     size_t n = reads.size();
     if (n < 2) return -1;
     std::vector<std::pair<bool,std::string>> t0, tk;
-    arcs_tokenize(reads[0].name, t0);
+    tokfn(reads[0].name, t0);
     size_t ncols = t0.size();
     if (ncols == 0 || ncols > 255) return -1;
     // Candidate numeric columns from read 0 (no leading zeros, ≤18 digits).
@@ -246,7 +302,7 @@ static int find_monotonic_name_index_column(const std::vector<Read>& reads) {
     std::vector<bool> alive(ncols, false);
     for (int c : cand) alive[(size_t)c] = true;
     for (size_t i = 0; i < n; ++i) {
-        arcs_tokenize(reads[i].name, tk);
+        tokfn(reads[i].name, tk);
         if (tk.size() != ncols) return -1;
         bool any = false;
         for (int c : cand) {
@@ -265,12 +321,21 @@ static int find_monotonic_name_index_column(const std::vector<Read>& reads) {
     for (int c : cand) if (alive[(size_t)c]) return c;
     return -1;
 }
+// Tries the digit-run tokenizer first (already correct/optimal when the naming
+// convention has no compound alphanumeric IDs), falls back to the separator-based
+// one only if the first finds no valid monotonic column — pure upside, matches
+// the keep-smaller philosophy used everywhere else in this file.
+static int find_monotonic_name_index_column_best(const std::vector<Read>& reads) {
+    int c = find_monotonic_name_index_column(reads, arcs_tokenize);
+    if (c >= 0) return c;
+    return find_monotonic_name_index_column(reads, arcs_tokenize2);
+}
 
-static std::vector<uint8_t> build_columnar_names(const std::vector<Read>& reads) {
+static std::vector<uint8_t> build_columnar_names(const std::vector<Read>& reads, TokenizeFn tokfn) {
     size_t n = reads.size();
     if (n < 2) return {};
     std::vector<std::pair<bool,std::string>> t0;
-    arcs_tokenize(reads[0].name, t0);
+    tokfn(reads[0].name, t0);
     size_t ncols = t0.size();
     if (ncols == 0 || ncols > 255) return {};
     std::vector<bool> isdig(ncols);
@@ -279,7 +344,7 @@ static std::vector<uint8_t> build_columnar_names(const std::vector<Read>& reads)
     for (size_t c = 0; c < ncols; ++c) col[c].reserve(n);
     std::vector<std::pair<bool,std::string>> tk;
     for (size_t i = 0; i < n; ++i) {
-        arcs_tokenize(reads[i].name, tk);
+        tokfn(reads[i].name, tk);
         if (tk.size() != ncols) return {};                 // non-uniform → give up
         for (size_t c = 0; c < ncols; ++c) {
             if (tk[c].first != isdig[c]) return {};
@@ -425,6 +490,16 @@ static std::vector<uint8_t> build_columnar_names(const std::vector<Read>& reads)
 
     return (out05.size() < out04.size()) ? out05 : out04;
 }
+// Tries both tokenizers, keeps whichever produces the smaller valid result (or the
+// only valid one). The decoder is tokenizer-agnostic — it just concatenates stored
+// columns in order — so either encoding decodes identically; this can never regress.
+static std::vector<uint8_t> build_columnar_names_best(const std::vector<Read>& reads) {
+    auto a = build_columnar_names(reads, arcs_tokenize);
+    auto b = build_columnar_names(reads, arcs_tokenize2);
+    if (a.empty()) return b;
+    if (b.empty()) return a;
+    return (b.size() < a.size()) ? b : a;
+}
 
 // ── Encode names ──────────────────────────────────────────────────────────────
 std::vector<uint8_t> ARCSEncoder::encode_names(
@@ -509,7 +584,7 @@ std::vector<uint8_t> ARCSEncoder::encode_names(
         }
         names_look_illumina = (hits * 10 >= samp * 9); // ≥90% look Illumina
     }
-    if (getenv("ARCS_NAMES_NOTOK") == nullptr && n > 0 && names_look_illumina) {
+    if (getenv("ARCS_NAMES_NOTOK") == nullptr && n > 0) {
         std::string templ; templ.reserve(n * 12);
         std::vector<uint8_t> xy; xy.reserve(n * 8);
         bool tok_ok = true;
@@ -722,7 +797,7 @@ std::vector<uint8_t> ARCSEncoder::encode_names(
         if (NM_TIMING) {
             // Debug path: try all candidates sequentially for comparison.
             auto a=std::chrono::steady_clock::now(); tok03=build03(); _nt("0x03 template+XY", a);
-            a=std::chrono::steady_clock::now(); cand04=build_columnar_names(reads); _nt("columnar 0x04/0x05", a);
+            a=std::chrono::steady_clock::now(); cand04=build_columnar_names_best(reads); _nt("columnar 0x04/0x05", a);
             a=std::chrono::steady_clock::now(); plain_lz=build_plain(); _nt("plain-LZMA floor", a);
             a=std::chrono::steady_clock::now(); cand06=build06(); _nt("0x06 paired-dedup", a);
             std::vector<uint8_t> best_tok = std::move(tok03);
@@ -737,25 +812,31 @@ std::vector<uint8_t> ARCSEncoder::encode_names(
                 return best_tok;
             }
         } else {
-            // Fast path: Illumina detected → run 0x03, columnar 0x04/0x05, and 0x06.
-            // Skip plain-LZMA only (always loses when any tokenized candidate succeeds).
-            // Columnar must stay: assembly-order permutation can make 0x04/0x05 < 0x03 (DS1).
-            tok03  = build03();
-            cand04 = build_columnar_names(reads);
-            cand06 = build06();
+            // Fast path: run 0x03, columnar 0x04/0x05, and 0x06. Non-Illumina names
+            // (no ":X:Y" pattern) make build03/build06 bail (return {}) quickly via
+            // their own internal pattern checks — build_columnar_names is general
+            // (digit-run tokenization, no Illumina assumption) and is the one that
+            // matters here: it can beat plain-LZMA on any structured name (e.g. SRA's
+            // "ACCESSION.N <idx> length=L") via constant-column collapse + per-column
+            // delta/range-coding. Must keep-smaller against plain_lz explicitly now
+            // that this path is no longer gated to Illumina-only data.
+            tok03    = build03();
+            cand04   = build_columnar_names_best(reads);
+            cand06   = build06();
+            plain_lz = build_plain();
             std::vector<uint8_t> best_tok = std::move(tok03);
             const char* best_fmt = "0x03";
             if (!cand04.empty() && (best_tok.empty() || cand04.size() < best_tok.size()))
                 { best_tok = std::move(cand04); best_fmt = "0x04/0x05"; }
             if (!cand06.empty() && (best_tok.empty() || cand06.size() < best_tok.size()))
                 { best_tok = std::move(cand06); best_fmt = "0x06(PE-dedup)"; }
-            if (!best_tok.empty()) {
+            if (!best_tok.empty() && best_tok.size() < plain_lz.size() + 1) {
                 if (getenv("ARCS_NAMES_DEBUG"))
-                    fprintf(stderr, "[NAMES] chosen=%s %zu B (skipped plain-LZMA, Illumina)\n",
-                            best_fmt, best_tok.size());
+                    fprintf(stderr, "[NAMES] chosen=%s %zu B (plain=%zu B)\n",
+                            best_fmt, best_tok.size(), plain_lz.size());
                 return best_tok;
             }
-            // All tokenized candidates failed (edge case) — fall through to plain.
+            // Tokenized candidates lost or all failed — fall through to plain LZMA.
         }
     }
 
@@ -1109,37 +1190,36 @@ void ARCSEncoder::encode_amplicon(const std::vector<Read>& reads,
     auto count_bytes = arcs_compress(count_raw, 9);
     writer.add_blob(BlobType::COUNT_DATA, count_bytes);
 
-    // ── 6. Build flat quality payload (cluster order) + permutation array ────
-    // Iterate clusters in canonical sort order; within each cluster iterate reads
-    // in their order of first encounter (deterministic across runs with same input).
-    //
-    // flat_qual[p * L .. (p+1)*L - 1] = quality string of original read perm[p]
-    // perm[p] = original read index (0..n_reads-1) at cluster position p
-    //
-    // This layout places all reads from the same cluster adjacent in the quality
-    // stream: LZMA's LZ77 window covers runs of nearly-identical quality profiles,
-    // achieving ~20x compression vs uncompressed (measured on DS-5 SARS 220bp).
-    std::vector<uint8_t> flat_qual;
-    flat_qual.reserve((size_t)reads.size() * L);
+    // ── 6. Quality: adaptive context-model coder (same as WGS chain-pg path) ──
+    // perm[p] = original read index (0..n_reads-1) at cluster position p, in
+    // canonical-cluster traversal order — this is exactly the `order` semantics
+    // qual_cm_encode expects (read index visited at traversal step k).
+    // rq/seqvec are indexed by ORIGINAL read index (the frame qual_cm_encode
+    // requires for its rq/seqs arguments).
     std::vector<uint32_t> perm;
     perm.reserve(reads.size());
-
     for (size_t ci = 0; ci < n_unique; ++ci) {
-        const auto& qs  = s_quals[ci];
         const auto& idx = s_orig_idx[ci];
-        for (size_t j = 0; j < qs.size(); ++j) {
-            perm.push_back(idx[j]);
-            const std::string& q = qs[j];
-            for (int k = 0; k < L; ++k) {
-                flat_qual.push_back(k < (int)q.size() ? (uint8_t)q[k] : (uint8_t)'!');
-            }
-        }
+        for (size_t j = 0; j < idx.size(); ++j) perm.push_back(idx[j]);
     }
 
-    auto qual_bytes = arcs_compress(flat_qual, 9);
-    fprintf(stderr, "[AMP-V7*] quality: %zu reads × %d bp → %zu B compressed (%.1fx)\n",
-            reads.size(), L, qual_bytes.size(),
-            flat_qual.empty() ? 1.0 : (double)flat_qual.size() / qual_bytes.size());
+    std::vector<std::vector<uint8_t>> rq(reads.size());
+    std::vector<std::string>          seqvec(reads.size());
+    std::vector<std::vector<bool>>    dev_sets(reads.size());
+    for (size_t i = 0; i < reads.size(); ++i) {
+        const std::string& qs = reads[i].qual;
+        rq[i].assign(qs.size(), 0);
+        for (int j = 0; j < (int)qs.size(); ++j) {
+            int q = (qs[j] >= 33) ? ((unsigned char)qs[j] - 33) : 0;
+            rq[i][(size_t)j] = (uint8_t)std::min(q, 93);
+        }
+        seqvec[i] = reads[i].seq;
+        dev_sets[i].assign(reads[i].seq.size(), false); // no pg/reference in amplicon mode
+    }
+
+    auto qual_bytes = qual_cm_encode(rq, perm, dev_sets, L, &seqvec, false);
+    fprintf(stderr, "[AMP-V7*] quality: %zu reads × %d bp → %zu B compressed (adaptive-CM)\n",
+            reads.size(), L, qual_bytes.size());
     writer.add_blob(BlobType::QUALITY_DATA, qual_bytes);
 
     // ── 7. Permutation array (LZMA-9 compressed uint32_le) ───────────────────
@@ -1479,6 +1559,140 @@ static std::vector<uint8_t> compress_pg(
             pg.size(), dna_raw.size() - 8,
             8.0 * (double)(dna_raw.size() - 8) / (double)pg.size());
 
+    // ── Repeat elimination + ARCS-DNA (format 0x09, opt-in ARCS_REPEAT_ELIM) ──
+    // Self-referential exact-repeat pass over the finished pg (see repeat_elim.h):
+    // catches distant/non-adjacent duplicate content the placement pass's single
+    // greedy forward walk doesn't dedupe (transposons, multi-copy genes, etc.).
+    // Purely a compression-time transform — repeat_elim_decode always restores
+    // the exact original pg before anything else (read positions, variant
+    // calling, arcs export/coverage/query) ever sees it. Keep-smaller gated
+    // against plain ARCS-DNA above, so it can never regress the archive.
+    static thread_local bool in_repeat_elim = false;
+    if (getenv("ARCS_REPEAT_ELIM") && !in_repeat_elim) {
+        // 20, not growth's own K0=32: growth needs a longer floor because a
+        // short overlap is a real ambiguity risk for a MERGE decision: safe
+        // once contigs are already finished and fixed, and this pass is pure
+        // compression (never restructures anything), only the byte trade-off
+        // matters — measured sweep on real data (yeast_sub.fq, 1M reads):
+        // 32->3,162,707B, 24->3,148,243B, 20->3,142,807B (best), 16->3,194,765B
+        // (worse: match-record overhead now exceeds the shorter matches'
+        // savings), 12->3,642,446B (loses to plain ARCS-DNA entirely).
+        uint32_t min_match_len = 20;
+        if (const char* mm = getenv("ARCS_REPEAT_ELIM_MINLEN")) {
+            int v = atoi(mm);
+            if (v >= 8 && v <= 1000000) min_match_len = (uint32_t)v;
+        }
+        uint64_t cap_entries = 64ULL * 1024 * 1024;
+        if (const char* ce = getenv("ARCS_REPEAT_ELIM_CAP")) {
+            long long v = atoll(ce);
+            if (v > 0) cap_entries = (uint64_t)v;
+        }
+        std::string literal;
+        std::vector<RepeatMatch> matches;
+        auto t_match0 = std::chrono::steady_clock::now();
+        bool re_ok = repeat_elim_encode_cap(pg, min_match_len, cap_entries, literal, matches);
+        auto t_match1 = std::chrono::steady_clock::now();
+        if (getenv("ARCS_REPEAT_ELIM_DEBUG")) {
+            fprintf(stderr, "[REPEAT-ELIM] match pass: %.2fs\n",
+                    std::chrono::duration<double>(t_match1 - t_match0).count());
+        }
+        if (re_ok && !matches.empty()) {
+            // ── Literal coder choice ──────────────────────────────────────────────
+            // Default: run the adaptive FCM (via the normal compress_pg candidate
+            // list) — best ratio, but it's an expensive coder running a SECOND time
+            // (once already on the full pg for the baseline comparison, again here
+            // on the shrunk literal): tens of seconds even on a modest pg.
+            //
+            // ARCS_REPEAT_ELIM_FAST=1: skip that second FCM pass entirely and use
+            // plain-ASCII LZMA (vle_encode_pg) instead — no per-base adaptive
+            // modeling, dramatically cheaper. Unlike 2-bit packing (format 0x08),
+            // ASCII text keeps byte-alignment intact so LZMA still finds real
+            // repeats (measured on this pg: 2-bit ~1.56 bpb vs ASCII-LZMA ~0.98 bpb —
+            // packing to 4 bases/byte breaks match-finding for non-4-aligned
+            // repeats). This is a real trade: faster, somewhat worse ratio on this
+            // piece specifically — not a free win, so it's opt-in, not default.
+            // Wrapped in the existing format-0x07 wire layout (single VLE block) so
+            // decompress_pg needs no new code path to read it back.
+            std::vector<uint8_t> literal_blob;
+            double t_dna_s = 0, t_ascii_s = 0;
+            if (getenv("ARCS_REPEAT_ELIM_FAST")) {
+                auto t0 = std::chrono::steady_clock::now();
+                static const int SEED_LEN = 26;
+                auto part = vle_encode_pg(literal);
+                literal_blob.push_back(0x07); literal_blob.push_back(1);
+                uint32_t s = (uint32_t)part.size();
+                literal_blob.push_back(s & 0xFF); literal_blob.push_back((s>>8) & 0xFF);
+                literal_blob.push_back((s>>16) & 0xFF); literal_blob.push_back((s>>24) & 0xFF);
+                for (int k = 0; k < SEED_LEN; ++k) literal_blob.push_back((uint8_t)'A');
+                literal_blob.push_back(0x01);
+                literal_blob.insert(literal_blob.end(), part.begin(), part.end());
+                t_ascii_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            } else {
+                auto t0 = std::chrono::steady_clock::now();
+                in_repeat_elim = true;
+                literal_blob = compress_pg(literal, reads, {}, {});
+                in_repeat_elim = false;
+                t_dna_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            }
+            if (getenv("ARCS_REPEAT_ELIM_DEBUG")) {
+                fprintf(stderr, "[REPEAT-ELIM] literal dna_encode: %.2fs, ascii-lzma: %.2fs, chosen literal_blob=%zu B\n",
+                        t_dna_s, t_ascii_s, literal_blob.size());
+            }
+
+            std::vector<uint8_t> off_raw, len_raw;
+            std::vector<uint8_t> rc_bits((matches.size() + 7) / 8, 0);
+            for (size_t mi = 0; mi < matches.size(); ++mi) {
+                const auto& m = matches[mi];
+                off_raw.push_back(m.src & 0xFF); off_raw.push_back((m.src>>8) & 0xFF);
+                off_raw.push_back((m.src>>16) & 0xFF); off_raw.push_back((m.src>>24) & 0xFF);
+                write_varint(len_raw, m.run_len);
+                write_varint(len_raw, m.len - min_match_len);
+                if (m.is_rc) rc_bits[mi / 8] |= (uint8_t)(1u << (mi % 8));
+            }
+            auto off_blob = arcs_compress(off_raw, 9);
+            auto len_blob = arcs_compress(len_raw, 9);
+            auto rc_blob  = arcs_compress(rc_bits, 9);
+
+            std::vector<uint8_t> cand; cand.push_back(0x09);
+            auto put_u32 = [&](uint32_t v) {
+                cand.push_back(v & 0xFF); cand.push_back((v>>8) & 0xFF);
+                cand.push_back((v>>16) & 0xFF); cand.push_back((v>>24) & 0xFF);
+            };
+            put_u32((uint32_t)pg.size());
+            put_u32(min_match_len);
+            put_u32((uint32_t)literal_blob.size());
+            cand.insert(cand.end(), literal_blob.begin(), literal_blob.end());
+            put_u32((uint32_t)matches.size());
+            put_u32((uint32_t)off_blob.size());
+            cand.insert(cand.end(), off_blob.begin(), off_blob.end());
+            put_u32((uint32_t)len_blob.size());
+            cand.insert(cand.end(), len_blob.begin(), len_blob.end());
+            // rc_blob: packed is_rc bitset (1 bit/match, LSB-first per byte) —
+            // appended after the pre-existing fields so archives written before
+            // this field existed would simply be truncated short, never
+            // misread; this format isn't used by any shipped/frozen archive
+            // yet (opt-in research feature), so no version gate is needed.
+            put_u32((uint32_t)rc_blob.size());
+            cand.insert(cand.end(), rc_blob.begin(), rc_blob.end());
+
+            fprintf(stderr,
+                "[CHAIN-PG] repeat-elim: pg=%zu B -> literal=%zu B (%zu matches) -> %zu B total (%s ARCS-DNA %zu B)\n",
+                pg.size(), literal.size(), matches.size(), cand.size(),
+                cand.size() < best.size() ? "beats" : "loses to", best.size());
+            if (getenv("ARCS_REPEAT_ELIM_SELFCHECK")) {
+                std::string rt = repeat_elim_decode(literal, matches, (uint32_t)pg.size());
+                if (rt != pg) {
+                    size_t d = 0; while (d < rt.size() && d < pg.size() && rt[d] == pg[d]) d++;
+                    fprintf(stderr, "[CHAIN-PG] repeat-elim SELFCHECK FAILED: rt.size=%zu pg.size=%zu first_diff=%zu\n",
+                            rt.size(), pg.size(), d);
+                } else {
+                    fprintf(stderr, "[CHAIN-PG] repeat-elim selfcheck OK\n");
+                }
+            }
+            if (cand.size() < best.size()) best = std::move(cand);
+        }
+    }
+
     // ── GeCo3 subprocess (optional, try if available) ─────────────────────────
     static const char* TMP_SEQ = "arcs_pg.seq";
     static const char* TMP_CO  = "arcs_pg.seq.co";
@@ -1598,6 +1812,20 @@ static std::vector<uint8_t> serialize_chain_pg_aux(const ChainEncodeResult& r) {
         v.push_back((uint8_t)(x>>24)); v.push_back((uint8_t)((x>>16)&0xFF));
         v.push_back((uint8_t)((x>>8)&0xFF)); v.push_back((uint8_t)(x&0xFF));
     };
+    if (getenv("ARCS_AUX_DEBUG")) {
+        fprintf(stderr, "[AUX-DBG-RAW] rc=%zu mmcnt=%zu mmpos=%zu mmbase=%zu Ncnt=%zu Npos=%zu "
+                        "qmmcnt=%zu readlen=%zu Nchar=%zu (raw bytes, n=%zu)\n",
+                col_rc.size(), col_mmcnt.size(), col_mmpos.size(), col_mmbase.size(),
+                col_Ncnt.size(), col_Npos.size(), col_qmmcnt.size(), col_readlen.size(),
+                col_Nchar.size(), n);
+        fprintf(stderr, "[AUX-DBG-COMPRESSED] rc=%zu mmcnt=%zu mmpos=%zu mmbase=%zu Ncnt=%zu Npos=%zu "
+                        "qmmcnt=%zu readlen=%zu Nchar=%zu (each column compressed independently)\n",
+                arcs_compress(col_rc, 9).size(), arcs_compress(col_mmcnt, 9).size(),
+                arcs_compress(col_mmpos, 9).size(), arcs_compress(col_mmbase, 9).size(),
+                arcs_compress(col_Ncnt, 9).size(), arcs_compress(col_Npos, 9).size(),
+                arcs_compress(col_qmmcnt, 9).size(), arcs_compress(col_readlen, 9).size(),
+                arcs_compress(col_Nchar, 9).size());
+    }
     std::vector<uint8_t> out;
     pu32(out, (uint32_t)col_rc.size());
     pu32(out, (uint32_t)col_mmcnt.size());
@@ -1635,11 +1863,22 @@ static ChainEncodeResult parallel_shard_assemble(
         const std::vector<Read>& reads, int N_shards) {
     const int n = (int)reads.size();
 
-    // Round-robin split: shard s gets read indices s, s+N, s+2N, ...
+    // Round-robin split: shard s gets read indices s, s+N, s+2N, ... (each shard
+    // sees the full genome at 1/N coverage -- good for assembly quality, but the
+    // resulting chain_order interleaves file-order positions arbitrarily far apart
+    // when shards are concatenated, which is what makes names/permutation cost
+    // large. ARCS_SHARD_CONTIG=1: use contiguous file-order blocks instead (shard
+    // s = reads[s*n/N .. (s+1)*n/N)) so each shard -- and the merged result -- stays
+    // close to file order, keeping names cheap (combined with ARCS_GPOS_WINDOW)
+    // while keeping N-way parallelism (no need for ARCS_PAR_SHARDS=1 serial mode).
+    // Tradeoff: each shard now sees only a contiguous slice of the genome instead
+    // of a uniform 1/N sample -- validate ratio impact before relying on this.
+    const bool shard_contig = (getenv("ARCS_SHARD_CONTIG") != nullptr);
     std::vector<std::vector<Read>>     shard_reads((size_t)N_shards);
     std::vector<std::vector<uint32_t>> shard_to_global((size_t)N_shards);
     for (int i = 0; i < n; ++i) {
-        int s = i % N_shards;
+        int s = shard_contig ? (int)((int64_t)i * N_shards / n) : (i % N_shards);
+        if (s >= N_shards) s = N_shards - 1;
         shard_reads[(size_t)s].push_back(reads[(size_t)i]);
         shard_to_global[(size_t)s].push_back((uint32_t)i);
     }
@@ -1701,6 +1940,78 @@ static ChainEncodeResult parallel_shard_assemble(
     return merged;
 }
 
+// ── parallel_shard_assemble_ka ────────────────────────────────────────────────
+// Same shard-and-merge pattern as parallel_shard_assemble above, applied to
+// build_kmer_anchor_pg ("Method A") instead of build_multicontig_pg. Method A
+// has no shared mutable state across calls (its k-mer index and growth state
+// are all local to the function), so this drops in with zero changes to that
+// file — confirmed embarrassingly parallel: each shard's index build and
+// growth loop are fully independent, unlike Method B's suffix-array
+// construction (a global sort over the whole text, with a genuinely
+// sequential-dependency LCP step — not a good fit for this same pattern).
+static ChainEncodeResult parallel_shard_assemble_ka(
+        const std::vector<Read>& reads, int N_shards) {
+    const int n = (int)reads.size();
+    const bool shard_contig = (getenv("ARCS_SHARD_CONTIG") != nullptr);
+    std::vector<std::vector<Read>>     shard_reads((size_t)N_shards);
+    std::vector<std::vector<uint32_t>> shard_to_global((size_t)N_shards);
+    for (int i = 0; i < n; ++i) {
+        int s = shard_contig ? (int)((int64_t)i * N_shards / n) : (i % N_shards);
+        if (s >= N_shards) s = N_shards - 1;
+        shard_reads[(size_t)s].push_back(reads[(size_t)i]);
+        shard_to_global[(size_t)s].push_back((uint32_t)i);
+    }
+
+    std::vector<ChainEncodeResult> sr((size_t)N_shards);
+    {
+        std::vector<std::thread> th;
+        th.reserve((size_t)N_shards);
+        for (int s = 0; s < N_shards; ++s)
+            th.emplace_back([&, s]{
+                sr[(size_t)s] = build_kmer_anchor_pg(shard_reads[(size_t)s]);
+            });
+        for (auto& t : th) t.join();
+    }
+
+    ChainEncodeResult merged;
+    merged.has_pg   = true;
+    merged.n_reads  = (size_t)n;
+    merged.read_len = sr[0].read_len;
+
+    uint32_t pg_off = 0;
+    for (int s = 0; s < N_shards; ++s) {
+        const ChainEncodeResult&      r = sr[(size_t)s];
+        const std::vector<uint32_t>&  g = shard_to_global[(size_t)s];
+        const size_t sn = r.chain_order.size();
+
+        for (size_t ci = 0; ci < sn; ++ci) {
+            merged.chain_order.push_back(g[r.chain_order[ci]]);
+            merged.pg_pos.push_back(r.pg_pos[ci] + pg_off);
+        }
+
+        merged.pg += r.pg;
+        pg_off    += (uint32_t)r.pg.size();
+
+        auto ap = [](auto& dst, const auto& src){
+            dst.insert(dst.end(), src.begin(), src.end());
+        };
+        ap(merged.pg_rc,           r.pg_rc);
+        ap(merged.pg_readlen,      r.pg_readlen);
+        ap(merged.pg_mm_counts,    r.pg_mm_counts);
+        ap(merged.pg_mm_pos_flat,  r.pg_mm_pos_flat);
+        ap(merged.pg_mm_base_flat, r.pg_mm_base_flat);
+        ap(merged.pg_N_counts,     r.pg_N_counts);
+        ap(merged.pg_N_pos_flat,   r.pg_N_pos_flat);
+        ap(merged.pg_N_char_flat,  r.pg_N_char_flat);
+        ap(merged.pg_qmm_counts,   r.pg_qmm_counts);
+        ap(merged.pg_qmm_pos_flat, r.pg_qmm_pos_flat);
+
+        merged.n_chain_starts += r.n_chain_starts;
+        merged.n_deltas       += r.n_deltas;
+    }
+    return merged;
+}
+
 // ── encode_wgs_chain_pg ───────────────────────────────────────────────────────
 // Chain-PG mode: run greedy k-NN chain to build a pseudogenome from chain walk,
 // then compress the pg with GeCo3 (or LZMA fallback). Per-read: pg_position +
@@ -1739,6 +2050,42 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
         result = chain_enc.encode(reads);
     } else if (getenv("ARCS_CHAINPG_DEDUP")) {
         result = build_dedup_pg(reads);
+    } else if (getenv("ARCS_DBG_ASSEMBLY")) {
+        // Opt-in alternative assembler (see vodbg_pg.h): global greedy-overlap
+        // contig growth over a suffix-array/APSP overlap table, instead of the
+        // default's order-dependent single-pass placement. Produces the same
+        // ChainEncodeResult pg_* fields, so nothing downstream (serialization,
+        // quality, decoder, arcs export/coverage/query) changes. CallData
+        // (--call) support was added directly to build_vodbg_pg — pass
+        // call_capture_ through so Method B can actually serve --call requests
+        // instead of silently falling through to the default assembler.
+        result = build_vodbg_pg(reads, call_capture_);
+    } else if (getenv("ARCS_KA_ASSEMBLY")) {
+        // Opt-in "Method A" assembler (see kmer_anchor_pg.h): global k-mer
+        // occurrence index + mismatch-tolerant anchor growth, isolated into
+        // its own function so its assembly-only cost can be measured
+        // independently of build_vodbg_pg ("Method B").
+        //
+        // Parallelism default: build_kmer_anchor_pg itself already
+        // parallelizes its index BUILD across all cores internally (see its
+        // FlatKmerIndex / build_index_parallel — a two-pass counting-sort
+        // scatter, growth stays serial and global) with NO coverage loss —
+        // measured 10-15x assembly speedup for only a ~5% pg_len cost.
+        // parallel_shard_assemble_ka (round-robin READ sharding) was the
+        // first attempt and is measurably worse — 2.13x speedup for 77%
+        // WORSE pg_len, because each shard only sees 1/N of the reads and
+        // loses global overlap visibility. It is kept only as an opt-in for
+        // comparison, never the default: set ARCS_KA_PAR_SHARDS>1 explicitly
+        // to use it.
+        int N_ka_shards = 1;
+        if (const char* sv = getenv("ARCS_KA_PAR_SHARDS")) N_ka_shards = std::max(1, atoi(sv));
+        if (N_ka_shards <= 1) {
+            result = build_kmer_anchor_pg(reads);
+        } else {
+            if (ENC_TIMING)
+                fprintf(stderr, "[ENC] parallel_shard_assemble_ka: N_shards=%d\n", N_ka_shards);
+            result = parallel_shard_assemble_ka(reads, N_ka_shards);
+        }
     } else {
         // Parallel shard assembly: auto-scale to min(4, hw_cores) shards.
         // Disabled when: (1) call_capture_ is set (--call mode requires a unified
@@ -2007,12 +2354,50 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
                 }
                 qual_is_pe = (total > 0 && matches * 10 >= total * 9);
             }
+            // Dense-alphabet remap for the CM path only (static-rANS above is
+            // untouched -- it already assumes the full 0..42 range). Binned data
+            // (e.g. 4-level Illumina binning) has qmax set to the raw MAX Phred
+            // value seen (e.g. 40), but the context model's q1/q2 dimensions are
+            // fixed-width 94-slot regardless of qmax -- so a real alphabet of just
+            // 4 distinct values still gets spread thinly across up to 94x94=8836
+            // context slots instead of 4x4=16, diluting the adaptive statistics for
+            // no reason. Remapping to a dense 0..ndist-1 index before encoding (and
+            // reversing it after decoding) shrinks qmax itself, so every downstream
+            // context dimension and the final entropy table become dense for free,
+            // with zero changes needed inside qual_cm.cpp. Self-describing header
+            // (byte 0 = table size, 0 = no remap) so decode never has to re-derive
+            // "was this binned" -- it just reads what the encoder actually did.
+            std::vector<uint8_t> dense_of_raw, raw_of_dense;
+            const bool do_remap = binned && ndist < 250;
+            if (do_remap) {
+                dense_of_raw.assign(64, 0);
+                for (int v = 0; v < 64; ++v) if (seen[v]) raw_of_dense.push_back((uint8_t)v);
+                for (size_t d = 0; d < raw_of_dense.size(); ++d) dense_of_raw[raw_of_dense[d]] = (uint8_t)d;
+            }
             auto _c2 = std::chrono::steady_clock::now();
-            auto cm = qual_cm_encode(rq, result.chain_order, orig_dev_sets, L, seqp, qual_is_pe);
+            std::vector<uint8_t> cm;
+            if (do_remap) {
+                std::vector<std::vector<uint8_t>> rq_dense(rq.size());
+                for (size_t i = 0; i < rq.size(); ++i) {
+                    rq_dense[i].resize(rq[i].size());
+                    for (size_t j = 0; j < rq[i].size(); ++j)
+                        rq_dense[i][j] = (rq[i][j] < 64) ? dense_of_raw[rq[i][j]] : (uint8_t)(raw_of_dense.size() - 1);
+                }
+                auto body = qual_cm_encode(rq_dense, result.chain_order, orig_dev_sets, L, seqp, qual_is_pe);
+                cm.push_back((uint8_t)raw_of_dense.size());
+                cm.insert(cm.end(), raw_of_dense.begin(), raw_of_dense.end());
+                cm.insert(cm.end(), body.begin(), body.end());
+            } else {
+                cm.push_back(0);
+                auto body = qual_cm_encode(rq, result.chain_order, orig_dev_sets, L, seqp, qual_is_pe);
+                cm.insert(cm.end(), body.begin(), body.end());
+            }
             if (ENC_TIMING) fprintf(stderr, "[ENC]   qual.adaptive-CM: %.2fs\n",
                 std::chrono::duration<double>(std::chrono::steady_clock::now()-_c2).count());
             if (force_both && seqp) {   // exact keep-smaller (opt-in, 2× quality time)
-                auto cm_ns = qual_cm_encode(rq, result.chain_order, orig_dev_sets, L, nullptr, qual_is_pe);
+                auto cm_ns_body = qual_cm_encode(rq, result.chain_order, orig_dev_sets, L, nullptr, qual_is_pe);
+                std::vector<uint8_t> cm_ns; cm_ns.push_back(0);
+                cm_ns.insert(cm_ns.end(), cm_ns_body.begin(), cm_ns_body.end());
                 if (cm_ns.size() < cm.size()) cm = std::move(cm_ns);
             }
             size_t cm_tot = cm.size() + 1;   // +1 for the 0x07 mode byte
@@ -2081,7 +2466,7 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
         // verify strict monotonicity over ALL reads (uniqueness guaranteed), so
         // it is byte-exact, not a heuristic. Falls back to an explicit perm blob
         // for non-SRA data (e.g. raw Illumina names with no sequential index).
-        order_col = find_monotonic_name_index_column(reads);
+        order_col = find_monotonic_name_index_column_best(reads);
         if (order_col >= 0) {
             perm_mode = 2;
             fprintf(stderr, "[CHAIN-PG] order-preserving: derive from name index col %d (free)\n", order_col);

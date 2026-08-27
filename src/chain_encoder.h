@@ -23,6 +23,16 @@
 // Overhead now matches SPRING: chain-start bitset = 12.5 KB fixed cost.
 // Delta stream quality >= SPRING because k-NN graph finds globally better overlaps.
 
+// Shared bookkeeping helpers (defined in chain_encoder.cpp, external linkage):
+// every pg-producing assembler (build_dedup_pg, build_multicontig_pg,
+// build_vodbg_pg) funnels through these two to populate ChainEncodeResult's
+// pg_* fields identically, so serialization/quality/decoder never need to
+// know which assembler produced a given archive.
+bool is_acgt_strict(char c);
+void record_mapped(struct ChainEncodeResult& r, uint32_t oi, uint32_t pos, int rc,
+                   const std::string& target, int L_ignored);
+void record_append(struct ChainEncodeResult& r, uint32_t oi, const std::string& orig, int L_ignored);
+
 struct ChainEncodeResult {
     // Verbatim sequences + N-positions (separate LZMA blob for better compression)
     std::vector<uint8_t>  vseq_bytes;     // col_vseq + col_vN (chain-start reads only)

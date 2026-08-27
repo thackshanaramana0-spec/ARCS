@@ -247,11 +247,30 @@ struct CtxState {
     inline void advance(int q) {
         ceil = std::max(q, ceil - 1);            // decaying running-max
         vol  = (vol * 3 + 8 * std::abs(q - q1)) >> 2;  // EWMA of |Δq|
-        run  = (q == q1) ? (run < 7 ? run + 1 : 7) : 0; // consecutive-repeat length of q1
+        run  = (q == q1) ? (run < 100000 ? run + 1 : 100000) : 0; // uncapped (bucketed at use)
         q2 = q1; q1 = q;
     }
     inline void reset() { q1 = q2 = ceil = vol = run = 0; }
 };
+
+// Buckets 0..7 preserve the exact old resolution/behaviour (run<=7 -> itself),
+// so anything whose runs stay short (typical full-range quality data, where this
+// model already wins) is completely unaffected. Buckets 8..15 add geometric-scale
+// resolution for LONGER runs instead of saturating: heavily-binned quality (one
+// symbol repeating for 50-150+ consecutive positions, e.g. Illumina 4-level
+// binning) previously collapsed every run past length 7 into one indistinguishable
+// context, throwing away exactly the structure that dominates such data. Measured
+// motivation: DRR976266 (4 distinct quality symbols, 94% one value) compressed
+// quality to 0.584 bits/value under the old cap -- WORSE than the raw zero-order
+// entropy floor (0.385 b/v) -- because the model never got persuasive evidence it
+// was mid-run. SPRING reaches 0.283 b/v on the same data by exploiting run length.
+inline int run_bucket(int r) {
+    if (r <= 7) return r;
+    int b = 8, lo = 8, hi = 15;
+    while (r > hi && b < 15) { lo = hi + 1; hi = hi * 2 + 1; ++b; }
+    (void)lo;
+    return b;
+}
 
 inline int posbin(int j, int L) { int pb = (int)((int64_t)j * 8 / (L > 0 ? L : 1)); return pb > 7 ? 7 : pb; }
 
@@ -266,7 +285,7 @@ inline uint64_t ctx_key(const CtxState& s, int j, int L, int is_dev, int qmax) {
     k = k * 16u + (uint32_t)ceilb;
     k = k * 4u  + (uint32_t)volb;
     k = k * 8u  + (uint32_t)pb;
-    k = k * 8u  + (uint32_t)s.run;
+    k = k * 16u + (uint32_t)run_bucket(s.run);
     k = k * 2u  + (uint32_t)(is_dev ? 1 : 0);
     return k;
 }
@@ -277,7 +296,7 @@ inline uint64_t lo_key(const CtxState& s, int j, int L, int qmax) {
     uint64_t k = (uint32_t)std::min(s.q1, qmax);
     k = k * 48u + (uint32_t)std::min(s.q2, qmax);
     k = k * 8u  + (uint32_t)posbin(j, L);
-    k = k * 8u  + (uint32_t)s.run;   // run-length: dominant lever on binned quality
+    k = k * 16u + (uint32_t)run_bucket(s.run);   // run-length: dominant lever on binned quality
     return k;
 }
 
@@ -313,7 +332,7 @@ inline void keys(const CtxState& s, int j, int L, int is_dev, int qmax,
         k = k * 16u + ceilb;
         k = k * 4u  + volb;
         k = k * 8u  + pb;
-        k = k * 8u  + (uint32_t)s.run;
+        k = k * 16u + (uint32_t)run_bucket(s.run);
         k = k * 2u  + (uint32_t)(is_dev ? 1 : 0);
         coded_k = k * 5u + (uint32_t)qmb;
     }

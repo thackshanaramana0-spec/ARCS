@@ -216,7 +216,16 @@ for IND in "${INDIVIDUALS[@]}"; do
     if [ ! -s "$IWD/calls_arcs.vcf" ]; then
         TF="$IWD/arcs_time.txt"
         export ARCS_DUMP_CONTIGS="$IWD/contigs.tsv"
-        /usr/bin/time -v "$ARCS_BIN" compress --call "$FQ" "$IWD/out.arcs" "$IWD/calls_arcs.vcf" 2>"$TF" || true
+        # Real CLI contract (verified directly against main.cpp's option parser,
+        # not just its printed usage string): `compress --call <out.vcf>
+        # <input> <output>` — --call's value is consumed immediately as the
+        # VCF output path, before input/output are read. The previous
+        # argument order here ($FQ as the vcf path, out.arcs as the "input",
+        # calls_arcs.vcf as the archive output) meant this command could never
+        # have loaded a valid FASTQ input; `|| true` silently swallowed the
+        # resulting failure, so no real T3 SNV-calling result was ever
+        # produced by this step for ANY assembler.
+        /usr/bin/time -v "$ARCS_BIN" compress --call "$IWD/calls_arcs.vcf" "$FQ" "$IWD/out.arcs" 2>"$TF" || true
         read -r ARCS_T ARCS_RAM <<< "$(parse_time_v "$TF")"
         unset ARCS_DUMP_CONTIGS
         N_ARCS=$(grep -vc '^#' "$IWD/calls_arcs.vcf" 2>/dev/null || echo 0)
@@ -228,7 +237,16 @@ for IND in "${INDIVIDUALS[@]}"; do
     # 3b. BWA lift for ARCS
     phase "3.${IND}.2" "[$IND] BWA liftover of ARCS contigs"
     if [ ! -s "$IWD/lifted_arcs.vcf" ] && [ -s "$IWD/contigs.tsv" ]; then
-        awk -F'\t' '{print ">"$1"\n"$2}' "$IWD/contigs.tsv" > "$IWD/contigs.fa"
+        # ARCS_DUMP_CONTIGS (caller.cpp) already writes valid FASTA
+        # (">contig_N\nSEQ\n") despite the "contigs.tsv" filename — the awk
+        # transform this line used to apply assumed a tab-separated
+        # name<TAB>seq input with no ">" prefix, which is NOT what caller.cpp
+        # produces; running it against the real (FASTA) format corrupted
+        # every header into ">>contig_N" and every sequence line into
+        # ">SEQ", silently breaking bwa's alignment and therefore this
+        # entire liftover step for ANY assembler, not just Method B. No
+        # transform is needed — just copy it through as-is.
+        cp "$IWD/contigs.tsv" "$IWD/contigs.fa"
         bwa mem -t 8 "$CHR20_FA" "$IWD/contigs.fa" 2>/dev/null > "$IWD/c2r.sam"
         python3 "$SCRIPTS_DIR/lift_vcf.py" \
             "$IWD/calls_arcs.vcf" "$IWD/c2r.sam" "$CHR20_FA" $CHROM \

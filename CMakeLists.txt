@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(arcs_cpp VERSION 2.2.0 LANGUAGES CXX)
+project(arcs_cpp VERSION 2.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -89,6 +89,20 @@ function(target_link_zstd tgt)
     endif()
 endfunction()
 
+# ── Helper to enable libsais's OpenMP-parallel SA/PLCP/LCP construction ───────
+# (used by src/sa_apsp.cpp) — every target that compiles ARCS_SOURCES needs
+# this applied consistently, since libsais.h itself guards the *_omp function
+# declarations behind LIBSAIS_OPENMP: a target missing this define would fail
+# to link against sa_apsp.cpp's calls to those functions.
+function(target_enable_libsais_openmp tgt)
+    if(OpenMP_C_FOUND AND OpenMP_CXX_FOUND)
+        target_compile_definitions(${tgt} PRIVATE LIBSAIS_OPENMP=1)
+        target_link_libraries(${tgt} PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
+    else()
+        message(WARNING "OpenMP not found for both C and C++ — libsais will run single-threaded for target ${tgt}")
+    endif()
+endfunction()
+
 # ── libbsc (bundled) ──────────────────────────────────────────────────────────
 set(LIBBSC_SOURCES
     third_party/libbsc/adler32/adler32.cpp
@@ -118,7 +132,11 @@ set(ARCS_SOURCES
     src/akc.cpp
     src/container.cpp
     src/chain_encoder.cpp
+    src/sa_apsp.cpp
+    src/vodbg_pg.cpp
+    src/kmer_anchor_pg.cpp
     src/dna_coder.cpp
+    src/repeat_elim.cpp
     src/qual_cm.cpp
     src/encoder.cpp
     src/decoder.cpp
@@ -126,6 +144,8 @@ set(ARCS_SOURCES
     src/tensor.cpp
     src/bsc_codec.cpp
     ${LIBBSC_SOURCES}
+    third_party/libsais/libsais.c
+    third_party/libsais/libsais64.c
 )
 
 # ── Main binary ───────────────────────────────────────────────────────────────
@@ -142,6 +162,7 @@ target_link_libraries(arcs PRIVATE ZLIB::ZLIB Threads::Threads)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(arcs PRIVATE OpenMP::OpenMP_CXX)
 endif()
+target_enable_libsais_openmp(arcs)
 
 if(LIBLZMA_FOUND)
     target_compile_definitions(arcs PRIVATE ARCS_HAVE_LZMA=1)
@@ -159,6 +180,7 @@ function(target_link_lzma tgt)
     endif()
 endfunction()
 
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 enable_testing()
 
@@ -167,6 +189,7 @@ target_include_directories(test_kmer PRIVATE src/ third_party/)
 target_link_libraries(test_kmer PRIVATE ZLIB::ZLIB)
 target_link_lzma(test_kmer)
 target_link_zstd(test_kmer)
+target_enable_libsais_openmp(test_kmer)
 add_test(NAME kmer COMMAND test_kmer)
 
 add_executable(test_debruijn tests/test_debruijn.cpp ${ARCS_SOURCES})
@@ -174,6 +197,7 @@ target_include_directories(test_debruijn PRIVATE src/ third_party/)
 target_link_libraries(test_debruijn PRIVATE ZLIB::ZLIB)
 target_link_lzma(test_debruijn)
 target_link_zstd(test_debruijn)
+target_enable_libsais_openmp(test_debruijn)
 add_test(NAME debruijn COMMAND test_debruijn)
 
 add_executable(test_rans tests/test_rans.cpp ${ARCS_SOURCES})
@@ -181,6 +205,7 @@ target_include_directories(test_rans PRIVATE src/ third_party/)
 target_link_libraries(test_rans PRIVATE ZLIB::ZLIB)
 target_link_lzma(test_rans)
 target_link_zstd(test_rans)
+target_enable_libsais_openmp(test_rans)
 add_test(NAME rans COMMAND test_rans)
 
 add_executable(test_mapper tests/test_mapper.cpp ${ARCS_SOURCES})
@@ -188,6 +213,7 @@ target_include_directories(test_mapper PRIVATE src/ third_party/)
 target_link_libraries(test_mapper PRIVATE ZLIB::ZLIB)
 target_link_lzma(test_mapper)
 target_link_zstd(test_mapper)
+target_enable_libsais_openmp(test_mapper)
 add_test(NAME mapper COMMAND test_mapper)
 
 add_executable(test_roundtrip tests/test_roundtrip.cpp ${ARCS_SOURCES})
@@ -195,6 +221,7 @@ target_include_directories(test_roundtrip PRIVATE src/ third_party/)
 target_link_libraries(test_roundtrip PRIVATE ZLIB::ZLIB)
 target_link_lzma(test_roundtrip)
 target_link_zstd(test_roundtrip)
+target_enable_libsais_openmp(test_roundtrip)
 add_test(NAME roundtrip COMMAND test_roundtrip)
 
 add_executable(test_qual_rans tests/test_qual_rans.cpp ${ARCS_SOURCES})
@@ -202,6 +229,7 @@ target_include_directories(test_qual_rans PRIVATE src/ third_party/)
 target_link_libraries(test_qual_rans PRIVATE ZLIB::ZLIB)
 target_link_lzma(test_qual_rans)
 target_link_zstd(test_qual_rans)
+target_enable_libsais_openmp(test_qual_rans)
 add_test(NAME qual_rans COMMAND test_qual_rans)
 
 add_executable(test_dna_coder tests/test_dna_coder.cpp ${ARCS_SOURCES})
@@ -212,7 +240,29 @@ target_link_zstd(test_dna_coder)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(test_dna_coder PRIVATE OpenMP::OpenMP_CXX)
 endif()
+target_enable_libsais_openmp(test_dna_coder)
 add_test(NAME dna_coder COMMAND test_dna_coder)
+
+add_executable(test_vodbg_calldata tests/test_vodbg_calldata.cpp ${ARCS_SOURCES})
+target_include_directories(test_vodbg_calldata PRIVATE src/ third_party/)
+target_link_libraries(test_vodbg_calldata PRIVATE ZLIB::ZLIB)
+target_link_lzma(test_vodbg_calldata)
+target_link_zstd(test_vodbg_calldata)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(test_vodbg_calldata PRIVATE OpenMP::OpenMP_CXX)
+endif()
+target_enable_libsais_openmp(test_vodbg_calldata)
+add_test(NAME vodbg_calldata COMMAND test_vodbg_calldata)
+
+# test_sa_large_scale: NOT wired into `add_test` deliberately — it builds a
+# >2.147B-char (~2.3GB) text and needs ~20GB peak RAM + real wall time to
+# construct+verify, which would slow down the fast default ctest suite (and
+# violate the "7/7 ctests before any benchmark phase" quick-check budget).
+# Run explicitly (./build/test_sa_large_scale) when validating the
+# >INT32_MAX/libsais64 code path specifically, not as part of routine ctest.
+add_executable(test_sa_large_scale tests/test_sa_large_scale.cpp src/sa_apsp.cpp third_party/libsais/libsais.c third_party/libsais/libsais64.c)
+target_include_directories(test_sa_large_scale PRIVATE src/ third_party/)
+target_enable_libsais_openmp(test_sa_large_scale)
 
 # ── Install ───────────────────────────────────────────────────────────────────
 install(TARGETS arcs RUNTIME DESTINATION bin)
