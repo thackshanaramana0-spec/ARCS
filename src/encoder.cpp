@@ -18,6 +18,7 @@
 #include <numeric>
 #include <unordered_map>
 #include <cstdlib>
+#include <unistd.h>
 
 #ifdef _WIN32
 // POSIX setenv/unsetenv are absent on MinGW; provide portable shims.
@@ -2084,6 +2085,145 @@ static ChainEncodeResult parallel_shard_assemble(
     return merged;
 }
 
+// ── vodbg_assemble ────────────────────────────────────────────────────────────
+// Wrapper around build_vodbg_pg ("Method B", the default assembler) that keeps
+// it inside the machine's memory and the codec's index-width limit.
+//
+// Method B's suffix array is built over BOTH strand views of every unique read,
+// so its working set scales with the READ SET, not with the assembled pg. Two
+// ceilings apply, and neither is a tuning knob:
+//
+//   (1) sa_apsp stores every position as uint32_t and throws above UINT32_MAX
+//       chars (see SuffixArray::build_libsais and build_apsp_candidates).
+//   (2) The build allocates ~25 bytes per char of concatenated text at peak:
+//       T itself (1) + pos_to_seg (4) + SuffixArray::sa (4) + ::lcp (4) +
+//       libsais's own SA/PLCP/LCP int32 triple (12). RAM is therefore the
+//       binding limit long before (1) is.
+//
+// Both Claim-1 slots over 2 GB (C. elegans ~11 GB, T. cacao ~15 GB) suppress
+// auto-chunk on purpose (ARCS_AUTOCHUNK_MB=25000 in run_block1.sh, recorded in
+// DATASET_LOCKED.md), so a single assembly there really does see the whole read
+// set. Rather than crash on those, split the read set into the FEWEST
+// contiguous pieces that each fit and assemble them one at a time.
+//
+// Sequentially, not concurrently: the split exists *because* memory is short,
+// so overlapping the pieces would defeat the only reason for making it. And
+// contiguously in file order (not round-robin) so the merged chain_order stays
+// near file order, which is what keeps the name/permutation stream cheap.
+//
+// On every dataset that fits — including all three we benchmark against PgRC2 —
+// this computes shards==1 and calls build_vodbg_pg directly, unchanged.
+static size_t host_available_bytes() {
+    // MemAvailable, not MemTotal: the kernel's own estimate of what can be
+    // allocated without swapping, which already accounts for the read set we
+    // are holding at this moment. MemTotal would over-promise by exactly that.
+    FILE* f = fopen("/proc/meminfo", "r");
+    size_t kb = 0;
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof line, f))
+            if (sscanf(line, "MemAvailable: %zu kB", &kb) == 1) break;
+        fclose(f);
+    }
+    if (kb == 0) {
+        // /proc unreadable (non-Linux, container). Fall back to the physical
+        // page count; if that is unavailable too, assume a small machine —
+        // over-sharding costs some ratio, under-sharding gets OOM-killed.
+        long pages = sysconf(_SC_PHYS_PAGES), psz = sysconf(_SC_PAGESIZE);
+        if (pages > 0 && psz > 0) return (size_t)pages * (size_t)psz / 2;
+        return (size_t)4 << 30;
+    }
+    return kb * 1024;
+}
+
+static ChainEncodeResult vodbg_assemble(const std::vector<Read>& reads,
+                                        CallData* call_out, bool timing) {
+    // Exactly what build_apsp_candidates will concatenate: forward view +
+    // reverse-complement view of each read, each followed by one separator.
+    size_t chars = 0;
+    for (const auto& r : reads) chars += 2 * (r.seq.size() + 1);
+
+    const size_t BYTES_PER_CHAR = 25;               // derived above, not fitted
+    // Half of what is available: the other half has to hold the reads, the
+    // per-read placement arrays, and the pg + DNA encode that follow.
+    const size_t avail    = host_available_bytes();
+    const size_t cap_ram  = (avail / 2) / BYTES_PER_CHAR;
+    // Stay inside libsais's 32-bit path as well. The 64-bit path works but
+    // doubles the transient triple to 24 bytes/char, so a text that only fits
+    // via 64-bit indices does not fit in memory anyway.
+    const size_t cap_idx  = (size_t)INT32_MAX;
+    size_t cap = std::min(cap_ram, cap_idx);
+    if (const char* e = getenv("ARCS_VODBG_MAX_CHARS")) {
+        long long v = atoll(e);
+        if (v > 0) cap = (size_t)v;                 // measurement override only
+    }
+
+    size_t n_shards = 1;
+    if (cap > 0 && chars > cap) n_shards = (chars + cap - 1) / cap;
+    if (n_shards <= 1) return build_vodbg_pg(reads, call_out);
+
+    fprintf(stderr,
+            "[VODBG-CAP] read text %.1f Mchar exceeds the %.1f Mchar that fits "
+            "(%.1f GB available) — assembling in %zu sequential contiguous pieces\n",
+            chars / 1e6, cap / 1e6, avail / 1e9, n_shards);
+
+    const size_t n = reads.size();
+    ChainEncodeResult merged;
+    merged.has_pg  = true;
+    merged.n_reads = n;
+    if (call_out) {
+        call_out->read_cid.assign(n, 0);
+        call_out->read_pos.assign(n, 0);
+        call_out->read_rc.assign(n, 0);
+        call_out->valid = true;
+    }
+
+    uint32_t pg_off = 0;
+    for (size_t s = 0; s < n_shards; ++s) {
+        const size_t lo = n * s / n_shards, hi = n * (s + 1) / n_shards;
+        std::vector<Read> part(reads.begin() + (ptrdiff_t)lo, reads.begin() + (ptrdiff_t)hi);
+        CallData part_call;
+        ChainEncodeResult r = build_vodbg_pg(part, call_out ? &part_call : nullptr);
+        if (timing)
+            fprintf(stderr, "[VODBG-CAP] piece %zu/%zu: %zu reads → pg %zu B\n",
+                    s + 1, n_shards, hi - lo, r.pg.size());
+        part.clear(); part.shrink_to_fit();
+
+        // chain_order entries are indices into `part` — shift into global space.
+        for (size_t ci = 0; ci < r.chain_order.size(); ++ci) {
+            merged.chain_order.push_back(r.chain_order[ci] + (uint32_t)lo);
+            merged.pg_pos.push_back(r.pg_pos[ci] + pg_off);
+        }
+        if (call_out && part_call.valid) {
+            const uint32_t cid_off = (uint32_t)call_out->contigs.size();
+            for (auto& c : part_call.contigs) call_out->contigs.push_back(std::move(c));
+            for (size_t i = 0; i < part_call.read_cid.size(); ++i) {
+                call_out->read_cid[lo + i] = part_call.read_cid[i] + cid_off;
+                call_out->read_pos[lo + i] = part_call.read_pos[i];   // contig frame
+                call_out->read_rc [lo + i] = part_call.read_rc[i];
+            }
+        }
+        merged.pg += r.pg;
+        pg_off    += (uint32_t)r.pg.size();
+        merged.read_len = r.read_len;
+
+        auto ap = [](auto& dst, const auto& src){ dst.insert(dst.end(), src.begin(), src.end()); };
+        ap(merged.pg_rc,           r.pg_rc);
+        ap(merged.pg_readlen,      r.pg_readlen);
+        ap(merged.pg_mm_counts,    r.pg_mm_counts);
+        ap(merged.pg_mm_pos_flat,  r.pg_mm_pos_flat);
+        ap(merged.pg_mm_base_flat, r.pg_mm_base_flat);
+        ap(merged.pg_N_counts,     r.pg_N_counts);
+        ap(merged.pg_N_pos_flat,   r.pg_N_pos_flat);
+        ap(merged.pg_N_char_flat,  r.pg_N_char_flat);
+        ap(merged.pg_qmm_counts,   r.pg_qmm_counts);
+        ap(merged.pg_qmm_pos_flat, r.pg_qmm_pos_flat);
+        merged.n_chain_starts += r.n_chain_starts;
+        merged.n_deltas       += r.n_deltas;
+    }
+    return merged;
+}
+
 // ── parallel_shard_assemble_ka ────────────────────────────────────────────────
 // Same shard-and-merge pattern as parallel_shard_assemble above, applied to
 // build_kmer_anchor_pg ("Method A") instead of build_multicontig_pg. Method A
@@ -2263,7 +2403,7 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
         // ARCS_DBG_ASSEMBLY=1 used to select this path; it is now the default,
         // so that variable is accepted and ignored (scripts still set it).
         // ARCS_LEGACY_ASSEMBLY=1 restores the previous shard-based default.
-        result = build_vodbg_pg(reads, call_capture_);
+        result = vodbg_assemble(reads, call_capture_, ENC_TIMING);
     }
     ARCS_CHECK(result.has_pg, "chain-pg: pg not built");
     if (getenv("ARCS_DUMP_PG_ENC")) {
