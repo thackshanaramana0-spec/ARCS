@@ -110,17 +110,29 @@ void SuffixArray::build_libsais(const std::string& text, int threads) {
     if (n64 == 1) { sa[0] = 0; return; }
 
     if (n64 <= (size_t)INT32_MAX) {
-        // Fits the 32-bit libsais API directly.
+        // Fits the 32-bit libsais API directly — and, crucially, int32_t and
+        // uint32_t are the same width, so libsais can write its output STRAIGHT
+        // into our own sa/lcp storage. This previously allocated a separate
+        // int32 SA and LCP and then copied 4n+4n bytes across, which held two
+        // full copies of each array live at once for no reason: 8 bytes per
+        // char of text, ~2.1 GB on a 257 Mchar read set. Every value libsais
+        // writes here is a text position or an LCP length, both non-negative
+        // and < n <= INT32_MAX, so the reinterpretation is exact in both
+        // directions (it is the same object representation, not a conversion).
+        // PLCP is genuinely transient — libsais_lcp_omp consumes it to produce
+        // LCP — so it keeps its own buffer, scoped to be freed immediately.
         const int32_t n = (int32_t)n64;
-        std::vector<int32_t> SA((size_t)n), PLCP((size_t)n), LCP((size_t)n);
-        int rc1 = libsais_gsa_omp((const uint8_t*)text.data(), SA.data(), n, 0, nullptr, threads);
+        int32_t* SAp  = reinterpret_cast<int32_t*>(sa.data());
+        int32_t* LCPp = reinterpret_cast<int32_t*>(lcp.data());
+        int rc1 = libsais_gsa_omp((const uint8_t*)text.data(), SAp, n, 0, nullptr, threads);
         if (rc1 != 0) throw std::runtime_error("libsais_gsa_omp failed");
-        int rc2 = libsais_plcp_gsa_omp((const uint8_t*)text.data(), SA.data(), PLCP.data(), n, threads);
-        if (rc2 != 0) throw std::runtime_error("libsais_plcp_gsa_omp failed");
-        int rc3 = libsais_lcp_omp(PLCP.data(), SA.data(), LCP.data(), n, threads);
-        if (rc3 != 0) throw std::runtime_error("libsais_lcp_omp failed");
-        for (size_t i = 0; i < n64; ++i) sa[i]  = (uint32_t)SA[i];
-        for (size_t i = 0; i < n64; ++i) lcp[i] = (uint32_t)LCP[i];
+        {
+            std::vector<int32_t> PLCP((size_t)n);
+            int rc2 = libsais_plcp_gsa_omp((const uint8_t*)text.data(), SAp, PLCP.data(), n, threads);
+            if (rc2 != 0) throw std::runtime_error("libsais_plcp_gsa_omp failed");
+            int rc3 = libsais_lcp_omp(PLCP.data(), SAp, LCPp, n, threads);
+            if (rc3 != 0) throw std::runtime_error("libsais_lcp_omp failed");
+        }
     } else {
         // Text exceeds INT32_MAX chars (~2.147B) — the real case that
         // crashed on GIAB HG002 (~3.8B chars). Use libsais64's int64_t-indexed
@@ -248,9 +260,26 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates(
         _sa_t0 = t1;
     }
 
-    // rank_of[pos] = position of that suffix in SA order (inverse of sa[]).
-    std::vector<uint32_t> rank_of((size_t)n);
-    for (int64_t i = 0; i < n; ++i) rank_of[SA.sa[(size_t)i]] = (uint32_t)i;
+    // rank_at_seg[e] = position in SA order of the suffix that starts at
+    // seg_start[e] (i.e. the whole of entry e's read).
+    //
+    // This used to be a full inverse suffix array, rank_of[pos] for every one
+    // of the n text positions -- 4 bytes per char, ~1.0 GB on a 257 Mchar read
+    // set. But it has exactly one reader (the `uint32_t r = rank_at_seg[e];`
+    // below), and that reader only ever asks about a segment START. So 99.3%
+    // of the entries were built and never read: m is ~1.7M against n ~257M.
+    // Storing one entry per segment answers every query that is actually made,
+    // for 1/150th of the memory and better locality.
+    //
+    // Built in the same single pass over SA: for each suffix position p, ask
+    // pos_to_seg which entry owns p and keep it only if p is that entry's
+    // start. One extra comparison per position, no extra pass.
+    std::vector<uint32_t> rank_at_seg(m, 0);
+    for (int64_t i = 0; i < n; ++i) {
+        const uint32_t p = SA.sa[(size_t)i];
+        const uint32_t e = pos_to_seg[p];
+        if (seg_start[e] == p) rank_at_seg[e] = (uint32_t)i;
+    }
 
     // pos -> (entry index, offset within that entry), or npos if pos lands on
     // a separator byte (not a valid read-content position). Was a binary
@@ -267,7 +296,7 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates(
     std::vector<std::vector<APSPCandidate>> out(m);
 
     // Per-entry APSP discovery is embarrassingly parallel: entry e only ever
-    // reads the already-fully-built, shared, read-only SA/LCP/rank_of/locate
+    // reads the already-fully-built, shared, read-only SA/LCP/rank_at_seg/locate
     // structures and writes exclusively to out[e] — no other entry's slot is
     // ever touched. Unlike Method A's read-sharding mistake, splitting the
     // RANGE OF e here changes nothing about what any single e can see (SA
@@ -282,8 +311,7 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates(
     for (size_t e = lo; e < hi; ++e) {
         uint32_t Lr = seg_len[e];
         if (Lr < min_overlap) continue;
-        uint32_t p = seg_start[e]; // read-start position (offset 0 within this entry)
-        uint32_t r = rank_of[p];
+        uint32_t r = rank_at_seg[e];   // SA rank of this entry's full-read suffix
 
         std::vector<APSPCandidate> cands;
         // `running` is the raw LCP between the two suffixes, which can be
