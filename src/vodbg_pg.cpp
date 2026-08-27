@@ -14,6 +14,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <sstream>
 #include <string>
 
 namespace {
@@ -46,10 +47,7 @@ struct Placement {
 } // namespace
 
 ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_out) {
-    ChainEncodeResult r;
-    r.has_pg = true;
     const size_t n = reads.size();
-    r.n_reads = n;
 
     int K0 = 24;
     if (const char* s = getenv("ARCS_VODBG_K")) { int v = atoi(s); if (v >= 12 && v <= 31) K0 = v; }
@@ -202,6 +200,59 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
         if (getenv("ARCS_VODBG_EXT_DEBUG"))
             fprintf(stderr, "[HQ-ADAPTIVE] target=%.2f solved_frac=%.4f\n", hq_adaptive_target, hq_ov_frac);
     }
+
+    // ── HQ-gate trial-and-select ──────────────────────────────────────────────
+    // No single hq_ov_frac is right for every dataset, and the differences are
+    // large enough to matter (measured, 3 datasets x 4 fracs):
+    //     yeast   best 0.45  (4,514,743 vs 4,654,678 at 0.65)  -140 KB
+    //     pf      best <=0.35 (3,096,184 vs 3,193,533)          -97 KB
+    //     E. coli best 0.65  (0.45 and 0.35 both REGRESS it)   +16/+75 KB
+    // A fixed constant therefore trades one dataset against another, and an
+    // HQ-RATE target fails the same way (E. coli +23 KB at its best target),
+    // because the datasets do not lie on a common scale in either dimension.
+    //
+    // Rather than fit a threshold to three points, select per dataset by
+    // OPTIMISING A MEASURABLE OBJECTIVE. pg length is the right one: across all
+    // 12 measured (dataset, frac) points, the frac minimising pg_len is exactly
+    // the frac minimising the final archive — 3/3 datasets, no exceptions. That
+    // is mechanistic rather than fitted: admitting a marginal read either
+    // shrinks pg (it found a real overlap) or grows it (it injected novel,
+    // often error-bearing content that later reads must then encode around),
+    // and pg length measures precisely that.
+    //
+    // This is affordable because the expensive part of assembly does not depend
+    // on the gate at all: sa_apsp_build is ~7.1 s of the ~8.8 s total and is
+    // already complete above, shared read-only across every trial. Each extra
+    // trial costs only growth (~0.25 s) plus the fallback pass (~1.5 s).
+    //
+    // ARCS_VODBG_HQ_OVFRAC / ARCS_VODBG_HQ_ADAPTIVE / ARCS_VODBG_HQ_MAXERR each
+    // pin the gate explicitly and so disable the search (single trial), keeping
+    // every existing experiment reproducible.
+    std::vector<double> hq_candidates;
+    if (use_quality_criterion || hq_adaptive || getenv("ARCS_VODBG_HQ_OVFRAC")) {
+        hq_candidates.push_back(hq_ov_frac);          // explicitly pinned: honour it
+    } else if (const char* s = getenv("ARCS_VODBG_HQ_TRIALS")) {
+        std::stringstream ss(s); std::string tok;
+        while (std::getline(ss, tok, ',')) if (!tok.empty()) hq_candidates.push_back(atof(tok.c_str()));
+        if (hq_candidates.empty()) hq_candidates.push_back(hq_ov_frac);
+    } else {
+        // Spans every measured optimum: 0.65 (E. coli), 0.45 (yeast), 0.15 (pf,
+        // whose curve keeps improving as the gate opens).
+        hq_candidates = {0.65, 0.45, 0.15};
+    }
+
+    ChainEncodeResult best_r;
+    CallData          best_call;
+    double            best_frac = hq_candidates[0];
+    bool              have_best = false;
+
+    for (size_t trial = 0; trial < hq_candidates.size(); ++trial) {
+        hq_ov_frac = hq_candidates[trial];
+        ChainEncodeResult r;
+        r.has_pg  = true;
+        r.n_reads = n;
+        CallData  trial_call;
+        CallData* co = call_out ? &trial_call : nullptr;
 
     std::vector<bool> is_hq(n, true);
     if (use_quality_criterion) {
@@ -495,16 +546,16 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
     // view IS the RC flag, same convention record_mapped already uses).
     // Fallback-mapped and never-placed reads are filled in further below,
     // once their outcomes are known.
-    if (call_out) {
-        call_out->contigs = contigs;
-        call_out->read_cid.assign(n, 0);
-        call_out->read_pos.assign(n, 0);
-        call_out->read_rc.assign(n, 0);
+    if (co) {
+        co->contigs = contigs;
+        co->read_cid.assign(n, 0);
+        co->read_pos.assign(n, 0);
+        co->read_rc.assign(n, 0);
         for (size_t i = 0; i < n; ++i) {
             if (!place[i].used) continue;
-            call_out->read_cid[i] = place[i].cid;
-            call_out->read_pos[i] = place[i].off;
-            call_out->read_rc[i]  = place[i].view;
+            co->read_cid[i] = place[i].cid;
+            co->read_pos[i] = place[i].off;
+            co->read_rc[i]  = place[i].view;
         }
     }
 
@@ -656,7 +707,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
             if (res.bestpos >= 0 && res.bestmm <= maxmm_for_read) {
                 const std::string& target = view_seq(rid, res.bestview);
                 emissions.push_back({(uint32_t)res.bestpos, rid, res.bestview});
-                if (call_out) {
+                if (co) {
                     // Invert absolute pg position back to (contig id, local offset).
                     // upper_bound gives the first base > abs_pos; the owning contig is
                     // the one just before that. NOTE: the fallback match itself only
@@ -675,15 +726,15 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
                     size_t cid = (size_t)(it - contig_base.begin()) - 1;
                     uint32_t local_off = (uint32_t)res.bestpos - contig_base[cid];
                     if ((size_t)local_off + target.size() <= contigs[cid].size()) {
-                        call_out->read_cid[rid] = (uint32_t)cid;
-                        call_out->read_pos[rid] = local_off;
-                        call_out->read_rc[rid]  = res.bestview;
+                        co->read_cid[rid] = (uint32_t)cid;
+                        co->read_pos[rid] = local_off;
+                        co->read_rc[rid]  = res.bestview;
                     } else {
-                        uint32_t new_cid = (uint32_t)call_out->contigs.size();
-                        call_out->contigs.push_back(target);
-                        call_out->read_cid[rid] = new_cid;
-                        call_out->read_pos[rid] = 0;
-                        call_out->read_rc[rid]  = res.bestview;
+                        uint32_t new_cid = (uint32_t)co->contigs.size();
+                        co->contigs.push_back(target);
+                        co->read_cid[rid] = new_cid;
+                        co->read_pos[rid] = 0;
+                        co->read_rc[rid]  = res.bestview;
                     }
                 }
             } else {
@@ -703,15 +754,15 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
                 for (size_t j = 0; j < s.size(); ++j)
                     r.pg.push_back(is_acgt_strict(s[j]) ? s[j] : 'A');
                 emissions.push_back({apos, rid, 0});
-                if (call_out) {
+                if (co) {
                     // Never placed anywhere — becomes its own singleton contig, same
                     // convention build_multicontig_pg uses for a "new contig start" read
                     // (pos=0, rc=0; record_append always stores the read forward, never RC).
-                    uint32_t cid = (uint32_t)call_out->contigs.size();
-                    call_out->contigs.push_back(reads[rid].seq);
-                    call_out->read_cid[rid] = cid;
-                    call_out->read_pos[rid] = 0;
-                    call_out->read_rc[rid]  = 0;
+                    uint32_t cid = (uint32_t)co->contigs.size();
+                    co->contigs.push_back(reads[rid].seq);
+                    co->read_cid[rid] = cid;
+                    co->read_pos[rid] = 0;
+                    co->read_rc[rid]  = 0;
                 }
             }
         }
@@ -728,7 +779,26 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
         record_mapped(r, e.rid, e.pos, (int)e.view, target, (int)target.size());
     }
 
-    if (call_out) call_out->valid = true;
+    if (co) co->valid = true;
 
-    return r;
+        // Keep the trial with the shortest pg (validated above as the objective
+        // that also minimises the final archive).
+        if (!have_best || r.pg.size() < best_r.pg.size()) {
+            best_r    = std::move(r);
+            best_call = std::move(trial_call);
+            best_frac = hq_ov_frac;
+            have_best = true;
+        }
+        if (VB_TIMING || getenv("ARCS_VODBG_EXT_DEBUG"))
+            fprintf(stderr, "[HQ-TRIAL] frac=%.2f pg_len=%zu%s\n",
+                    hq_ov_frac, best_r.pg.size(),
+                    (best_frac == hq_ov_frac) ? "  <= best so far" : "");
+    }
+
+    if (call_out) *call_out = std::move(best_call);
+    if (VB_TIMING || getenv("ARCS_VODBG_EXT_DEBUG"))
+        fprintf(stderr, "[HQ-TRIAL] selected frac=%.2f pg_len=%zu (%zu trials)\n",
+                best_frac, best_r.pg.size(), hq_candidates.size());
+
+    return best_r;
 }
