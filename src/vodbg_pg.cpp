@@ -387,6 +387,18 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
     struct Proposal { int64_t overlap; uint32_t cid; uint8_t dir; };
     struct ProposalLess { bool operator()(const Proposal& a, const Proposal& b) const { return a.overlap < b.overlap; } };
 
+    // NEGATIVE RESULT: do not run the HQ trials concurrently. They are
+    // independent given the shared read-only APSP table, so running all three
+    // at once looks free -- but the growth loop already scales, so concurrent
+    // trials only re-slice the same cores. Measured (yeast, 1M reads, 3 trials):
+    //     threads= 1   2.09 + 4.33 + 10.81 = 17.23s
+    //     threads= 2   1.18 + 2.88 +  5.64 =  9.70s
+    //     threads= 4   0.60 + 1.84 +  3.55 =  5.99s
+    //     threads=12   0.21 + 1.25 +  1.67 =  3.13s   <- sequential, today
+    // Three concurrent trials at 4 threads each finish when the SLOWEST does,
+    // i.e. 3.55s -- worse than the 3.13s they already take back to back. The
+    // trials are also unequal (the widest gate does 5x the work of the
+    // narrowest), so concurrency leaves cores idle exactly when it matters.
     int growth_threads = (int)std::thread::hardware_concurrency();
     if (growth_threads < 1) growth_threads = 1;
     if (const char* s = getenv("ARCS_VODBG_GROWTH_THREADS")) { int v = atoi(s); if (v >= 1) growth_threads = v; }

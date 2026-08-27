@@ -18,9 +18,35 @@
 // reads:        original reads (used to pre-seed context model)
 // chain_order:  chain_order[i] = original read index at chain position i
 // pg_pos:       pg_pos[i] = start position in pg of chain position i
-// seed:         up to max-FCM-order chars from the preceding block's pg tail;
-//               seeds the context shift-registers so split-block coding starts
-//               in the correct context state (lossless parallel-block support).
+// seed:         chars from the preceding block's pg tail. Warms both the
+//               context shift-registers AND the FCM frequency tables, so
+//               split-block coding starts in the correct state (lossless
+//               parallel-block support).
+//
+// NEGATIVE RESULT — do not re-attempt block-parallel coding for speed.
+// The coder is single-threaded and dominates both sides (~8.7s encode, ~8.1s
+// decode on a 16.3 MB yeast pg; 72% of decompress). Splitting it into blocks
+// parallelises almost perfectly but costs ratio, and seeding does not buy the
+// ratio back. Measured on that real pg (bytes, whole-pg = 3,432,287):
+//
+//     N= 2 cold                     3,573,136   +140,849
+//     N= 4 cold                     3,686,154   +253,867
+//     N= 8 cold                     3,795,467   +363,180
+//     N=12 cold                     3,823,581   +391,294
+//     N= 4, 256 KB shared seed      3,663,445   +231,158
+//     N= 4,   4 MB shared seed      3,628,994   +196,707
+//
+// The seed tested is the strongest one a DECODER can actually have: block 0 is
+// decoded first and every other block seeds from its tail, so phase 2 still
+// runs fully parallel. Even 4 MB of it recovers only 22% of the 4-way loss --
+// the high-order FCM tables warm too slowly relative to block size -- while
+// adding 1.1s of seeding work back.
+//
+// The trade is refused on size, not on effort: 4-way costs 196,707 B against
+// margins over PgRC2 of 402,417 B (yeast), 421,806 B (E. coli) and 150,884 B
+// (P. falciparum) -- half the first, most of the last. Every dataset has to
+// keep winning, so a split that erases one margin is not available at any
+// speed. Harness: /tmp/split/{split,seed2}.cpp pattern (links dna_coder.cpp.o).
 // Returns compressed bytes (self-contained; includes pg_len header).
 std::vector<uint8_t> dna_encode(
     const std::string&              pg,
