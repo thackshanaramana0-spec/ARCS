@@ -1785,6 +1785,35 @@ static std::vector<uint8_t> serialize_chain_pg_aux(const ChainEncodeResult& r) {
     }
     for (uint8_t b : r.pg_mm_base_flat) col_mmbase.push_back(b);
 
+    // Measurement-only diagnostic (ARCS_AUX_DEBUG=1): mm_base_flat stores the
+    // read's ABSOLUTE base at each mismatch position, but a mismatch means
+    // that base is BY DEFINITION not equal to the pg's own reference base
+    // there (see record_mapped's `r.pg[pos+j] != tj` condition) — so only 3
+    // of the 4 ACGT values are ever possible per entry, not 4. Storing "which
+    // of the 3 non-reference bases" (rank, excluding the known-impossible
+    // reference value) instead of the raw absolute base recovers that
+    // log2(4/3)~=0.415 bit/entry the raw encoding wastes, for free — this
+    // block never changes the real wire format, only measures the potential.
+    if (getenv("ARCS_AUX_DEBUG")) {
+        std::vector<uint8_t> col_mmrank;
+        col_mmrank.reserve(r.pg_mm_base_flat.size());
+        size_t cum = 0;
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t cnt = r.pg_mm_counts[i];
+            uint32_t abs_base = r.pg_pos[i];
+            for (uint32_t k = 0; k < cnt; ++k, ++cum) {
+                uint16_t off = r.pg_mm_pos_flat[cum];
+                uint8_t  b   = r.pg_mm_base_flat[cum];
+                size_t pgpos = (size_t)abs_base + off;
+                uint8_t ref = (pgpos < r.pg.size()) ? encode_base(r.pg[pgpos]) : 4;
+                uint8_t rank = (ref < 4 && b > ref) ? (uint8_t)(b - 1) : b; // exclude ref's slot, keep in [0,2]
+                col_mmrank.push_back(rank);
+            }
+        }
+        fprintf(stderr, "[MMBASE-DBG] raw_absolute compressed=%zu | rank_of_3 compressed=%zu (n_mismatches=%zu)\n",
+                arcs_compress(col_mmbase, 9).size(), arcs_compress(col_mmrank, 9).size(), col_mmbase.size());
+    }
+
     for (uint32_t c : r.pg_N_counts)   write_varint(col_Ncnt, c);
     for (uint16_t p : r.pg_N_pos_flat) {
         col_Npos.push_back((uint8_t)(p & 0xFF));
@@ -2107,6 +2136,12 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
         }
     }
     ARCS_CHECK(result.has_pg, "chain-pg: pg not built");
+    if (getenv("ARCS_DUMP_PG_ENC")) {
+        const char* path = getenv("ARCS_DUMP_PG_ENC");
+        FILE* f = fopen(path, "wb");
+        if (f) { fwrite(result.pg.data(), 1, result.pg.size(), f); fclose(f); }
+        fprintf(stderr, "[ENC] pg dumped to %s (%zu bytes)\n", path, result.pg.size());
+    }
 
     prog.mapped_reads   = result.n_deltas;
     prog.unmapped_reads = result.n_chain_starts;
@@ -2119,6 +2154,30 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
         n, result.n_chain_starts, 100.0*result.n_chain_starts/n,
         result.n_deltas,          100.0*result.n_deltas/n,
         result.pg.size(), result.pg_mm_pos_flat.size(), result.pg_N_pos_flat.size());
+
+    // Measurement-only (ARCS_META_DUMP=<prefix>): dump the raw per-read
+    // metadata streams so their real value distributions / achievable entropy
+    // can be analysed offline, independently of whatever coder is currently
+    // applied to them. Never affects the archive.
+    if (const char* mp = getenv("ARCS_META_DUMP")) {
+        std::string pre(mp);
+        if (FILE* f = fopen((pre + ".pos.u32").c_str(), "wb")) {
+            fwrite(result.pg_pos.data(), 4, result.pg_pos.size(), f); fclose(f);
+        }
+        if (FILE* f = fopen((pre + ".rc.u8").c_str(), "wb")) {
+            fwrite(result.pg_rc.data(), 1, result.pg_rc.size(), f); fclose(f);
+        }
+        if (FILE* f = fopen((pre + ".mmcnt.u32").c_str(), "wb")) {
+            fwrite(result.pg_mm_counts.data(), 4, result.pg_mm_counts.size(), f); fclose(f);
+        }
+        if (FILE* f = fopen((pre + ".mmpos.u16").c_str(), "wb")) {
+            fwrite(result.pg_mm_pos_flat.data(), 2, result.pg_mm_pos_flat.size(), f); fclose(f);
+        }
+        if (FILE* f = fopen((pre + ".mmbase.u8").c_str(), "wb")) {
+            fwrite(result.pg_mm_base_flat.data(), 1, result.pg_mm_base_flat.size(), f); fclose(f);
+        }
+        fprintf(stderr, "[META-DUMP] wrote %s.{pos.u32,rc.u8,mmcnt.u32,mmpos.u16,mmbase.u8}\n", mp);
+    }
 
     _emark("assembly");
     // ── Independent heavy phases run CONCURRENTLY ───────────────────────────

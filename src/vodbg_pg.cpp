@@ -516,10 +516,28 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
         fprintf(stderr, "[EXT-DBG] resolved=%zu out_of_bounds=%ld tiny_mm(1..half)=%ld huge_mm(>half)=%ld\n",
                 resolved.size(), bad, tiny_mm, huge_mm);
     }
+    // Global emission list: (abs_pos, rid, view) for EVERY read, filled by all
+    // three placement paths (growth here, fallback-mapped and appended below),
+    // then sorted ONCE by absolute pg position and emitted in that single
+    // global order at the end of this function.
+    //
+    // Why this matters — measured, not assumed: emitting the growth reads
+    // sorted but then appending the fallback reads in their own
+    // (original-read-index) order left pg_pos NON-monotonic. Real distribution
+    // on yeast_sub.fq: deltas spanned -15,338,383..+15,344,152 with ~12.5% of
+    // them million-scale random jumps, which is what the downstream
+    // zigzag-delta+LZMA position stream actually had to encode (1,325,900 B
+    // measured). Sorting ALL reads together instead bounds every delta to
+    // [0,150] with ZERO escapes (mean 15.4, order-1 entropy 4.76 bits ~= 595 KB)
+    // — worth ~700 KB on this dataset alone, i.e. more than the entire
+    // measured archive gap against PgRC2. This is purely an emission-ORDER
+    // change: chain_order still maps every slot back to its original read
+    // index, so the archive stays lossless either way.
+    struct Emission { uint32_t pos; uint32_t rid; uint8_t view; };
+    std::vector<Emission> emissions;
+    emissions.reserve(n);
     for (uint32_t i : resolved) {
-        uint32_t abs_pos = contig_base[place[i].cid] + place[i].off;
-        const std::string& target = view_seq(i, place[i].view);
-        record_mapped(r, i, abs_pos, (int)place[i].view, target, (int)target.size());
+        emissions.push_back({contig_base[place[i].cid] + place[i].off, i, place[i].view});
     }
 
     // ── Fallback placement pass for reads growth never touched (too short for
@@ -617,7 +635,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
             int maxmm_for_read = (MAXMM >= 0) ? MAXMM : std::max(1, Lr0 / 3);
             if (res.bestpos >= 0 && res.bestmm <= maxmm_for_read) {
                 const std::string& target = view_seq(rid, res.bestview);
-                record_mapped(r, rid, (uint32_t)res.bestpos, (int)res.bestview, target, (int)target.size());
+                emissions.push_back({(uint32_t)res.bestpos, rid, res.bestview});
                 if (call_out) {
                     // Invert absolute pg position back to (contig id, local offset).
                     // upper_bound gives the first base > abs_pos; the owning contig is
@@ -649,7 +667,22 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
                     }
                 }
             } else {
-                record_append(r, rid, reads[rid].seq, (int)reads[rid].seq.size());
+                // No acceptable placement: this read becomes brand-new pg
+                // content. Append it here (non-ACGT -> 'A', byte-for-byte what
+                // record_append does) and record its position, so it can be
+                // emitted in the SAME global position-sorted pass as every
+                // other read below rather than out of order. Emitting it via
+                // record_mapped against this freshly-appended region is
+                // equivalent to record_append: every ACGT position matches the
+                // pg exactly (zero mismatches by construction) and the
+                // non-ACGT positions go through record_mapped's own N branch,
+                // which records the identical pg_N_pos_flat/pg_N_char_flat
+                // entries record_append would have.
+                uint32_t apos = (uint32_t)r.pg.size();
+                const std::string& s = reads[rid].seq;
+                for (size_t j = 0; j < s.size(); ++j)
+                    r.pg.push_back(is_acgt_strict(s[j]) ? s[j] : 'A');
+                emissions.push_back({apos, rid, 0});
                 if (call_out) {
                     // Never placed anywhere — becomes its own singleton contig, same
                     // convention build_multicontig_pg uses for a "new contig start" read
@@ -663,6 +696,18 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
             }
         }
     }
+    // ── Single global position-sorted emission (see `emissions` above) ───────
+    // Every read — growth-placed, fallback-mapped, or freshly appended — is
+    // emitted here in one strictly ascending absolute-pg-position order, which
+    // is what makes the downstream pg_pos delta stream monotonic and tightly
+    // bounded instead of full of million-scale random jumps.
+    std::sort(emissions.begin(), emissions.end(),
+              [](const Emission& a, const Emission& b) { return a.pos < b.pos; });
+    for (const Emission& e : emissions) {
+        const std::string& target = view_seq(e.rid, e.view);
+        record_mapped(r, e.rid, e.pos, (int)e.view, target, (int)target.size());
+    }
+
     if (call_out) call_out->valid = true;
 
     return r;

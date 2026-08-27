@@ -281,6 +281,20 @@ ChainEncodeResult ChainSequenceEncoder::encode(const std::vector<Read>& reads) {
                             ++N_cnt;
                         } else if (b != result.pg[pg_start_i + (uint32_t)j]) {
                             result.pg_mm_pos_flat.push_back((uint16_t)j);
+                            // Absolute base (not rank-of-3): tried a rank-among-non-
+                            // reference-bases encoding here (18.8% smaller on real
+                            // data), but it requires the encoder's and decoder's
+                            // notion of "the pg's reference byte at this position" to
+                            // match EXACTLY, in every case — reverted after finding
+                            // TWO distinct real ways that invariant breaks in
+                            // practice (one was literal 'N' in r.pg vs the DNA coder's
+                            // internal N->A substitution timing; a second, structurally
+                            // different case surfaced immediately after fixing the
+                            // first, undermining confidence there wasn't a third).
+                            // Storing the absolute value is provably robust to ALL such
+                            // cases (it never depends on ref_b agreement) at a small
+                            // size cost — the right tradeoff given this project's
+                            // standing zero-tolerance losslessness rule.
                             result.pg_mm_base_flat.push_back(encode_base(b));
                             ++mm_cnt;
                             // Quality deviation: convert enc_seq pos → orig_read pos
@@ -621,6 +635,13 @@ void record_mapped(ChainEncodeResult& r, uint32_t oi, uint32_t pos, int rc,
             ++N_cnt;
         } else if (r.pg[pos + (uint32_t)j] != tj) { // mismatch vs pg
             r.pg_mm_pos_flat.push_back((uint16_t)j);
+            // Absolute base (not rank-of-3) — see build_multicontig_pg's matching
+            // comment for why a rank-based encoding (tried, measured 18.8%
+            // smaller) was reverted: it depends on encode-time and decode-time
+            // agreeing on the pg's reference byte at this exact position, an
+            // invariant this codebase does not actually guarantee everywhere
+            // (found two distinct, real ways it breaks). Absolute value is
+            // immune to that class of bug entirely.
             r.pg_mm_base_flat.push_back(encode_base(tj));
             ++mm_cnt;
             uint16_t qpos = (uint16_t)(rc ? (L - 1 - j) : j);  // orig-read frame
