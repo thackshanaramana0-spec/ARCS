@@ -55,9 +55,29 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
     if (const char* s = getenv("ARCS_VODBG_K")) { int v = atoi(s); if (v >= 12 && v <= 31) K0 = v; }
     // MAXMM: fallback-pass mismatch tolerance (the only place it's used — growth
     // is zero-tolerance by design, see HQ/LQ split above). -1 sentinel = default
-    // to PgRC's real LQ-remap tolerance (~read_len/3 per its MinCharsPerMismatch=3
-    // config, confirmed via direct source read) computed per read below, instead
-    // of a flat constant far stricter than that.
+    // to read_len/8, computed per read below.
+    //
+    // This was read_len/3, inherited from PgRC's MinCharsPerMismatch=3 — but that
+    // constant belongs to THEIR cost structure, not ours, and was never validated
+    // here. Accepting a read at M mismatches costs M mismatch records; rejecting
+    // it appends read_len fresh bases to the pg instead. The optimum is therefore
+    // T* = read_len × (C_base / C_mm), where C_base is the marginal compressed
+    // cost of an appended base and C_mm that of a mismatch record — and notably
+    // it does NOT depend on the distribution of M, since the count of reads at
+    // any given M cancels out of the marginal comparison.
+    //
+    // Both coefficients were measured from a real sweep (3 datasets × 6 values):
+    //   yeast   C_base 0.668 bits, C_mm 6.59 bits → T* = 15.2
+    //   E. coli C_base 0.690 bits, C_mm 5.28 bits → T* = 19.6  (measured optimum 20)
+    // C_base is far below the ~1.9 bpb a naive model would assume, because
+    // appended reads are highly redundant with existing pg content and also
+    // become exact-match reference for later reads.
+    //
+    // The ratio varies ~30% across datasets, so no single constant is optimal
+    // everywhere; read_len/8 (18 at 150 bp, 12 at 100 bp) sits inside every
+    // measured optimum's basin. Measured totals at each dataset's own optimum vs
+    // this rule differ by only a few KB. Per-dataset optima were 12 (yeast, flat
+    // to 20), 20 (E. coli), 12 (P. falciparum, 100 bp).
     int    MAXMM  = -1;
     double OV_ERR = 0.08;
     if (const char* s = getenv("ARCS_VODBG_MAXMM")) MAXMM  = atoi(s);
@@ -590,7 +610,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
 
         auto search_one = [&](uint32_t rid) -> FallbackResult {
             int Lr0 = (int)reads[rid].seq.size();
-            int maxmm_for_read = (MAXMM >= 0) ? MAXMM : std::max(1, Lr0 / 3);
+            int maxmm_for_read = (MAXMM >= 0) ? MAXMM : std::max(1, Lr0 / 8);
             int bestmm = maxmm_for_read + 1; int32_t bestpos = -1; uint8_t bestview = 0;
             for (uint8_t view = 0; view < 2 && !pgidx.empty(); ++view) {
                 const std::string& R = view_seq(rid, view);
@@ -632,7 +652,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& reads, CallData* call_
             uint32_t rid = unresolved[idx];
             const FallbackResult& res = results[idx];
             int Lr0 = (int)reads[rid].seq.size();
-            int maxmm_for_read = (MAXMM >= 0) ? MAXMM : std::max(1, Lr0 / 3);
+            int maxmm_for_read = (MAXMM >= 0) ? MAXMM : std::max(1, Lr0 / 8);
             if (res.bestpos >= 0 && res.bestmm <= maxmm_for_read) {
                 const std::string& target = view_seq(rid, res.bestview);
                 emissions.push_back({(uint32_t)res.bestpos, rid, res.bestview});

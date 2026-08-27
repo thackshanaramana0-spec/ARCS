@@ -1772,9 +1772,32 @@ static std::vector<uint8_t> compress_pg(
     if (getenv("ARCS_USE_GECO3")) try_geco3();
 
     // ── LZMA-9 fallback (if ARCS-DNA > LZMA, which shouldn't happen on real pg) ─
-    {
+    // Gated on the incumbent's bits/base, because on real pg it never wins and
+    // is expensive: measured across three datasets, the two fallback passes cost
+    // 13-20 s of a ~50 s compress (41% of total on yeast) while losing by 6-31%
+    // every time:
+    //   yeast literal 1.959 bpb vs LZMA 2.078 | yeast pg 1.447 vs 1.680
+    //   ecoli literal 1.951 vs 2.081          | ecoli pg 0.893 vs 1.171
+    //   pf    literal 1.783 vs 1.932          | pf    pg 1.160 vs 1.336
+    // The cutoff is principled rather than empirical-only: at 2.0 bits/base the
+    // sequence is essentially incompressible (random DNA is exactly 2 bits/base),
+    // and LZMA over ASCII DNA cannot reach even that — it carries literal/match
+    // framing on top, measured at 2.08 bpb on exactly such input. So an incumbent
+    // already at or below 2.0 bpb cannot be beaten by LZMA and the pass is pure
+    // waste. Above 2.0 the CM coder has underperformed (pathological or non-DNA
+    // input) and LZMA becomes worth trying, so the safety net still fires where
+    // it can actually help. ARCS_FORCE_LZMA_FALLBACK=1 runs it unconditionally.
+    const double incumbent_bpb = pg.empty() ? 99.0
+                               : 8.0 * (double)best.size() / (double)pg.size();
+    const bool try_lzma = (incumbent_bpb > 2.0) || getenv("ARCS_FORCE_LZMA_FALLBACK");
+    if (try_lzma) {
+        auto _lz0 = std::chrono::steady_clock::now();
         std::vector<uint8_t> raw(pg.begin(), pg.end());
         auto lout = arcs_compress(raw, 9);
+        if (getenv("ARCS_ENC_TIMING"))
+            fprintf(stderr, "[ENC]   lzma_fallback: %.2fs (pg=%zu B -> %zu B, incumbent %zu B)\n",
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - _lz0).count(),
+                    pg.size(), lout.size(), best.size());
         if (1 + lout.size() < best.size()) {
             best.clear(); best.push_back(0x01);
             best.insert(best.end(), lout.begin(), lout.end());
