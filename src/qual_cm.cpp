@@ -231,8 +231,28 @@ inline uint32_t build_cf(const Freq& child, const Freq& parent, int qmax,
         w[q] = wq; sum += wq;
     }
     if (sum == 0) { for (int q = 0; q <= qmax; ++q) cf[q] = 1; return (uint32_t)(qmax + 1); }
-    U64Div dv(sum);                             // one reciprocal for all qmax+1 divisions
+    // The magic-number reciprocal pays for itself only when it amortises over
+    // enough divisions. Building it costs a 128-bit division (__uint128_t / d,
+    // a libgcc __udivti3 call, several times the cost of a native 64-bit divide),
+    // and perf puts that call at 4.98% of all decompress cycles -- reached from
+    // decode_block, i.e. this function. On real data qmax is small (measured 3
+    // on yeast: four quality symbols), so the setup was being amortised over
+    // four divisions and losing. Plain division wins below the crossover.
+    //
+    // Both paths compute the same quotient by construction -- that is what a
+    // magic-number reciprocal guarantees -- so this changes speed only, never
+    // output.
+    const bool few = (qmax + 1) <= 8;
     uint32_t tot = 0;
+    if (few) {
+        for (int q = 0; q <= qmax; ++q) {
+            uint32_t v = (uint32_t)((w[q] * CF_TARGET) / sum);
+            if (v == 0) v = 1;
+            cf[q] = v; tot += v;
+        }
+        return tot;
+    }
+    U64Div dv(sum);                             // one reciprocal for all qmax+1 divisions
     for (int q = 0; q <= qmax; ++q) {
         uint32_t v = (uint32_t)dv(w[q] * CF_TARGET);
         if (v == 0) v = 1;
