@@ -1,0 +1,4 @@
+dataset,tool,bytes,comp_s,decomp_s,peak_rss_kb,lossless
+yeast_sub,SPRING,7290880,3.00,0.40,707328,LOSSLESS
+ecoli_sub,SPRING,7290880,4.23,0.48,707384,LOSSLESS
+pf_sub,SPRING,4321280,1.88,0.37,500940,LOSSLESS

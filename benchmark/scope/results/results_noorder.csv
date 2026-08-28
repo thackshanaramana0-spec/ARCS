@@ -1,0 +1,4 @@
+dataset,tool,bytes,comp_s,decomp_s,peak_rss_kb,note
+yeast_sub,PgRC2_noorder,4898653,3.92,0.26,234848,CONTENT_MISMATCH
+ecoli_sub,PgRC2_noorder,3777220,2.68,0.16,222316,CONTENT_OK_ORDER_LOST
+pf_sub,PgRC2_noorder,3115148,1.46,0.16,184584,CONTENT_OK_ORDER_LOST

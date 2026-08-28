@@ -87,6 +87,14 @@ regardless. PgRC2's varies what data survives.
 
 ## Whole archive on scope-matched inputs (read with the caveat above)
 
+**STALE RSS WARNING (2026-08-28):** the peak-RSS column below was measured at
+`4c29ee0`, which predates `49113e0` and `6cd1e82` -- two commits that each cut
+assembly peak memory roughly in half with byte-identical output. Every ARCS RSS
+figure here, and the "~19x worse on peak RSS" conclusion at the end, therefore
+overstates current ARCS. Re-measure before quoting. Size and time columns are
+unaffected. Raw logs for this table are retained in `scope/results/`.
+
+
 | dataset | tool | bytes | compress | decompress | peak RSS |
 |---------|------|-------|----------|------------|----------|
 | yeast | ARCS | 7,066,356 | 19.34 s | 7.01 s | 4.34 GB |

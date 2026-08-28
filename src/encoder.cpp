@@ -2545,7 +2545,17 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
     // at every boundary. PgRC2 codes each of its streams separately and picks a
     // coder per stream. Coding each column on its own statistics is the same
     // idea. Kept only if it beats the single pass, so it can never regress.
-    if (!getenv("ARCS_NO_AUX_SPLIT") && aux_blocks.size() > 1) {
+    // OFF by default: measured, it always loses. Coding the ten columns
+    // separately costs ten extra LZMA-9 passes -- 1.03s of the compress -- and
+    // the result is then discarded, because ~90 bytes of container framing per
+    // column outweighs anything separation buys (single 686,816 vs per-column
+    // 687,725 on yeast). LZMA handles the mixed stream fine.
+    //
+    // Kept behind ARCS_AUX_SPLIT=1 because it answers a real question: PgRC2's
+    // advantage is not stream SEPARATION but per-stream CODER SELECTION (static
+    // FSE for bitmap-like streams, PPMd for symbol streams). Splitting alone,
+    // which is all this does, buys nothing.
+    if (getenv("ARCS_AUX_SPLIT") && aux_blocks.size() > 1) {
         auto put32 = [](std::vector<uint8_t>& v, uint32_t x){
             v.push_back((uint8_t)(x & 0xFF));         v.push_back((uint8_t)((x >> 8) & 0xFF));
             v.push_back((uint8_t)((x >> 16) & 0xFF)); v.push_back((uint8_t)((x >> 24) & 0xFF)); };
@@ -2578,6 +2588,15 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
     if (const char* e = getenv("ARCS_QUAL_SURP_ORDER")) surp_order = atoi(e);
     if (surp_order < 1) surp_order = 1; else if (surp_order > 16) surp_order = 16;
     {
+        // ARCS_QUAL_TIMING=1: the quality stage measures ~4.5s while its coder
+        // accounts for ~1.1s. Declared here, before dev_sets, because the
+        // unattributed time turned out to be ahead of the coder, not inside it.
+        const bool QT = getenv("ARCS_QUAL_TIMING") != nullptr;
+        auto _qt0 = std::chrono::steady_clock::now();
+        auto _qmark = [&](const char* w){ if (QT) { auto t = std::chrono::steady_clock::now();
+            fprintf(stderr, "[QUAL] %-22s %.2fs\n", w, std::chrono::duration<double>(t - _qt0).count()); _qt0 = t; } };
+        _qmark("stage entry");
+
         // Build dev_sets INDEXED BY ORIGINAL READ INDEX.
         // encode_quality_rans indexes dev_sets by reads[dfs_order[i]] = original read idx.
         // Chain position i has original read idx = chain_order[i], so we map accordingly.
@@ -2586,6 +2605,7 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
         // separately — the decoder derives the identical set the same way.
         // Per-read-length dev_sets (matches the decoder, which sizes to each read's
         // length) — supports variable-length reads.
+        _qmark("pre-dev_sets");
         std::vector<std::vector<bool>> orig_dev_sets(reads.size());
         for (size_t i = 0; i < reads.size(); ++i)
             orig_dev_sets[i].assign(reads[i].seq.size(), false);
@@ -2601,6 +2621,7 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
                 if (qp >= 0 && qp < rl) orig_dev_sets[orig_idx][(size_t)qp] = true;
             }
         }
+        _qmark("dev_sets built");
         std::vector<uint32_t> no_parents((size_t)n, UINT32_MAX);
         std::vector<int> dummy_shifts((size_t)n, 0);
         MSTSequenceEncoder mst_q(MSTConfig{});
@@ -2630,12 +2651,6 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
 
         // ARCS_QUAL_TIMING=1: the quality stage measures 4.51s while its coder
         // accounts for 1.23s. Find where the other 3.3s goes before touching it.
-        const bool QT = getenv("ARCS_QUAL_TIMING") != nullptr;
-        auto _qt0 = std::chrono::steady_clock::now();
-        auto _qmark = [&](const char* w){ if (QT) { auto t = std::chrono::steady_clock::now();
-            fprintf(stderr, "[QUAL] %-22s %.2fs\n", w, std::chrono::duration<double>(t - _qt0).count()); _qt0 = t; } };
-        _qmark("stage entry");
-
         // Variable-length reads: the static-rANS quality path assumes a fixed L, so
         // for variable-length data we use ONLY the per-read-length-correct adaptive
         // CM coder (mode 0x07). Fixed-length data keeps the keep-smaller gate.
