@@ -372,7 +372,25 @@ struct APM {
 // decode both use these when no env override is set, so separate compress /
 // decompress processes stay consistent. Env vars exist only for research.
 struct DnaConfig {
-    std::vector<int> orders = {2, 4, 8, 11, 14, 18, 22, 26};
+    // Five orders, not eight. Measured on three datasets, the three dropped
+    // models (11, 18, 26) cost size AND time -- they were not paying for
+    // themselves:
+    //
+    //   dataset  8 orders                 5 orders                 delta
+    //   yeast    13,994,970 / 7.23s       13,978,158 / 5.27s       -16,812 B  -27%
+    //   ecoli    46,130,519 / 6.70s       46,122,968 / 5.32s        -7,551 B  -21%
+    //   pf       13,087,347 / 4.70s       13,080,256 / 4.17s        -7,091 B  -11%
+    //
+    // Smaller on every dataset, so this is not a size/speed trade. Two effects
+    // compound: each model is a hash probe into a table far larger than L2, so
+    // dropping three removes three cache misses per base on BOTH sides; and a
+    // near-duplicate of an order already present adds correlated noise to the
+    // mixer, which has to spend weight updates learning to discount it. Eight
+    // orders was over-fitted -- more models is not more prediction.
+    //
+    // Compress time is unchanged (19.25 -> 19.31s on yeast): encode is
+    // dominated by assembly, not by the coder.
+    std::vector<int> orders = {2, 4, 8, 14, 22};
     std::vector<std::pair<int,int>> stcm;  // (order, edit-threshold) tolerant models
     int mix_bits = 2;    // history bits (beyond node) selecting mixer weight row
     int apm_w    = 2;    // APM blend weight numerator (0 = APM off)
