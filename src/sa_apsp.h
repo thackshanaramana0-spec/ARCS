@@ -84,3 +84,11 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates(
 std::vector<std::vector<APSPCandidate>> build_apsp_candidates_hash(
     const std::vector<std::string_view>& reads_both_views,
     uint32_t n_reads, int max_cands, uint32_t min_overlap, uint32_t search_cap);
+
+// Same contract, BWT + backward search instead of a suffix array plus LCP:
+// peak 6n against 11n (measured 4.77 vs 9.55 bytes/char) because PLCP is never
+// materialised and LCP is never kept. Opt-in via ARCS_FM_APSP=1 while it is
+// being validated. See fm_apsp.cpp.
+std::vector<std::vector<APSPCandidate>> build_apsp_candidates_fm(
+    const std::vector<std::string_view>& reads_both_views,
+    uint32_t n_reads, int max_cands, uint32_t min_overlap, uint32_t search_cap);

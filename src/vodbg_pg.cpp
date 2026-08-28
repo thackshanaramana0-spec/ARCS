@@ -236,7 +236,12 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
     // fast profile. Without it the 2-bit pg codec rides along and its ~5.9%
     // archive cost swamps whatever the index itself does, which made an earlier
     // measurement of "hash_apsp costs 5.9%" meaningless.
-    auto apsp = (getenv("ARCS_FAST_UPGRADE") || getenv("ARCS_HASH_APSP"))
+    // ARCS_FM_APSP selects the BWT + backward-search path (fm_apsp.cpp): same
+    // answers, peak 6n instead of 11n because PLCP is never built and LCP is
+    // never kept. Opt-in until it is measured on every dataset.
+    auto apsp = getenv("ARCS_FM_APSP")
+        ? build_apsp_candidates_fm(both_views, (uint32_t)n, max_cands, (uint32_t)K0, search_cap)
+        : (getenv("ARCS_FAST_UPGRADE") || getenv("ARCS_HASH_APSP"))
         ? build_apsp_candidates_hash(both_views, (uint32_t)n, max_cands, (uint32_t)K0, search_cap)
         : build_apsp_candidates(both_views, (uint32_t)n, max_cands, (uint32_t)K0, search_cap);
     memmark("after apsp");

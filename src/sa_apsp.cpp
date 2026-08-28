@@ -456,5 +456,12 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates(
         _sa_t0 = t1;
     }
 
+    if (getenv("ARCS_APSP_STATS")) {
+        size_t tot=0, nonempty=0, maxov=0;
+        for (auto& v : out) { tot+=v.size(); if(!v.empty()) ++nonempty;
+            for (auto& c : v) if (c.overlap>maxov) maxov=c.overlap; }
+        fprintf(stderr,"[apsp SA] entries=%zu nonempty=%zu cands=%zu maxov=%zu\n",
+                out.size(), nonempty, tot, maxov);
+    }
     return out;
 }
