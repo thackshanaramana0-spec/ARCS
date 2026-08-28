@@ -737,6 +737,16 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
         contig_base[c] = (uint32_t)r.pg.size();
         r.pg += contigs[c];
     }
+    // Post-growth pg length, before the fallback stage appends anything.
+    // The trial selection below compares FINAL pg_len, which is only known
+    // after fallback -- and fallback builds a 660-1014 MB k-mer index that is
+    // the post-SA memory peak, once per trial. If the ORDERING by this figure
+    // matches the ordering by final pg_len, two of those three builds are
+    // avoidable: run growth for all trials, pick the winner here, run fallback
+    // once. ARCS_TRIAL_PROBE=1 prints both so the correlation can be checked.
+    if (getenv("ARCS_TRIAL_PROBE"))
+        fprintf(stderr, "[TRIAL-PROBE] frac=%.2f contigs=%zu post_growth_pg=%zu\n",
+                hq_ov_frac, contigs.size(), r.pg.size());
 
     // ── Expose placements for in-process reference-free calling (arcs --call) ───
     // Same contract as build_multicontig_pg's call_out (see chain_encoder.h):
