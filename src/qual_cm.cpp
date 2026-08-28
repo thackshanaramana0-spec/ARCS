@@ -18,6 +18,7 @@
 // table with a classic carryless range coder — the model is never transmitted, so
 // rich context is free (the lesson the static rANS model could not exploit).
 // Integer-only → encode and decode are bit-exact and portable → lossless.
+#include "arcs_threads.h"
 #include "qual_cm.h"
 #include "container.h"
 #include <cstring>
@@ -526,7 +527,7 @@ static int choose_nblocks(size_t n) {
     // block re-warms its model, so we keep ≥18k reads/block to bound the ratio cost
     // (~0.3%/block); the speed win (parallel encode + parallel decode) dominates.
     // ARCS_QUAL_BLOCKS=1 (or ARCS_QUAL_NOPAR) restores the absolute-best-ratio path.
-    unsigned hc = std::thread::hardware_concurrency(); if (!hc) hc = 4;
+    unsigned hc = (unsigned)arcs_threads(); if (!hc) hc = 4;
     size_t by_reads = n / 18000; if (by_reads < 1) by_reads = 1;
     int nb = (int)std::min<size_t>(hc, by_reads);
     if (nb < 1) nb = 1; if (nb > 64) nb = 64;

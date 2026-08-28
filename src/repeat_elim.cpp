@@ -1,3 +1,4 @@
+#include "arcs_threads.h"
 #include "repeat_elim.h"
 #include "sa_apsp.h"
 
@@ -68,7 +69,7 @@ bool repeat_elim_encode_cap(const std::string& pg, uint32_t K,
     for (size_t t = 0; t < n; ++t) T.push_back(complement_base(pg[n - 1 - t]));
     T.push_back('\0');
 
-    int threads = (int)std::thread::hardware_concurrency();
+    int threads = arcs_threads();
     if (threads < 1) threads = 1;
     if (const char* s = getenv("ARCS_REPEAT_ELIM_SA_THREADS")) { int v = atoi(s); if (v >= 1) threads = v; }
 

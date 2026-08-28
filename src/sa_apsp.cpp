@@ -1,3 +1,4 @@
+#include "arcs_threads.h"
 #include "sa_apsp.h"
 #include <unistd.h>
 #include <cstdio>
@@ -290,7 +291,7 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates(
     // build() stays available as ARCS_VODBG_SA_SERIAL=1 for comparison/
     // fallback, not removed.
     SuffixArray SA;
-    int sa_threads = (int)std::thread::hardware_concurrency();
+    int sa_threads = arcs_threads();
     if (sa_threads < 1) sa_threads = 1;
     if (const char* s = getenv("ARCS_VODBG_SA_THREADS")) { int v = atoi(s); if (v >= 1) sa_threads = v; }
     if (getenv("ARCS_VODBG_SA_SERIAL")) {
@@ -372,7 +373,7 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates(
     // RANGE OF e here changes nothing about what any single e can see (SA
     // already covers every read globally) — it's pure parallel-map, zero
     // coordination needed, not a coverage trade-off.
-    int apsp_threads = (int)std::thread::hardware_concurrency();
+    int apsp_threads = arcs_threads();
     if (apsp_threads < 1) apsp_threads = 1;
     if (const char* s = getenv("ARCS_VODBG_APSP_THREADS")) { int v = atoi(s); if (v >= 1) apsp_threads = v; }
     if ((size_t)apsp_threads > m) apsp_threads = std::max(1, (int)m);

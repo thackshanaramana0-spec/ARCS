@@ -1,3 +1,4 @@
+#include "arcs_threads.h"
 #include <unistd.h>
 #include <string_view>
 #if defined(__GLIBC__)
@@ -471,7 +472,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
     // i.e. 3.55s -- worse than the 3.13s they already take back to back. The
     // trials are also unequal (the widest gate does 5x the work of the
     // narrowest), so concurrency leaves cores idle exactly when it matters.
-    int growth_threads = (int)std::thread::hardware_concurrency();
+    int growth_threads = arcs_threads();
     if (growth_threads < 1) growth_threads = 1;
     // ARCS_DETERMINISTIC=1: byte-identical archives for a given input.
     //
@@ -856,7 +857,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
 
     if (!unresolved.empty()) {
         int Lpg = (int)r.pg.size();
-        int fallback_threads = (int)std::thread::hardware_concurrency();
+        int fallback_threads = arcs_threads();
         if (fallback_threads < 1) fallback_threads = 1;
         if (const char* s = getenv("ARCS_VODBG_FALLBACK_THREADS")) { int v = atoi(s); if (v >= 1) fallback_threads = v; }
 

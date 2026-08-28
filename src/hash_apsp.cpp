@@ -29,6 +29,7 @@
 // away -- and sliding the seed one base is a shift-or rather than a rescan.
 // Walking a read's suffix offsets outward from the longest means the first
 // verified hit at each offset is that pair's longest overlap.
+#include "arcs_threads.h"
 #include "sa_apsp.h"
 #include <cstdio>
 #include <cstdlib>
@@ -108,7 +109,7 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates_hash(
     // out[] is indexed by the PREFIX side (see sa_apsp.h), so a hit at offset
     // `off` in x is recorded against the matched entry e, carrying x's read and
     // view as the candidate. Entries are laid out as 2*rid + view.
-    int threads = (int)std::thread::hardware_concurrency();
+    int threads = arcs_threads();
     if (threads < 1) threads = 1;
     if (const char* s = getenv("ARCS_VODBG_APSP_THREADS")) { int v = atoi(s); if (v >= 1) threads = v; }
     if ((size_t)threads > m) threads = std::max(1, (int)m);

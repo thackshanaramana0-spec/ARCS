@@ -1,3 +1,4 @@
+#include "arcs_threads.h"
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -1396,7 +1397,7 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
     } else if (const char* e2 = getenv("ARCS_SHARD")) {
         int v = atoi(e2); if (v >= 1 && v <= 256) SHARD = v;
     } else if (getenv("ARCS_NO_SHARD") == nullptr && n >= 200000) {
-        unsigned hc = std::thread::hardware_concurrency(); if (!hc) hc = 4;
+        unsigned hc = (unsigned)arcs_threads(); if (!hc) hc = 4;
         SHARD = (int)std::min<unsigned>(hc, 8);
         // Default to minz routing — genomic co-location per shard makes merge trivial.
         // Disable with ARCS_SHARD_NOMINZ=1 to revert to round-robin (diagnostic only).
@@ -1610,7 +1611,7 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
             // RC strings are independent per contig → compute them in parallel (the
             // single biggest serial cost of the merge index build).
             {
-                unsigned hc = std::thread::hardware_concurrency(); if (!hc) hc = 4;
+                unsigned hc = (unsigned)arcs_threads(); if (!hc) hc = 4;
                 int nt = (int)std::min<size_t>(hc, std::max(1, MC / 2000));
                 if (nt <= 1) {
                     for (int c = 0; c < MC; ++c) rcstr[c] = reverse_complement(contigs[c]);
@@ -1640,7 +1641,7 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
             // Disable with ARCS_MERGE_NOPAR=1 to fall back to exact serial behaviour.
             // Serial path below is byte-for-byte identical to the original.
             {
-                unsigned hc_m = std::thread::hardware_concurrency(); if (!hc_m) hc_m = 4;
+                unsigned hc_m = (unsigned)arcs_threads(); if (!hc_m) hc_m = 4;
                 // 1 thread per ~16 contigs, capped at hw thread count. Too few contigs
                 // and thread overhead exceeds benefit (very fast pass anyway).
                 // Require ≥8 cores before enabling parallel merge — at <8 cores the
@@ -1786,7 +1787,7 @@ ChainEncodeResult build_multicontig_pg(const std::vector<Read>& reads, CallData*
             //   no vector race. Remap loop runs post-join (happens-before guarantee).
             //
             // Disable with ARCS_GROW_NOPAR=1 for byte-identical serial behaviour.
-            unsigned hc_g = std::thread::hardware_concurrency(); if (!hc_g) hc_g = 4;
+            unsigned hc_g = (unsigned)arcs_threads(); if (!hc_g) hc_g = 4;
             int nt_g = (getenv("ARCS_GROW_NOPAR") == nullptr && MC > 64 && hc_g >= 8)
                        ? (int)std::min<unsigned>(hc_g, 48u) : 1;
 

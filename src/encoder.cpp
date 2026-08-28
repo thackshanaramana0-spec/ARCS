@@ -1,3 +1,4 @@
+#include "arcs_threads.h"
 #include "encoder.h"
 #include "chain_encoder.h"
 #include "vodbg_pg.h"
@@ -851,7 +852,7 @@ std::vector<uint8_t> ARCSEncoder::encode_names(
     // it parallelizes alongside quality (both feed the multithreaded default). Each
     // split costs ~0.4% ratio; kept to ≥1.5 MB/block to bound it. ARCS_NAMES_BLOCKS
     // overrides; =1 restores single-stream best-ratio names.
-    unsigned hc = std::thread::hardware_concurrency(); if (!hc) hc = 4;
+    unsigned hc = (unsigned)arcs_threads(); if (!hc) hc = 4;
     int nb = (raw.size() < (2u<<20)) ? 1
              : (int)std::min<size_t>(hc, std::max<size_t>(1, raw.size() / (size_t)(1500000)));
     if (const char* e = getenv("ARCS_NAMES_BLOCKS")) { int v = atoi(e); if (v>=1 && v<=64) nb = v; }
@@ -2406,7 +2407,7 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
         //   (2) dataset is too small to amortize thread-launch overhead;
         //   (3) ARCS_PAR_SHARDS=1 is set explicitly.
         // Override thread count: ARCS_PAR_SHARDS=N (N=1 forces serial).
-        const int hw = (int)std::thread::hardware_concurrency();
+        const int hw = arcs_threads();
         int N_shards = std::min(4, hw > 0 ? hw : 1);
         if (const char* sv = getenv("ARCS_PAR_SHARDS")) N_shards = std::max(1, atoi(sv));
         if (call_capture_ || n < 8000) N_shards = 1;
@@ -2538,6 +2539,45 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
     std::vector<std::pair<size_t,size_t>> aux_blocks;
     auto aux_raw  = serialize_chain_pg_aux(result, &aux_blocks);
     auto aux_blob = arcs_compress(aux_raw, 9);
+
+    // ── ARCS_CODER_PROBE: is per-stream CODER selection worth anything? ─────
+    // Print-only, alters no blob, so it cannot affect the archive. This answers
+    // the question the ARCS_AUX_SPLIT note below leaves open: stream SEPARATION
+    // was measured and loses, but LZMA-9 is the only coder pos/aux have ever
+    // been through. bsc_codec.h claims BWT+QLFC beats LZMA on structured delta
+    // streams, and pos_raw is exactly that (zigzag-delta varints). PgRC2 tries
+    // PPMd/range/FSE/LZMA per stream and keeps the winner; this measures
+    // whether that design has anything in it for us before any format changes.
+    if (getenv("ARCS_CODER_PROBE")) {
+        auto try_bsc = [](const std::vector<uint8_t>& raw) -> size_t {
+            if (raw.empty()) return 0;
+            try { return bsc_compress_buf(raw).size(); } catch (...) { return SIZE_MAX; }
+        };
+        auto pct = [](size_t cand, size_t base) {
+            return base ? 100.0 * ((double)cand / (double)base - 1.0) : 0.0; };
+        const size_t pos_bsc = try_bsc(pos_raw), aux_bsc = try_bsc(aux_raw);
+        fprintf(stderr, "[CODER-PROBE] pos raw=%zu lzma=%zu bsc=%zu (%+.2f%%)\n",
+                pos_raw.size(), pos_blob.size(), pos_bsc, pct(pos_bsc, pos_blob.size()));
+        fprintf(stderr, "[CODER-PROBE] aux raw=%zu lzma=%zu bsc=%zu (%+.2f%%)\n",
+                aux_raw.size(), aux_blob.size(), aux_bsc, pct(aux_bsc, aux_blob.size()));
+        if (aux_blocks.size() > 1) {
+            size_t tot_best = 0;
+            for (size_t i = 0; i < aux_blocks.size(); ++i) {
+                const auto& b = aux_blocks[i];
+                std::vector<uint8_t> raw(aux_raw.begin() + (ptrdiff_t)b.first,
+                                         aux_raw.begin() + (ptrdiff_t)(b.first + b.second));
+                const size_t cl = raw.empty() ? 0 : arcs_compress(raw, 9).size();
+                const size_t cb = try_bsc(raw);
+                const size_t best = std::min(std::min(cl, cb), raw.size());
+                tot_best += best;
+                fprintf(stderr, "[CODER-PROBE]   col%zu raw=%zu lzma=%zu bsc=%zu -> %s\n",
+                        i, raw.size(), cl, cb,
+                        best == raw.size() ? "store" : (best == cb ? "bsc" : "lzma"));
+            }
+            fprintf(stderr, "[CODER-PROBE] aux per-column best-of=%zu vs single-lzma=%zu (%+.2f%%)\n",
+                    tot_best, aux_blob.size(), pct(tot_best, aux_blob.size()));
+        }
+    }
     // ── per-column coding (aux container 0xA2) ───────────────────────────────
     // The ten columns are statistically unrelated -- a strand bitmap, varint
     // counts, 16-bit positions, 2-bit bases -- and compressing their
@@ -3066,7 +3106,7 @@ void ARCSEncoder::compress_chunked(const std::string& input_path,
     // count; ARCS_CHUNK_THREADS overrides. Each sub-encoder is run with its OWN
     // internal parallelism throttled (ARCS_ENC_NOPAR + single quality/name block)
     // so T outer × inner threads don't oversubscribe.
-    unsigned T = std::thread::hardware_concurrency(); if (!T) T = 4;
+    unsigned T = (unsigned)arcs_threads(); if (!T) T = 4;
     if (const char* e = getenv("ARCS_CHUNK_THREADS")) { int v = atoi(e); if (v >= 1 && v <= 128) T = (unsigned)v; }
 
     // Compress one in-memory chunk to inner-archive bytes (via a unique temp pair).

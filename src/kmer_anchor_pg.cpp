@@ -1,3 +1,4 @@
+#include "arcs_threads.h"
 #include "kmer_anchor_pg.h"
 
 #include <algorithm>
@@ -240,7 +241,7 @@ ChainEncodeResult build_kmer_anchor_pg(const std::vector<Read>& reads, bool allo
     // serial's 34.0M) — quality is thread-count-independent here, so there's
     // no reason to leave cores idle. Override via ARCS_KA_INDEX_THREADS
     // (1 = serial).
-    int idx_threads = (int)std::thread::hardware_concurrency();
+    int idx_threads = arcs_threads();
     if (idx_threads < 1) idx_threads = 1;
     if (const char* s = getenv("ARCS_KA_INDEX_THREADS")) { int v = atoi(s); if (v >= 1) idx_threads = v; }
     FlatKmerIndex kidx = build_index_parallel(n, K0, BUCKET_CAP, idx_threads, view_seq);

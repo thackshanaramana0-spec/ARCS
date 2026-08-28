@@ -1,3 +1,4 @@
+#include "arcs_threads.h"
 #include <thread>
 #include <future>
 #include <chrono>
@@ -1014,7 +1015,7 @@ static void decompress_chunked_impl(const std::string& input_path,
     // Wave-parallel decode: decompress up to T chunks CONCURRENTLY to per-chunk temp
     // FASTQs, then append them to the output IN ORDER. Peak RAM = O(T × chunk) — the
     // chunked-mode property, now with decode parallelism (chunks are independent).
-    unsigned T = std::thread::hardware_concurrency(); if (!T) T = 4;
+    unsigned T = (unsigned)arcs_threads(); if (!T) T = 4;
     if (const char* e = getenv("ARCS_CHUNK_THREADS")) { int v = atoi(e); if (v >= 1 && v <= 128) T = (unsigned)v; }
 
     auto decode_one = [&](uint32_t ci) {
