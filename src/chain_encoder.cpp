@@ -624,7 +624,7 @@ int MAX_BUCKET = []{ const char* s = getenv("ARCS_DEDUP_BUCKET"); return s ? ato
 // Record a read that maps onto existing pg at (pos, rc). target = RC^rc(orig).
 // Uses the read's ACTUAL length (target.size()) so variable-length reads work.
 void record_mapped(ChainEncodeResult& r, uint32_t oi, uint32_t pos, int rc,
-                   const std::string& target, int /*L_ignored*/) {
+                   std::string_view target, int /*L_ignored*/) {
     const int L = (int)target.size();
     uint32_t mm_cnt = 0, N_cnt = 0, qmm_cnt = 0;
     for (int j = 0; j < L; ++j) {
@@ -659,7 +659,7 @@ void record_mapped(ChainEncodeResult& r, uint32_t oi, uint32_t pos, int rc,
 }
 
 // Append a read as a new forward reference segment (N → 'A' in pg).
-void record_append(ChainEncodeResult& r, uint32_t oi, const std::string& orig, int /*L_ignored*/) {
+void record_append(ChainEncodeResult& r, uint32_t oi, std::string_view orig, int /*L_ignored*/) {
     const int L = (int)orig.size();
     uint32_t pos = (uint32_t)r.pg.size();
     uint32_t N_cnt = 0;

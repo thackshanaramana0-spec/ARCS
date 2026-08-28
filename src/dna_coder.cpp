@@ -395,11 +395,12 @@ static void autosize_hash_bits(size_t N) {
     // otherwise pick 2^24 (~64 MB/model). This is a CAP, not a floor: small pgs still
     // size down naturally, so it never inflates a small input.
     int cap = 24;
-    // ARCS_FAST_UPGRADE trades table size for memory. Measured on yeast: cap 24
-    // -> 20 costs 422 bytes of a 14 MB archive (0.003%) and returns 241 MB of
-    // peak RSS, because a 2^24-entry table is sized for a pseudogenome far
-    // larger than these. An explicit ARCSDNA_HBITS_MAX still wins over both.
-    if (getenv("ARCS_FAST_UPGRADE")) cap = 20;
+    // NOT capped for ARCS_FAST_UPGRADE. Isolating it showed the cap returns only
+    // ~41 MB (an earlier 241 MB reading was run-to-run variance measured while
+    // something else moved) and nothing at all on the default path, where the
+    // suffix array holds the peak. It also cannot help speed: the coder's cost
+    // is per-base model updates, not table size. The fast profile drops the FCM
+    // coder outright instead, which addresses both axes.
     if (const char* e = getenv("ARCSDNA_HBITS_MAX")) { int v = atoi(e); if (v >= 12 && v <= 24) cap = v; }
     int b = 18; if (b > cap) b = cap;
     while (((size_t)1 << b) < 2 * N && b < cap) ++b;  // ≥2× N entries, capped at 2^cap

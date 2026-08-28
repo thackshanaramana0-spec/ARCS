@@ -19,7 +19,14 @@ struct SuffixArray {
     // realistic benefit). build_libsais enforces this ceiling explicitly
     // (throws rather than silently truncating) if ever actually exceeded.
     std::vector<uint32_t> sa;   // sa[i] = start position of the i-th suffix in sorted order
-    std::vector<uint32_t> lcp;  // lcp[i] = LCP(suffix at sa[i-1], suffix at sa[i]); lcp[0] = 0
+    // uint16, not uint32. Every LCP here is a match between two read suffixes
+    // in a text whose reads are separated by a byte no base can equal, so the
+    // values live in read-length territory (~150) while a uint32 reserves four
+    // bytes for each. At 257 Mchar that halved array is ~490 MB off the
+    // construction peak. Values are saturated at 65535 on the way in, which is
+    // lossless for every use here: overlaps are capped at the read length, and
+    // chain-pg already refuses reads longer than 65535 bp.
+    std::vector<uint16_t> lcp; // lcp[i] = LCP(suffix at sa[i-1], suffix at sa[i]); lcp[0] = 0
 
     void build(const std::string& text);
 

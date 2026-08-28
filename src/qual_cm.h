@@ -14,6 +14,7 @@
 // L                 = read length.
 #include <vector>
 #include <string>
+#include <string_view>
 #include <cstdint>
 
 // seqs (optional, the GAME-CHANGER lever): per-read base sequence in the SAME
@@ -32,7 +33,7 @@ std::vector<uint8_t> qual_cm_encode(
     const std::vector<uint32_t>&             order,
     const std::vector<std::vector<bool>>&    dev_sets,
     int                                      L,
-    const std::vector<std::string>*          seqs  = nullptr,
+    const std::vector<std::string_view>*    seqs  = nullptr,
     bool                                     is_pe = false);
 
 // Decodes a stream produced by qual_cm_encode into rq_out (indexed by read index,
@@ -44,5 +45,5 @@ bool qual_cm_decode(
     const std::vector<std::vector<bool>>&    dev_sets,
     int                                      L,
     std::vector<std::vector<uint8_t>>&       rq_out,
-    const std::vector<std::string>*          seqs  = nullptr,
+    const std::vector<std::string_view>*    seqs  = nullptr,
     const std::vector<int>*                  rlens = nullptr);   // per-read lengths

@@ -1205,7 +1205,7 @@ void ARCSEncoder::encode_amplicon(const std::vector<Read>& reads,
     }
 
     std::vector<std::vector<uint8_t>> rq(reads.size());
-    std::vector<std::string>          seqvec(reads.size());
+    std::vector<std::string_view>     seqvec(reads.size());
     std::vector<std::vector<bool>>    dev_sets(reads.size());
     for (size_t i = 0; i < reads.size(); ++i) {
         const std::string& qs = reads[i].qual;
@@ -1522,7 +1522,15 @@ static std::vector<uint8_t> compress_pg(
     // ARCS_PG_2BIT=1: pack 4 bases/byte (Z4: A=0,C=1,T=2,G=3) then LZMA-9.
     // Decode ~10ms vs 26s FCM on 12MB pg. Ratio +2.2% vs FCM (DS2, M2).
     // Non-ACTG pg falls back to vle_encode_pg payload (lossless, same 0x08 flag).
-    if (getenv("ARCS_PG_2BIT")) {
+    // ARCS_FAST_UPGRADE selects this too. The adaptive FCM coder is the single
+    // largest cost on BOTH axes the fast profile exists to reduce: it is ~72% of
+    // decompress (it re-trains its model per base on the decode side, which no
+    // table-size change can fix) and its tables are the encode-stage RSS peak
+    // once the suffix array is gone. Packing 4 bases/byte before LZMA also hands
+    // the compressor a quarter of the bytes, so it is far cheaper at encode than
+    // the ASCII-LZMA path (format 0x07), which was measurably SLOWER to compress
+    // than FCM despite being faster to decode.
+    if (getenv("ARCS_PG_2BIT") || (getenv("ARCS_FAST_UPGRADE") && !getenv("ARCS_PG_FAST_DECODE"))) {
         auto payload = pg_encode_2bit(pg);
         std::vector<uint8_t> out = {0x08};
         out.insert(out.end(), payload.begin(), payload.end());
@@ -1828,7 +1836,11 @@ static std::vector<uint8_t> compress_pg(
 //     col_Npos:    uint16_le per N entry (pos in enc_seq frame)
 //     col_qmmcnt:  varint qmm_count per read
 //     col_qmmpos:  uint16_le per qmm entry (pos in orig-read frame)
-static std::vector<uint8_t> serialize_chain_pg_aux(const ChainEncodeResult& r) {
+// blocks_out (optional): byte ranges of the header and each column within the
+// returned buffer, so the caller can entropy-code them separately instead of
+// handing one compressor ten unrelated streams glued together.
+static std::vector<uint8_t> serialize_chain_pg_aux(const ChainEncodeResult& r,
+        std::vector<std::pair<size_t,size_t>>* blocks_out = nullptr) {
     size_t n = r.pg_pos.size();
     std::vector<uint8_t> col_rc;
     std::vector<uint8_t> col_mmcnt, col_mmpos, col_mmbase;
@@ -1922,8 +1934,15 @@ static std::vector<uint8_t> serialize_chain_pg_aux(const ChainEncodeResult& r) {
                 col_mmrank.push_back(rank);
             }
         }
+        // Compare against the TRUE absolute encoding, taken from
+        // pg_mm_base_flat, not against col_mmbase: under aux v1 (the default)
+        // col_mmbase already holds rank-of-3 values, so using it here compared
+        // the transform against itself and reported an identical size both
+        // sides -- which read as "rank-of-3 buys nothing" when it was really
+        // measuring nothing at all.
+        std::vector<uint8_t> col_mmabs(r.pg_mm_base_flat.begin(), r.pg_mm_base_flat.end());
         fprintf(stderr, "[MMBASE-DBG] raw_absolute compressed=%zu | rank_of_3 compressed=%zu (n_mismatches=%zu)\n",
-                arcs_compress(col_mmbase, 9).size(), arcs_compress(col_mmrank, 9).size(), col_mmbase.size());
+                arcs_compress(col_mmabs, 9).size(), arcs_compress(col_mmrank, 9).size(), col_mmabs.size());
     }
 
     for (uint32_t c : r.pg_N_counts)   write_varint(col_Ncnt, c);
@@ -1984,9 +2003,13 @@ static std::vector<uint8_t> serialize_chain_pg_aux(const ChainEncodeResult& r) {
     if (aux_v1) pu32(out, 1u);
 
     // Stream order: col_Nchar + col_readlen before col_qmmpos (size-derived, last).
+    if (blocks_out) { blocks_out->clear(); blocks_out->push_back({0, out.size()}); }  // header
     for (auto* c : {&col_rc,&col_mmcnt,&col_mmpos,&col_mmbase,
-                    &col_Ncnt,&col_Npos,&col_qmmcnt,&col_readlen,&col_Nchar,&col_qmmpos})
+                    &col_Ncnt,&col_Npos,&col_qmmcnt,&col_readlen,&col_Nchar,&col_qmmpos}) {
+        const size_t at = out.size();
         out.insert(out.end(), c->begin(), c->end());
+        if (blocks_out) blocks_out->push_back({at, c->size()});
+    }
     return out;
 }
 
@@ -2512,8 +2535,40 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
     // do not store it — clear it before serialization.
     result.pg_qmm_counts.assign((size_t)n, 0);
     result.pg_qmm_pos_flat.clear();
-    auto aux_raw  = serialize_chain_pg_aux(result);
+    std::vector<std::pair<size_t,size_t>> aux_blocks;
+    auto aux_raw  = serialize_chain_pg_aux(result, &aux_blocks);
     auto aux_blob = arcs_compress(aux_raw, 9);
+    // ── per-column coding (aux container 0xA2) ───────────────────────────────
+    // The ten columns are statistically unrelated -- a strand bitmap, varint
+    // counts, 16-bit positions, 2-bit bases -- and compressing their
+    // concatenation forces one adaptive model to serve all of them, re-learning
+    // at every boundary. PgRC2 codes each of its streams separately and picks a
+    // coder per stream. Coding each column on its own statistics is the same
+    // idea. Kept only if it beats the single pass, so it can never regress.
+    if (!getenv("ARCS_NO_AUX_SPLIT") && aux_blocks.size() > 1) {
+        auto put32 = [](std::vector<uint8_t>& v, uint32_t x){
+            v.push_back((uint8_t)(x & 0xFF));         v.push_back((uint8_t)((x >> 8) & 0xFF));
+            v.push_back((uint8_t)((x >> 16) & 0xFF)); v.push_back((uint8_t)((x >> 24) & 0xFF)); };
+        std::vector<uint8_t> v2;
+        v2.push_back(0xA2);
+        put32(v2, (uint32_t)aux_blocks.size());
+        std::vector<std::vector<uint8_t>> comp;
+        comp.reserve(aux_blocks.size());
+        for (const auto& b : aux_blocks) {
+            std::vector<uint8_t> raw(aux_raw.begin() + (ptrdiff_t)b.first,
+                                     aux_raw.begin() + (ptrdiff_t)(b.first + b.second));
+            auto c = arcs_compress(raw, 9);
+            // A column that resists compression is stored verbatim rather than
+            // paying container overhead for nothing.
+            if (c.size() >= raw.size()) { put32(v2, (uint32_t)b.second); put32(v2, 0u); comp.push_back(std::move(raw)); }
+            else                        { put32(v2, (uint32_t)b.second); put32(v2, (uint32_t)c.size()); comp.push_back(std::move(c)); }
+        }
+        for (const auto& c : comp) v2.insert(v2.end(), c.begin(), c.end());
+        if (getenv("ARCS_AUX_DEBUG"))
+            fprintf(stderr, "[AUX-SPLIT] single=%zu per-column=%zu (%s)\n",
+                    aux_blob.size(), v2.size(), v2.size() < aux_blob.size() ? "per-column wins" : "single wins");
+        if (v2.size() < aux_blob.size()) aux_blob.swap(v2);
+    }
 
     // ── Quality: re-encode using pg dev_sets + no parent deltas ─────────────
     // The chain encoder's quality used chain-delta parents; decoder uses
@@ -2661,8 +2716,11 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
             const bool binned    = (ndist <= 24);
             const bool force_both = (getenv("ARCS_QUAL_BOTH") != nullptr);
             const bool want_seq  = (getenv("ARCS_QUAL_NOSEQ") == nullptr) && (!binned || force_both);
-            std::vector<std::string> seqvec;
-            const std::vector<std::string>* seqp = nullptr;
+            // Views, not copies: qual_cm only reads these. Materialising them
+            // duplicated every sequence (~200 MB here) during the encode stage,
+            // which is exactly where peak RSS sits once the assembly is done.
+            std::vector<std::string_view> seqvec;
+            const std::vector<std::string_view>* seqp = nullptr;
             if (want_seq) {
                 seqvec.resize(reads.size());
                 for (size_t i = 0; i < reads.size(); ++i) seqvec[i] = reads[i].seq;

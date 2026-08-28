@@ -118,7 +118,7 @@ bool repeat_elim_encode_cap(const std::string& pg, uint32_t K,
             uint32_t running = UINT32_MAX;
             uint32_t steps = 0;
             for (int64_t rr = (int64_t)r - 1; rr >= 0 && steps < search_cap; --rr, ++steps) {
-                running = std::min(running, SA.lcp[(size_t)(rr + 1)]);
+                running = std::min(running, (uint32_t)SA.lcp[(size_t)(rr + 1)]);
                 if (running < K) break;
                 uint32_t p = SA.sa[(size_t)rr];
                 if (p < (uint32_t)n) consider_forward(p, running);
@@ -127,7 +127,7 @@ bool repeat_elim_encode_cap(const std::string& pg, uint32_t K,
             running = UINT32_MAX;
             steps = 0;
             for (size_t rr = (size_t)r + 1; rr < Tn && steps < search_cap; ++rr, ++steps) {
-                running = std::min(running, SA.lcp[rr]);
+                running = std::min(running, (uint32_t)SA.lcp[rr]);
                 if (running < K) break;
                 uint32_t p = SA.sa[rr];
                 if (p < (uint32_t)n) consider_forward(p, running);

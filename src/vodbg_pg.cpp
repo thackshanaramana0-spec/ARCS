@@ -1,5 +1,8 @@
 #include <unistd.h>
 #include <string_view>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include "vodbg_pg.h"
 #include "sa_apsp.h"
 #include "flat_kmer_index.h"
@@ -28,7 +31,7 @@ namespace {
 // Only used by the fallback placement pass now (see below) — the main
 // discovery/growth path uses exact suffix-array overlaps (sa_apsp.h), not
 // k-mer anchors.
-inline bool pack_kmer(const std::string& s, int off, int K, uint64_t& out) {
+inline bool pack_kmer(std::string_view s, int off, int K, uint64_t& out) {
     uint64_t v = 0;
     for (int j = 0; j < K; ++j) {
         uint8_t b = encode_base(s[(size_t)(off + j)]);
@@ -160,11 +163,44 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
 
     // ── Build the two views (forward, reverse-complement) of every read once ────
     memmark("after dedup");
-    std::vector<std::string> rcseq(n);
-    for (size_t i = 0; i < n; ++i) rcseq[i] = reverse_complement(R(i).seq);
+    // One arena, not 851k allocations. Each reverse-complement view used to be
+    // its own std::string: a 32-byte header plus a separate heap block with its
+    // own allocator overhead and rounding, for a payload that is a fixed ~150
+    // bytes. Packed end to end into a single buffer with an offset table, the
+    // per-string overhead disappears and the views become contiguous, which also
+    // helps the growth loop's access pattern.
+    //
+    // view_seq still hands back a string_view over the same bytes, so every
+    // caller is unchanged and the output is identical.
+    std::vector<char>     rc_arena;
+    std::vector<uint32_t> rc_off(n + 1, 0);
+    {
+        size_t total = 0;
+        for (size_t i = 0; i < n; ++i) total += R(i).seq.size();
+        rc_arena.resize(total);
+        size_t at = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const std::string& fwd = R(i).seq;
+            rc_off[i] = (uint32_t)at;
+            // reverse complement straight into the arena -- no temporary string
+            const size_t len = fwd.size();
+            for (size_t k = 0; k < len; ++k) {
+                const char c = fwd[len - 1 - k];
+                char o;
+                switch (c) { case 'A': o = 'T'; break; case 'T': o = 'A'; break;
+                             case 'C': o = 'G'; break; case 'G': o = 'C'; break;
+                             default:  o = c;   break; }
+                rc_arena[at + k] = o;
+            }
+            at += len;
+        }
+        rc_off[n] = (uint32_t)at;
+    }
     memmark("after rcseq");
-    auto view_seq = [&](uint32_t rid, uint8_t view) -> const std::string& {
-        return view == 0 ? R(rid).seq : rcseq[rid];
+    auto view_seq = [&](uint32_t rid, uint8_t view) -> std::string_view {
+        return view == 0 ? std::string_view(R(rid).seq)
+                         : std::string_view(rc_arena.data() + rc_off[rid],
+                                            rc_off[rid + 1] - rc_off[rid]);
     };
 
     // ── APSP candidate table (exact suffix-array overlap discovery) ────────────
@@ -190,7 +226,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
     // because the allocator keeps the arena. The APSP builders only ever read
     // .data()/.size(), so a string_view is sufficient.
     std::vector<std::string_view> both_views((size_t)n * 2);
-    for (size_t i = 0; i < n; ++i) { both_views[2*i] = R(i).seq; both_views[2*i+1] = rcseq[i]; }
+    for (size_t i = 0; i < n; ++i) { both_views[2*i] = R(i).seq; both_views[2*i+1] = view_seq((uint32_t)i, 1); }
     memmark("after both_views");
     // ARCS_FAST_UPGRADE=1 swaps the suffix array for a seed-hash index: same
     // candidate contract, a few GB less peak, at the cost of the short and
@@ -518,10 +554,21 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
                 first_overlap = cand_list[0].overlap;
                 first_was_claimed = claimed[cand_list[0].rid].load(std::memory_order_acquire);
             }
+            // ARCS_FWD_ONLY_GROWTH=1: refuse reverse-complement placements during
+            // growth, the way PgRC2 does -- it chains reads in the orientation
+            // given and only ever flips one in the later mapping stage. The
+            // consequence is the strand-flag stream: ours is 47.8% ones with a
+            // mean run of 2.45 (a fair coin, 0.975 bits conditional entropy, so
+            // 130,712 B is within 7% of its floor and no coder can do better),
+            // while theirs is skewed enough to reach 0.437 bits / 54,019 B.
+            // Free orientation buys shorter contigs and pays for it in flags;
+            // this gate exists to measure which way that trade actually nets.
+            static const bool FWD_ONLY = getenv("ARCS_FWD_ONLY_GROWTH") != nullptr;
             for (const auto& c : cand_list) {
                 if (claimed[c.rid].load(std::memory_order_acquire) || !is_hq[c.rid]) continue;
                 uint8_t cand_view = (uint8_t)(1 - c.view);
-                const std::string& R = view_seq(c.rid, cand_view);
+                if (FWD_ONLY && cand_view != 0) continue;
+                const std::string_view R = view_seq(c.rid, cand_view);
                 int L = (int)c.overlap;
                 if (L > Ls || L > (int)R.size()) continue;
                 if (memcmp(R.data(), S.data() + (Ls - L), (size_t)L) != 0) continue; // stale anchor — skip, try next
@@ -576,7 +623,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
             }
             if (!g.found) continue;
 
-            const std::string& R = view_seq(g.rid, g.view);
+            const std::string_view R = view_seq(g.rid, g.view);
             if (p.dir == 0) {
                 std::string& C = ts.contigs[p.cid];
                 place[g.rid] = {true, p.cid, (uint32_t)(C.size() - g.overlap), g.view};
@@ -614,6 +661,25 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
         for (auto& th : ths) th.join();
     }
     memmark("after growth");
+    // The candidate table is read ONLY by growth, but it stayed live through the
+    // fallback k-mer index build and the emission pass -- and the fallback build
+    // is where peak RSS actually lands (measured across the three trials: 2405,
+    // 2407, 2964 MB, the last being the peak). It is ~1.7M small vectors, one
+    // per read-view, so releasing it before the biggest allocation of the run
+    // costs nothing and changes no output byte: growth has already joined and
+    // nothing downstream reads it again.
+    //
+    // Only on the final trial -- earlier trials still need it for their own
+    // growth pass. malloc_trim is what makes the release visible: glibc keeps
+    // freed arenas by default, so an earlier measurement recovered only 52 MB of
+    // a 312 MB free until the arena was returned explicitly.
+    if (trial + 1 == hq_candidates.size()) {
+        apsp.clear(); apsp.shrink_to_fit();
+#if defined(__GLIBC__)
+        malloc_trim(0);
+#endif
+        memmark("apsp released");
+    }
 
     size_t total_contigs_dbg = 0;
     for (auto& ts : tstate) total_contigs_dbg += ts.contigs.size();
@@ -708,7 +774,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
         long bad = 0, tiny_mm = 0, huge_mm = 0;
         for (uint32_t i : resolved) {
             uint32_t abs_pos = contig_base[place[i].cid] + place[i].off;
-            const std::string& target = view_seq(i, place[i].view);
+            const std::string_view target = view_seq(i, place[i].view);
             if (abs_pos + target.size() > r.pg.size()) { ++bad; continue; }
             int mm = 0;
             for (size_t j = 0; j < target.size(); ++j)
@@ -794,7 +860,12 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
             // ARCS_FAST_UPGRADE: exact-size CSR table instead of fixed buckets --
             // a few hundred MB instead of ~1 GB here, and no k-mer dropped to a
             // full bucket (see flat_kmer_index.h).
-            if (getenv("ARCS_FAST_UPGRADE"))
+            // ARCS_CSR_INDEX gives the CSR table its own switch, independent of
+            // the fast profile: it is exact where the fixed-bucket table DROPS
+            // k-mers once a bucket fills, so it may well place reads better
+            // rather than merely cheaper. That makes it a size question, not
+            // only a memory one, and it has to be measured on its own.
+            if (getenv("ARCS_FAST_UPGRADE") || getenv("ARCS_CSR_INDEX"))
                 pgidx = build_flat_kmer_index_csr(n_positions, fallback_threads, emit_pg_kmers);
             else
                 pgidx = build_flat_kmer_index_parallel(n_positions, BUCKET_CAP, fallback_threads,
@@ -810,7 +881,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
             int maxmm_for_read = (MAXMM >= 0) ? MAXMM : std::max(1, Lr0 / 8);
             int bestmm = maxmm_for_read + 1; int32_t bestpos = -1; uint8_t bestview = 0;
             for (uint8_t view = 0; view < 2 && !pgidx.empty(); ++view) {
-                const std::string& R = view_seq(rid, view);
+                const std::string_view R = view_seq(rid, view);
                 int Lr = (int)R.size();
                 if (Lr < K0) continue;
                 const int seed_offs[3] = {0, (Lr - K0) / 2, Lr - K0};
@@ -851,7 +922,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
             int Lr0 = (int)R(rid).seq.size();
             int maxmm_for_read = (MAXMM >= 0) ? MAXMM : std::max(1, Lr0 / 8);
             if (res.bestpos >= 0 && res.bestmm <= maxmm_for_read) {
-                const std::string& target = view_seq(rid, res.bestview);
+                const std::string_view target = view_seq(rid, res.bestview);
                 for (uint32_t oi : dups[rid])
                     emissions.push_back({(uint32_t)res.bestpos, oi, rid, res.bestview});
                 if (co) {
@@ -878,7 +949,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
                         co->read_rc[rid]  = res.bestview;
                     } else {
                         uint32_t new_cid = (uint32_t)co->contigs.size();
-                        co->contigs.push_back(target);
+                        co->contigs.emplace_back(target);   // CallData owns its contigs
                         co->read_cid[rid] = new_cid;
                         co->read_pos[rid] = 0;
                         co->read_rc[rid]  = res.bestview;
@@ -923,7 +994,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
     std::sort(emissions.begin(), emissions.end(),
               [](const Emission& a, const Emission& b) { return a.pos < b.pos; });
     for (const Emission& e : emissions) {
-        const std::string& target = view_seq(e.uid, e.view);   // sequence: unique index
+        const std::string_view target = view_seq(e.uid, e.view);   // sequence: unique index
         record_mapped(r, e.rid, e.pos, (int)e.view, target, (int)target.size());  // identity: original index
     }
 

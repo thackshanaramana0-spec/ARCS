@@ -3,6 +3,7 @@
 #include "mst_encoder.h"
 #include <vector>
 #include <string>
+#include <string_view>
 #include <cstdint>
 
 // ── Greedy chain encoder (trial11) ────────────────────────────────────────────
@@ -30,8 +31,8 @@
 // know which assembler produced a given archive.
 bool is_acgt_strict(char c);
 void record_mapped(struct ChainEncodeResult& r, uint32_t oi, uint32_t pos, int rc,
-                   const std::string& target, int L_ignored);
-void record_append(struct ChainEncodeResult& r, uint32_t oi, const std::string& orig, int L_ignored);
+                   std::string_view target, int L_ignored);
+void record_append(struct ChainEncodeResult& r, uint32_t oi, std::string_view orig, int L_ignored);
 
 struct ChainEncodeResult {
     // Verbatim sequences + N-positions (separate LZMA blob for better compression)

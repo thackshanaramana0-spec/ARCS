@@ -713,7 +713,10 @@ void ARCSDecoder::decode_amplicon(const ARCSReader& rdr, FASTQWriter& out_writer
 
         std::vector<std::vector<uint8_t>> rq_out(n);
         for (size_t i = 0; i < n; ++i) rq_out[i].assign((size_t)rlens[i], 0);
-        bool q_ok = qual_cm_decode(q_blob, perm, dev_sets, L, rq_out, &seqvec, &rlens);
+        // qual_cm reads sequences without owning them; hand it views over the
+        // vectors already decoded rather than duplicating every sequence.
+        std::vector<std::string_view> seqview(seqvec.begin(), seqvec.end());
+        bool q_ok = qual_cm_decode(q_blob, perm, dev_sets, L, rq_out, &seqview, &rlens);
         ARCS_CHECK(q_ok, "amplicon: adaptive-CM quality decode failed");
         for (size_t i = 0; i < n; ++i) {
             output[i].qual.resize(rlens[i]);
@@ -1323,7 +1326,40 @@ void ARCSDecoder::decode_wgs_chain_pg(const ARCSReader& rdr, FASTQWriter& out_wr
 
     // Main thread: LZMA decompress fast blobs while pg runs in background.
     auto pos_raw = arcs_decompress(_pos_comp.data(), _pos_comp.size());
-    auto aux_raw = arcs_decompress(_aux_comp.data(), _aux_comp.size());
+    // Aux container 0xA2: header and each column coded separately (see the
+    // encoder). Reassemble into exactly the buffer the single-pass path would
+    // have produced, so everything below parses identically.
+    std::vector<uint8_t> aux_raw;
+    if (!_aux_comp.empty() && _aux_comp[0] == 0xA2) {
+        size_t o = 1;
+        auto rd32 = [&](void) -> uint32_t {
+            ARCS_CHECK(o + 4 <= _aux_comp.size(), "chain-pg: aux container truncated");
+            uint32_t v = (uint32_t)_aux_comp[o] | ((uint32_t)_aux_comp[o+1] << 8) |
+                         ((uint32_t)_aux_comp[o+2] << 16) | ((uint32_t)_aux_comp[o+3] << 24);
+            o += 4; return v;
+        };
+        const uint32_t nblk = rd32();
+        ARCS_CHECK(nblk > 0 && nblk < 64, "chain-pg: implausible aux block count");
+        std::vector<std::pair<uint32_t,uint32_t>> hdr(nblk);   // (raw_len, comp_len)
+        for (uint32_t i = 0; i < nblk; ++i) { hdr[i].first = rd32(); hdr[i].second = rd32(); }
+        for (uint32_t i = 0; i < nblk; ++i) {
+            const uint32_t raw_len = hdr[i].first, comp_len = hdr[i].second;
+            if (comp_len == 0) {                                // stored verbatim
+                ARCS_CHECK(o + raw_len <= _aux_comp.size(), "chain-pg: aux block truncated");
+                aux_raw.insert(aux_raw.end(), _aux_comp.begin() + (ptrdiff_t)o,
+                               _aux_comp.begin() + (ptrdiff_t)(o + raw_len));
+                o += raw_len;
+            } else {
+                ARCS_CHECK(o + comp_len <= _aux_comp.size(), "chain-pg: aux block truncated");
+                auto d = arcs_decompress(_aux_comp.data() + o, comp_len);
+                ARCS_CHECK(d.size() == raw_len, "chain-pg: aux block size mismatch");
+                aux_raw.insert(aux_raw.end(), d.begin(), d.end());
+                o += comp_len;
+            }
+        }
+    } else {
+        aux_raw = arcs_decompress(_aux_comp.data(), _aux_comp.size());
+    }
     std::vector<uint8_t> q_model_raw;
     if (_qm_comp.size() > 1) {
         auto _dec = arcs_decompress(_qm_comp.data(), _qm_comp.size());
@@ -1548,7 +1584,8 @@ void ARCSDecoder::decode_wgs_chain_pg(const ARCSReader& rdr, FASTQWriter& out_wr
 
         std::vector<std::vector<uint8_t>> rq_out(n);
         for (size_t i = 0; i < n; ++i) rq_out[i].assign((size_t)rlens[i], 0);
-        bool ok = qual_cm_decode(q_body, sorted_order, dev_sets, L, rq_out, &seqs, &rlens);
+        std::vector<std::string_view> seqview(seqs.begin(), seqs.end());
+        bool ok = qual_cm_decode(q_body, sorted_order, dev_sets, L, rq_out, &seqview, &rlens);
         ARCS_CHECK(ok, "chain-pg: adaptive-CM quality decode failed");
         quals.assign(n, std::string());
         for (size_t i = 0; i < n; ++i) {

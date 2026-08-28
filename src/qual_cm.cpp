@@ -105,7 +105,7 @@ static inline int b2i5(char c) {
                  case 'T': return 3; default: return 4; }  // N/other = 4
 }
 // Local 3-mer sequence context {prev,cur,next base} at position j → 0..124.
-static inline int seq3(const std::string* s, int j, int L) {
+static inline int seq3(const std::string_view* s, int j, int L) {
     if (!s) return 0;
     int p = (j > 0)     ? b2i5((*s)[j - 1]) : 4;
     int c = (j < (int)s->size()) ? b2i5((*s)[j]) : 4;
@@ -312,7 +312,7 @@ inline uint64_t lo_key(const CtxState& s, int j, int L, int qmax) {
 // Added ONLY to coded_k so the dense parent (lo) stays warm without the extra
 // dimension. The interpolation backoff absorbs cold-start for new qmb contexts.
 inline void keys(const CtxState& s, int j, int L, int is_dev, int qmax,
-                 const std::string* seq, uint64_t& parent_k, uint64_t& coded_k,
+                 const std::string_view* seq, uint64_t& parent_k, uint64_t& coded_k,
                  int use_seq, int qmb = 4) {
     const uint32_t q1c = (uint32_t)std::min(s.q1, qmax);
     const uint32_t q2c = (uint32_t)std::min(s.q2, qmax);
@@ -361,7 +361,7 @@ static std::vector<uint8_t> encode_block(
     const std::vector<std::vector<uint8_t>>& rq,
     const std::vector<uint32_t>& order, size_t begin, size_t end,
     const std::vector<std::vector<bool>>& dev_sets, int L,
-    const std::vector<std::string>* seqs, int qmax, QcmCfg cfg, bool is_pe,
+    const std::vector<std::string_view>* seqs, int qmax, QcmCfg cfg, bool is_pe,
     bool do_profile = false) {
     FreqMap tbl(15), lo(12);
     RangeEnc enc;
@@ -379,7 +379,7 @@ static std::vector<uint8_t> encode_block(
         if (idx >= rq.size()) { seen.insert(idx); continue; }
         const auto& r = rq[idx];
         const bool has_dev = idx < dev_sets.size();
-        const std::string* seq = (seqs && idx < seqs->size()) ? &(*seqs)[idx] : nullptr;
+        const std::string_view* seq = (seqs && idx < seqs->size()) ? &(*seqs)[idx] : nullptr;
         const int RL = (int)r.size();
         // R2 with mate already encoded in this block → mate quality available
         bool has_mate = is_pe && (idx & 1) && idx > 0 && seen.count(idx - 1) &&
@@ -450,7 +450,7 @@ static bool decode_block(
     const std::vector<uint32_t>& order, size_t begin, size_t end,
     const std::vector<std::vector<bool>>& dev_sets, int L,
     std::vector<std::vector<uint8_t>>& rq_out,
-    const std::vector<std::string>* seqs, const std::vector<int>* rlens, int qmax, QcmCfg cfg,
+    const std::vector<std::string_view>* seqs, const std::vector<int>* rlens, int qmax, QcmCfg cfg,
     bool is_pe) {
     FreqMap tbl(15), lo(12);
     RangeDec dec(p, e);
@@ -464,7 +464,7 @@ static bool decode_block(
         const int RL = (rlens && idx < rlens->size()) ? (*rlens)[idx] : L;
         r.assign((size_t)RL, 0);
         const bool has_dev = idx < dev_sets.size();
-        const std::string* seq = (seqs && idx < seqs->size()) ? &(*seqs)[idx] : nullptr;
+        const std::string_view* seq = (seqs && idx < seqs->size()) ? &(*seqs)[idx] : nullptr;
         // R2 with R1 already decoded in this block → mate quality available
         bool has_mate = is_pe && (idx & 1) && idx > 0 && idx - 1 < decoded.size() &&
                         decoded[idx - 1] && !rq_out[idx - 1].empty();
@@ -551,7 +551,7 @@ static void prescan_block(
     const std::vector<std::vector<uint8_t>>& rq,
     const std::vector<uint32_t>& order, size_t begin, size_t end,
     const std::vector<std::vector<bool>>& dev_sets, int L,
-    const std::vector<std::string>* seqs, int qmax, QcmCfg cfg, bool is_pe,
+    const std::vector<std::string_view>* seqs, int qmax, QcmCfg cfg, bool is_pe,
     FreqMap& lo, FreqMap& tbl,
     std::unordered_map<uint64_t, uint64_t>& ck_to_pk) {
 
@@ -561,7 +561,7 @@ static void prescan_block(
         if (idx >= rq.size()) { seen.insert(idx); continue; }
         const auto& r = rq[idx];
         const bool has_dev = idx < dev_sets.size();
-        const std::string* seq = (seqs && idx < seqs->size()) ? &(*seqs)[idx] : nullptr;
+        const std::string_view* seq = (seqs && idx < seqs->size()) ? &(*seqs)[idx] : nullptr;
         const int RL = (int)r.size();
         bool has_mate = is_pe && (idx & 1) && idx > 0 && seen.count(idx - 1) &&
                         (idx - 1) < rq.size();
@@ -666,7 +666,7 @@ static std::vector<uint8_t> encode_block_static(
     const std::vector<std::vector<uint8_t>>& rq,
     const std::vector<uint32_t>& order, size_t begin, size_t end,
     const std::vector<std::vector<bool>>& dev_sets, int L,
-    const std::vector<std::string>* seqs, int qmax, QcmCfg cfg, bool is_pe,
+    const std::vector<std::string_view>* seqs, int qmax, QcmCfg cfg, bool is_pe,
     const StaticModel& model, const StaticCDFEntry& fallback) {
 
     RangeEnc enc;
@@ -676,7 +676,7 @@ static std::vector<uint8_t> encode_block_static(
         if (idx >= rq.size()) { seen.insert(idx); continue; }
         const auto& r = rq[idx];
         const bool has_dev = idx < dev_sets.size();
-        const std::string* seq = (seqs && idx < seqs->size()) ? &(*seqs)[idx] : nullptr;
+        const std::string_view* seq = (seqs && idx < seqs->size()) ? &(*seqs)[idx] : nullptr;
         const int RL = (int)r.size();
         bool has_mate = is_pe && (idx & 1) && idx > 0 && seen.count(idx - 1) &&
                         (idx - 1) < rq.size();
@@ -869,7 +869,7 @@ static bool decode_block_static(
     const std::vector<uint32_t>& order, size_t begin, size_t end,
     const std::vector<std::vector<bool>>& dev_sets, int L,
     std::vector<std::vector<uint8_t>>& rq_out,
-    const std::vector<std::string>* seqs, const std::vector<int>* rlens,
+    const std::vector<std::string_view>* seqs, const std::vector<int>* rlens,
     int qmax, QcmCfg cfg, bool is_pe,
     const StaticModel& model, const StaticCDFEntry& fallback) {
 
@@ -882,7 +882,7 @@ static bool decode_block_static(
         const int RL = (rlens && idx < rlens->size()) ? (*rlens)[idx] : L;
         r.assign((size_t)RL, 0);
         const bool has_dev = idx < dev_sets.size();
-        const std::string* seq = (seqs && idx < seqs->size()) ? &(*seqs)[idx] : nullptr;
+        const std::string_view* seq = (seqs && idx < seqs->size()) ? &(*seqs)[idx] : nullptr;
         bool has_mate = is_pe && (idx & 1) && idx > 0 && idx - 1 < decoded.size() &&
                         decoded[idx - 1] && !rq_out[idx - 1].empty();
         const std::vector<uint8_t>* mq = has_mate ? &rq_out[idx - 1] : nullptr;
@@ -919,7 +919,7 @@ std::vector<uint8_t> qual_cm_encode(
     const std::vector<uint32_t>&             order,
     const std::vector<std::vector<bool>>&    dev_sets,
     int                                      L,
-    const std::vector<std::string>*          seqs,
+    const std::vector<std::string_view>*    seqs,
     bool                                     is_pe) {
 
     int qmax = 0;
@@ -1106,7 +1106,7 @@ bool qual_cm_decode(
     const std::vector<std::vector<bool>>&    dev_sets,
     int                                      L,
     std::vector<std::vector<uint8_t>>&       rq_out,
-    const std::vector<std::string>*          seqs,
+    const std::vector<std::string_view>*    seqs,
     const std::vector<int>*                  rlens) {
 
     if (data.size() < 5) return false;

@@ -1,4 +1,22 @@
 #include "sa_apsp.h"
+#include <unistd.h>
+#include <cstdio>
+#include <cstdlib>
+
+// ARCS_VODBG_MEM=1: current RSS inside the suffix-array build. The caller's
+// marks sit either side of this function, so the construction peak -- which is
+// the whole default-path peak -- was invisible to them.
+static size_t sa_rss_mb() {
+    FILE* f = fopen("/proc/self/statm", "r");
+    if (!f) return 0;
+    long pages = 0, res = 0;
+    if (fscanf(f, "%ld %ld", &pages, &res) != 2) res = 0;
+    fclose(f);
+    return (size_t)((double)res * (double)sysconf(_SC_PAGESIZE) / (1024.0 * 1024.0));
+}
+#define SA_MEMMARK(w) do { if (getenv("ARCS_VODBG_MEM")) \
+    fprintf(stderr, "[SA-MEM]  %-24s %zu MB\n", (w), sa_rss_mb()); } while (0)
+
 #include "libsais/libsais.h"
 #include "libsais/libsais64.h"
 
@@ -84,7 +102,7 @@ void SuffixArray::build(const std::string& text) {
         if (rank[(size_t)i] > 0) {
             int j = (int)sa[(size_t)rank[(size_t)i] - 1];
             while (i + h < n && j + h < n && text[(size_t)(i + h)] == text[(size_t)(j + h)]) ++h;
-            lcp[(size_t)rank[(size_t)i]] = (uint32_t)h;
+            lcp[(size_t)rank[(size_t)i]] = (uint16_t)(h > 65535 ? 65535 : h);
             if (h > 0) --h;
         } else {
             h = 0;
@@ -104,8 +122,11 @@ void SuffixArray::build_libsais(const std::string& text, int threads) {
         // than silently truncate if one somehow does.
         throw std::runtime_error("SuffixArray::build_libsais: text exceeds uint32_t position range (need wider storage)");
     }
+    SA_MEMMARK("build entry");
     sa.assign(n64, 0);
+    SA_MEMMARK("sa allocated");
     lcp.assign(n64, 0);
+    SA_MEMMARK("lcp allocated");
     if (n64 == 0) return;
     if (n64 == 1) { sa[0] = 0; return; }
 
@@ -126,13 +147,40 @@ void SuffixArray::build_libsais(const std::string& text, int threads) {
         int32_t* LCPp = reinterpret_cast<int32_t*>(lcp.data());
         int rc1 = libsais_gsa_omp((const uint8_t*)text.data(), SAp, n, 0, nullptr, threads);
         if (rc1 != 0) throw std::runtime_error("libsais_gsa_omp failed");
+        SA_MEMMARK("after gsa");
+
+        // PLCP still gets its own int32 array -- libsais writes int32 and the
+        // gather below wants to stay parallel -- but the DESTINATION is narrow,
+        // so the array that survives the build is half size.
+        //
+        // An in-place cycle-following permutation was tried instead, which
+        // removes the PLCP array entirely (peak 4093 -> 3111 MB). It is not
+        // worth it: following SA pointers is ~257M random accesses per build,
+        // serial, and it took wall time from 20 s to 74 s. A straight gather is
+        // sequential in the write and parallelisable, and narrowing the output
+        // recovers most of the memory for none of the time.
         {
             std::vector<int32_t> PLCP((size_t)n);
+            SA_MEMMARK("plcp allocated");
             int rc2 = libsais_plcp_gsa_omp((const uint8_t*)text.data(), SAp, PLCP.data(), n, threads);
             if (rc2 != 0) throw std::runtime_error("libsais_plcp_gsa_omp failed");
-            int rc3 = libsais_lcp_omp(PLCP.data(), SAp, LCPp, n, threads);
-            if (rc3 != 0) throw std::runtime_error("libsais_lcp_omp failed");
+            const int gthreads = std::max(1, threads);
+            std::vector<std::thread> gth;
+            gth.reserve((size_t)gthreads);
+            for (int t = 0; t < gthreads; ++t) {
+                gth.emplace_back([&, t]{
+                    const size_t lo = (size_t)n * (size_t)t / (size_t)gthreads;
+                    const size_t hi = (size_t)n * (size_t)(t + 1) / (size_t)gthreads;
+                    for (size_t i = lo; i < hi; ++i) {
+                        const int32_t v = PLCP[(size_t)SAp[i]];
+                        lcp[i] = (uint16_t)(v > 65535 ? 65535 : (v < 0 ? 0 : v));
+                    }
+                });
+            }
+            for (auto& g : gth) g.join();
+            SA_MEMMARK("after lcp gather");
         }
+        SA_MEMMARK("plcp freed");
     } else {
         // Text exceeds INT32_MAX chars (~2.147B) — the real case that
         // crashed on GIAB HG002 (~3.8B chars). Use libsais64's int64_t-indexed
@@ -147,7 +195,7 @@ void SuffixArray::build_libsais(const std::string& text, int threads) {
         int64_t rc3 = libsais64_lcp_omp(PLCP.data(), SA.data(), LCP.data(), n, threads);
         if (rc3 != 0) throw std::runtime_error("libsais64_lcp_omp failed");
         for (size_t i = 0; i < n64; ++i) sa[i]  = (uint32_t)SA[i];
-        for (size_t i = 0; i < n64; ++i) lcp[i] = (uint32_t)LCP[i];
+        for (size_t i = 0; i < n64; ++i) lcp[i] = (uint16_t)(LCP[i] > 65535 ? 65535 : (LCP[i] < 0 ? 0 : LCP[i]));
     }
 }
 
@@ -364,7 +412,7 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates(
             uint32_t running = UINT32_MAX;
             uint32_t steps = 0;
             for (int64_t i = (int64_t)r - 1; i >= 0 && steps < search_cap; --i, ++steps) {
-                running = std::min(running, SA.lcp[(size_t)(i + 1)]);
+                running = std::min(running, (uint32_t)SA.lcp[(size_t)(i + 1)]);
                 if (running < min_overlap) break;
                 consider(locate(SA.sa[(size_t)i]), running);
             }
@@ -374,7 +422,7 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates(
             uint32_t running = UINT32_MAX;
             uint32_t steps = 0;
             for (int64_t i = (int64_t)r + 1; i < n && steps < search_cap; ++i, ++steps) {
-                running = std::min(running, SA.lcp[(size_t)i]);
+                running = std::min(running, (uint32_t)SA.lcp[(size_t)i]);
                 if (running < min_overlap) break;
                 consider(locate(SA.sa[(size_t)i]), running);
             }
