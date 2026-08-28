@@ -2628,6 +2628,14 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
             }
         }
 
+        // ARCS_QUAL_TIMING=1: the quality stage measures 4.51s while its coder
+        // accounts for 1.23s. Find where the other 3.3s goes before touching it.
+        const bool QT = getenv("ARCS_QUAL_TIMING") != nullptr;
+        auto _qt0 = std::chrono::steady_clock::now();
+        auto _qmark = [&](const char* w){ if (QT) { auto t = std::chrono::steady_clock::now();
+            fprintf(stderr, "[QUAL] %-22s %.2fs\n", w, std::chrono::duration<double>(t - _qt0).count()); _qt0 = t; } };
+        _qmark("stage entry");
+
         // Variable-length reads: the static-rANS quality path assumes a fixed L, so
         // for variable-length data we use ONLY the per-read-length-correct adaptive
         // CM coder (mode 0x07). Fixed-length data keeps the keep-smaller gate.
@@ -2643,6 +2651,7 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
         for (const auto& r : reads)
             for (unsigned char c : r.qual) { int q = (c >= 33) ? (c - 33) : 0; if (q > qhi) qhi = q; }
         const bool hi_phred = (qhi > 42);
+        _qmark("qhi scan");
 
         // Quality winner prediction: detect binned vs full-range here (before candidate 1)
         // so the static-rANS skip can use it. Binned = ≤24 distinct Phred levels.
@@ -2659,6 +2668,7 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
                 }
             pre_binned = (nd <= 24);
         }
+        _qmark("binned probe");
         const bool force_both_qual = (getenv("ARCS_QUAL_BOTH") != nullptr);
 
         std::vector<uint8_t> best_data, best_model;
@@ -2686,6 +2696,7 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
         // {q1,q2,decaying-ceiling,volatility,pos,is_dev}, no transmitted model).
         // Default ON (forced for variable-length); keep-smaller gate otherwise.
         if (var_len || hi_phred || getenv("ARCS_QUAL_NOCM") == nullptr) {
+            _qmark("pre-rq");
             std::vector<std::vector<uint8_t>> rq(reads.size());
             for (size_t i = 0; i < reads.size(); ++i) {
                 const std::string& qs = reads[i].qual;
@@ -2695,6 +2706,7 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
                     rq[i][(size_t)j] = (uint8_t)std::min(q, 93);  // full legal Phred range (lossless)
                 }
             }
+            _qmark("rq build");
             // Sequence context (the game-changer lever): per-read bases in
             // orig-read frame, indexed by original read index — identical to what
             // the decoder reconstructs before decoding quality. Enables quality to

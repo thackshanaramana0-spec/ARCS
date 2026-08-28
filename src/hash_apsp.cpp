@@ -41,7 +41,20 @@
 
 namespace {
 
-constexpr uint32_t SEED_BASES = 32;                  // exactly fills a uint64 at 2 bits/base
+// Seed width. 32 fills a uint64 exactly, but it also sets the SHORTEST overlap
+// this path can see, and that floor is why it returns fewer candidates than the
+// suffix array (0.31% archive on yeast). A narrower seed sees shorter overlaps
+// at the cost of specificity -- more candidates to verify. ARCS_HASH_SEED lets
+// that be measured rather than assumed; prototype work on a standalone
+// assembler put the optimum near 16.
+static uint32_t seed_bases() {
+    static const uint32_t v = [] {
+        uint32_t d = 32;
+        if (const char* e = getenv("ARCS_HASH_SEED")) { int x = atoi(e); if (x >= 8 && x <= 32) d = (uint32_t)x; }
+        return d;
+    }();
+    return v;
+}
 
 inline int base2(char c) {
     switch (c) { case 'A': return 0; case 'C': return 1;
@@ -52,9 +65,9 @@ inline int base2(char c) {
 // Pack the 32 bases at p. Fails (false) on any non-ACGT byte, which is correct
 // rather than merely convenient: a seed spanning an N would compare equal to
 // some real 32-mer under any 2-bit encoding.
-inline bool pack_seed(const char* p, uint64_t& out) {
+inline bool pack_seed(const char* p, uint32_t w, uint64_t& out) {
     uint64_t k = 0;
-    for (uint32_t i = 0; i < SEED_BASES; ++i) {
+    for (uint32_t i = 0; i < w; ++i) {
         const int v = base2(p[i]);
         if (v < 0) return false;
         k = (k << 2) | (uint64_t)v;
@@ -77,6 +90,8 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates_hash(
 
     // A seed shorter than the seed width can never be found, so raise the floor
     // rather than silently returning nothing for overlaps below it.
+    const uint32_t SEED_BASES = seed_bases();
+    const uint64_t SEED_MASK = (SEED_BASES >= 32) ? ~0ULL : ((1ULL << (2 * SEED_BASES)) - 1);
     const uint32_t min_ov = std::max(min_overlap, SEED_BASES);
 
     // ── index: first SEED_BASES of every entry -> entry ids ──────────────────
@@ -86,7 +101,7 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates_hash(
         const std::string_view E = reads_both_views[e];
         if (E.size() < SEED_BASES) continue;
         uint64_t k;
-        if (pack_seed(E.data(), k)) prefix_idx[k].push_back(e);
+        if (pack_seed(E.data(), SEED_BASES, k)) prefix_idx[k].push_back(e);
     }
 
     // ── for each entry x, find entries whose PREFIX matches a SUFFIX of x ────
@@ -117,12 +132,12 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates_hash(
             for (uint32_t off = 1; off <= maxoff; ++off) {
                 if (off + SEED_BASES > X.size()) break;
                 if (!rolling) {
-                    if (!pack_seed(X.data() + off, k)) continue;   // N inside the window
+                    if (!pack_seed(X.data() + off, SEED_BASES, k)) continue;   // N inside the window
                     rolling = true;
                 } else {
                     const int v = base2(X[off + SEED_BASES - 1]);
                     if (v < 0) { rolling = false; continue; }
-                    k = (k << 2) | (uint64_t)v;                    // 32 bases fill the word
+                    k = ((k << 2) | (uint64_t)v) & SEED_MASK;
                 }
                 auto it = prefix_idx.find(k);
                 if (it == prefix_idx.end()) continue;

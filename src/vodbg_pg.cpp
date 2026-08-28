@@ -231,7 +231,11 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
     // ARCS_FAST_UPGRADE=1 swaps the suffix array for a seed-hash index: same
     // candidate contract, a few GB less peak, at the cost of the short and
     // error-straddling overlaps only an exact SA can see (see hash_apsp.cpp).
-    auto apsp = getenv("ARCS_FAST_UPGRADE")
+    // ARCS_HASH_APSP isolates the seed-hash overlap path from the rest of the
+    // fast profile. Without it the 2-bit pg codec rides along and its ~5.9%
+    // archive cost swamps whatever the index itself does, which made an earlier
+    // measurement of "hash_apsp costs 5.9%" meaningless.
+    auto apsp = (getenv("ARCS_FAST_UPGRADE") || getenv("ARCS_HASH_APSP"))
         ? build_apsp_candidates_hash(both_views, (uint32_t)n, max_cands, (uint32_t)K0, search_cap)
         : build_apsp_candidates(both_views, (uint32_t)n, max_cands, (uint32_t)K0, search_cap);
     memmark("after apsp");

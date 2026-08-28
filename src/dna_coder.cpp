@@ -581,6 +581,10 @@ void run_core(const std::string* pin, std::string* pout, size_t N, BitCoder& cod
     }
     bool any_ir_pf = false;
     for (auto& m : e.models) if (m.do_ir_pf) { any_ir_pf = true; break; }
+    // ARCS_SPEC_PF_N: how many of the widest models get speculative
+    // next-position prefetches (default 2, 0 disables). See the issue site.
+    int spec_pf_n = 4;   // measured optimum: 6.73s -> 5.07s at 4; 6 and 8 regress (bandwidth)
+    if (const char* sp = getenv("ARCS_SPEC_PF_N")) { int v = atoi(sp); if (v >= 0 && v <= 8) spec_pf_n = v; }
 
     // ── ARCS_IR_VERIFY: index-equality audit ──────────────────────────────────
     // Compares the table index the IR prefetch would target (computed at select
@@ -626,6 +630,36 @@ void run_core(const std::string* pin, std::string* pout, size_t N, BitCoder& cod
                         pf_idx_ver[mi] = ir_idx;
                     }
                 }
+            }
+        }
+        // ── Speculative prefetch for the NEXT position ───────────────────────
+        // Decode is a dependency chain: decode a base, fold it into hist,
+        // compute the table index, wait for the load, decode the next. The
+        // existing select() prefetch is issued immediately before the value is
+        // used, so it has no time to land and every iteration pays a full miss.
+        // pg_decode is 6.70s of an 8.88s decompress at 2.44 Mchar/s, which is
+        // memory latency, not arithmetic.
+        //
+        // The next context is unknown -- but only four values are possible. So
+        // issue all four candidate indices now, before code_node runs; whichever
+        // base turns out to be right, its line is already in flight and the
+        // other three are harmless. Prefetch is a hint: this cannot change a
+        // single output byte, only when the data arrives.
+        //
+        // Restricted to the widest models by ARCS_SPEC_PF_N (default 2): the
+        // low-order tables are small enough to stay cached, so speculating on
+        // them would spend bandwidth for nothing.
+        if (spec_pf_n > 0) {
+            int done = 0;
+            for (size_t mi = e.models.size(); mi-- > 0 && done < spec_pf_n; ) {
+                auto& m = e.models[mi];
+                if (m.dense) continue;   // small tables stay cached; no gain
+                const uint64_t base_hist = hist << 2;
+                __builtin_prefetch(&m.tbl[m.index(base_hist | 0ULL)], 1, 1);
+                __builtin_prefetch(&m.tbl[m.index(base_hist | 1ULL)], 1, 1);
+                __builtin_prefetch(&m.tbl[m.index(base_hist | 2ULL)], 1, 1);
+                __builtin_prefetch(&m.tbl[m.index(base_hist | 3ULL)], 1, 1);
+                ++done;
             }
         }
         if (do_prof) cyc_sel += arcs_rdtsc() - tsc0;
