@@ -2780,12 +2780,33 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
             auto _c2 = std::chrono::steady_clock::now();
             std::vector<uint8_t> cm;
             if (do_remap) {
-                std::vector<std::vector<uint8_t>> rq_dense(rq.size());
-                for (size_t i = 0; i < rq.size(); ++i) {
-                    rq_dense[i].resize(rq[i].size());
-                    for (size_t j = 0; j < rq[i].size(); ++j)
-                        rq_dense[i][j] = (rq[i][j] < 64) ? dense_of_raw[rq[i][j]] : (uint8_t)(raw_of_dense.size() - 1);
+                // Remap in place unless the raw values are still needed. rq is
+                // already one vector per read -- about 1M separate allocations
+                // and ~150 MB -- and rq_dense duplicated every one of them to
+                // hold the same data under a different alphabet. The dense
+                // values are what gets encoded either way, so writing them back
+                // into rq encodes identical bytes while allocating nothing.
+                //
+                // force_both (opt-in) re-encodes from rq afterwards and needs the
+                // raw alphabet, so that path keeps the copy.
+                std::vector<std::vector<uint8_t>> rq_dense_owned;
+                const bool need_raw_after = force_both && seqp;
+                if (need_raw_after) {
+                    rq_dense_owned.resize(rq.size());
+                    for (size_t i = 0; i < rq.size(); ++i) {
+                        rq_dense_owned[i].resize(rq[i].size());
+                        for (size_t j = 0; j < rq[i].size(); ++j)
+                            rq_dense_owned[i][j] = (rq[i][j] < 64) ? dense_of_raw[rq[i][j]]
+                                                                  : (uint8_t)(raw_of_dense.size() - 1);
+                    }
+                } else {
+                    for (size_t i = 0; i < rq.size(); ++i)
+                        for (size_t j = 0; j < rq[i].size(); ++j)
+                            rq[i][j] = (rq[i][j] < 64) ? dense_of_raw[rq[i][j]]
+                                                       : (uint8_t)(raw_of_dense.size() - 1);
                 }
+                const std::vector<std::vector<uint8_t>>& rq_dense =
+                    need_raw_after ? rq_dense_owned : rq;
                 auto body = qual_cm_encode(rq_dense, result.chain_order, orig_dev_sets, L, seqp, qual_is_pe);
                 cm.push_back((uint8_t)raw_of_dense.size());
                 cm.insert(cm.end(), raw_of_dense.begin(), raw_of_dense.end());
