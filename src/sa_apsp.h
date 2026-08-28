@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // ── Suffix array + LCP array (Kasai) ─────────────────────────────────────────
@@ -65,5 +66,14 @@ struct APSPCandidate { uint32_t rid; uint8_t view; uint32_t overlap; };
 // (interleaved: index 2*rid + view). Returns, for each such entry, up to
 // `max_cands` best distinct-read overlap partners (sorted by overlap desc).
 std::vector<std::vector<APSPCandidate>> build_apsp_candidates(
-    const std::vector<std::string>& reads_both_views,
+    const std::vector<std::string_view>& reads_both_views,
+    uint32_t n_reads, int max_cands, uint32_t min_overlap, uint32_t search_cap);
+
+// Same contract, seed-hash implementation instead of a suffix array: far less
+// memory (2n index postings vs a 257 Mchar SA + LCP + rank on yeast), but it
+// cannot see overlaps below its 32-base seed width and needs the prefix side's
+// first 32 bases error-free, so it returns a SUBSET of the above. Opt-in via
+// ARCS_FAST_UPGRADE=1. See hash_apsp.cpp.
+std::vector<std::vector<APSPCandidate>> build_apsp_candidates_hash(
+    const std::vector<std::string_view>& reads_both_views,
     uint32_t n_reads, int max_cands, uint32_t min_overlap, uint32_t search_cap);

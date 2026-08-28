@@ -133,6 +133,7 @@ set(ARCS_SOURCES
     src/container.cpp
     src/chain_encoder.cpp
     src/sa_apsp.cpp
+    src/hash_apsp.cpp
     src/vodbg_pg.cpp
     src/kmer_anchor_pg.cpp
     src/dna_coder.cpp

@@ -1,3 +1,5 @@
+#include <unistd.h>
+#include <string_view>
 #include "vodbg_pg.h"
 #include "sa_apsp.h"
 #include "flat_kmer_index.h"
@@ -46,8 +48,23 @@ struct Placement {
 
 } // namespace
 
+// ARCS_VODBG_MEM=1: current RSS at each major allocation point. Peak RSS alone
+// says the assembly is expensive; it does not say which structure is expensive,
+// and guessing from struct sizes has been wrong more than once.
+static size_t vodbg_rss_mb() {
+    FILE* f = fopen("/proc/self/statm", "r");
+    if (!f) return 0;
+    long pages = 0, res = 0;
+    if (fscanf(f, "%ld %ld", &pages, &res) != 2) res = 0;
+    fclose(f);
+    return (size_t)((double)res * (double)sysconf(_SC_PAGESIZE) / (1024.0 * 1024.0));
+}
+
 ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* call_out) {
     const size_t n_orig = orig_reads.size();
+    const bool MEMDBG = getenv("ARCS_VODBG_MEM") != nullptr;
+    auto memmark = [&](const char* w){ if (MEMDBG) fprintf(stderr, "[VB-MEM] %-22s %zu MB\n", w, vodbg_rss_mb()); };
+    memmark("entry");
 
     // ── Exact-duplicate read collapse (ARCS_VODBG_NODEDUP=1 disables) ─────────
     // Sequencing data carries a large fraction of byte-identical reads —
@@ -142,8 +159,10 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
     constexpr int BUCKET_CAP = 64;
 
     // ── Build the two views (forward, reverse-complement) of every read once ────
+    memmark("after dedup");
     std::vector<std::string> rcseq(n);
     for (size_t i = 0; i < n; ++i) rcseq[i] = reverse_complement(R(i).seq);
+    memmark("after rcseq");
     auto view_seq = [&](uint32_t rid, uint8_t view) -> const std::string& {
         return view == 0 ? R(rid).seq : rcseq[rid];
     };
@@ -165,10 +184,23 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
     const bool VB_TIMING = getenv("ARCS_VODBG_TIMING") != nullptr;
     auto _vb_t0 = std::chrono::steady_clock::now();
 
-    std::vector<std::string> both_views((size_t)n * 2);
+    // Views, not copies. Every sequence here already exists -- forward in
+    // orig_reads, reverse-complement in rcseq -- so materialising a third copy
+    // cost 312 MB measured, and freeing it afterwards returned only 52 MB
+    // because the allocator keeps the arena. The APSP builders only ever read
+    // .data()/.size(), so a string_view is sufficient.
+    std::vector<std::string_view> both_views((size_t)n * 2);
     for (size_t i = 0; i < n; ++i) { both_views[2*i] = R(i).seq; both_views[2*i+1] = rcseq[i]; }
-    auto apsp = build_apsp_candidates(both_views, (uint32_t)n, max_cands, (uint32_t)K0, search_cap);
-    both_views.clear(); both_views.shrink_to_fit(); // no longer needed; view_seq() reconstructs on demand
+    memmark("after both_views");
+    // ARCS_FAST_UPGRADE=1 swaps the suffix array for a seed-hash index: same
+    // candidate contract, a few GB less peak, at the cost of the short and
+    // error-straddling overlaps only an exact SA can see (see hash_apsp.cpp).
+    auto apsp = getenv("ARCS_FAST_UPGRADE")
+        ? build_apsp_candidates_hash(both_views, (uint32_t)n, max_cands, (uint32_t)K0, search_cap)
+        : build_apsp_candidates(both_views, (uint32_t)n, max_cands, (uint32_t)K0, search_cap);
+    memmark("after apsp");
+    both_views.clear(); both_views.shrink_to_fit();
+    memmark("both_views freed"); // no longer needed; view_seq() reconstructs on demand
     if (VB_TIMING) {
         auto t1 = std::chrono::steady_clock::now();
         fprintf(stderr, "[VB-TIMING] sa_apsp_build: %.2fs\n", std::chrono::duration<double>(t1 - _vb_t0).count());
@@ -581,6 +613,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
         }
         for (auto& th : ths) th.join();
     }
+    memmark("after growth");
 
     size_t total_contigs_dbg = 0;
     for (auto& ts : tstate) total_contigs_dbg += ts.contigs.size();
@@ -750,16 +783,25 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
         FlatKmerIndex pgidx;
         if (Lpg >= K0) {
             size_t n_positions = (size_t)(Lpg - K0 + 1);
-            pgidx = build_flat_kmer_index_parallel(n_positions, BUCKET_CAP, fallback_threads,
+            auto emit_pg_kmers =
                 [&](size_t lo, size_t hi, std::vector<std::pair<uint64_t,uint64_t>>& out) {
                     for (size_t p = lo; p < hi; ++p) {
                         uint64_t km;
                         if (!pack_kmer(r.pg, (int)p, K0, km)) continue;
                         out.push_back({km, (uint64_t)p});
                     }
-                });
+                };
+            // ARCS_FAST_UPGRADE: exact-size CSR table instead of fixed buckets --
+            // a few hundred MB instead of ~1 GB here, and no k-mer dropped to a
+            // full bucket (see flat_kmer_index.h).
+            if (getenv("ARCS_FAST_UPGRADE"))
+                pgidx = build_flat_kmer_index_csr(n_positions, fallback_threads, emit_pg_kmers);
+            else
+                pgidx = build_flat_kmer_index_parallel(n_positions, BUCKET_CAP, fallback_threads,
+                                                       emit_pg_kmers);
         }
 
+        memmark("after fallback index");
         struct FallbackResult { int32_t bestpos; uint8_t bestview; int bestmm; };
         std::vector<FallbackResult> results(unresolved.size());
 
@@ -889,6 +931,7 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
 
         // Keep the trial with the shortest pg (validated above as the objective
         // that also minimises the final archive).
+        memmark("trial end");
         const size_t trial_pg = r.pg.size();   // capture before any move
         const bool   improved = !have_best || trial_pg < best_r.pg.size();
         if (improved) {

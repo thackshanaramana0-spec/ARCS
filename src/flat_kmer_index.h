@@ -39,12 +39,34 @@ inline uint64_t flat_kmer_index_mix64(uint64_t x) {
 struct FlatKmerIndex {
     uint64_t table_mask = 0;
     int      bucket_cap = 0;
-    std::vector<uint64_t> km;   // UINT64_MAX = empty slot
+    std::vector<uint64_t> km;   // UINT64_MAX = empty slot (fixed-bucket layout only)
     std::vector<uint64_t> val;
+
+    // ── CSR layout (ARCS_FAST_UPGRADE) ───────────────────────────────────────
+    // Non-empty `offset` selects it: bucket b owns entries [offset[b],
+    // offset[b+1]) of km/val, so every bucket is exactly the size it needs.
+    //
+    // The fixed-bucket layout above allocates table_size * bucket_cap slots of
+    // 16 bytes whether or not they hold anything, and table_size is rounded up
+    // to a power of two -- for ~17.5M pseudogenome k-mers that is 1,048,576
+    // buckets x 64 slots = 67M slots = 1.07 GB to store 17.5M items, about 61
+    // bytes apiece. CSR stores the same items in ~297 MB.
+    //
+    // It also fixes a correctness wart rather than only a size one: once a
+    // fixed bucket fills, further k-mers hashing there are DROPPED, so the
+    // index silently forgets occurrences and the fallback placement misses
+    // matches it should have found. CSR has no overflow, so nothing is lost.
+    std::vector<uint32_t> offset;
 
     template <class F>
     void for_each(uint64_t query_km, F&& f) const {
-        uint64_t b = flat_kmer_index_mix64(query_km) & table_mask;
+        const uint64_t b = flat_kmer_index_mix64(query_km) & table_mask;
+        if (!offset.empty()) {
+            const uint32_t e = offset[(size_t)b + 1];
+            for (uint32_t i = offset[(size_t)b]; i < e; ++i)
+                if (km[i] == query_km) f(val[i]);
+            return;
+        }
         const uint64_t* kp = &km[(size_t)b * (size_t)bucket_cap];
         const uint64_t* vp = &val[(size_t)b * (size_t)bucket_cap];
         for (int s = 0; s < bucket_cap; ++s) {
@@ -55,6 +77,75 @@ struct FlatKmerIndex {
 
     bool empty() const { return km.empty(); }
 };
+
+// ── CSR build: exact-size buckets via counting sort ──────────────────────────
+// Same EmitFn contract as build_flat_kmer_index_parallel below, same for_each
+// afterwards, but the table is sized to what the data actually needs instead of
+// table_size * bucket_cap fixed slots.
+//
+// Three passes over the staged pairs: count per bucket, prefix-sum into offsets,
+// then scatter. Textbook counting sort. Buckets are sized exactly, so no item is
+// ever dropped for want of a slot -- unlike the fixed-bucket build, where a full
+// bucket silently discards the k-mers that hash to it.
+//
+// Emission stays parallel (it is the expensive part); the scatter runs serially
+// in global order -- thread 0's pairs, then thread 1's, and so on -- so the
+// finished index is identical for any thread count.
+template <class EmitFn>
+FlatKmerIndex build_flat_kmer_index_csr(size_t n_items, int n_threads, EmitFn&& emit) {
+    int T = std::max(1, n_threads);
+    if ((size_t)T > std::max((size_t)1, n_items)) T = std::max(1, (int)n_items);
+
+    std::vector<std::vector<std::pair<uint64_t,uint64_t>>> local((size_t)T);
+    {
+        std::vector<std::thread> ths;
+        ths.reserve((size_t)T);
+        for (int t = 0; t < T; ++t) {
+            ths.emplace_back([&, t]{
+                size_t lo = n_items * (size_t)t / (size_t)T;
+                size_t hi = n_items * (size_t)(t + 1) / (size_t)T;
+                emit(lo, hi, local[(size_t)t]);
+            });
+        }
+        for (auto& th : ths) th.join();
+    }
+
+    size_t total = 0;
+    for (const auto& v : local) total += v.size();
+
+    FlatKmerIndex idx;
+    if (total == 0) { idx.table_mask = 0; return idx; }
+
+    // One bucket per ~4 items: enough to keep chains short, while the table
+    // itself stays a small fraction of the entry arrays (4 bytes per bucket
+    // against 12 per entry). Entry count is what dominates now, not slack.
+    size_t table_size = 1024;
+    const size_t want = total / 4 + 1;
+    while (table_size < want && table_size < (64ull << 20)) table_size <<= 1;
+    idx.table_mask = table_size - 1;
+
+    // total must be addressable by the uint32 offsets; fall back rather than wrap.
+    if (total > (size_t)UINT32_MAX) return idx;
+
+    idx.offset.assign(table_size + 1, 0);
+    for (const auto& v : local)
+        for (const auto& kv : v)
+            ++idx.offset[(size_t)(flat_kmer_index_mix64(kv.first) & idx.table_mask) + 1];
+    for (size_t b = 0; b < table_size; ++b) idx.offset[b + 1] += idx.offset[b];
+
+    idx.km.resize(total);
+    idx.val.resize(total);
+    std::vector<uint32_t> cursor(idx.offset.begin(), idx.offset.end() - 1);
+    for (const auto& v : local) {
+        for (const auto& kv : v) {
+            const size_t b = (size_t)(flat_kmer_index_mix64(kv.first) & idx.table_mask);
+            const uint32_t at = cursor[b]++;
+            idx.km[at]  = kv.first;
+            idx.val[at] = kv.second;
+        }
+    }
+    return idx;
+}
 
 // EmitFn signature: void(size_t lo, size_t hi, std::vector<std::pair<uint64_t,uint64_t>>& out)
 // — called once per thread with that thread's [lo,hi) slice of [0, n_items);

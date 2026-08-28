@@ -163,7 +163,7 @@ constexpr char SEP = '\0';
 }
 
 std::vector<std::vector<APSPCandidate>> build_apsp_candidates(
-    const std::vector<std::string>& reads_both_views,
+    const std::vector<std::string_view>& reads_both_views,
     uint32_t n_reads, int max_cands, uint32_t min_overlap, uint32_t search_cap) {
 
     const size_t m = reads_both_views.size(); // = 2*n_reads
@@ -205,7 +205,7 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates(
     std::vector<uint32_t> seg_sample;
     {
         size_t total = 0;
-        for (auto& s : reads_both_views) total += s.size() + 1;
+        for (const auto& s : reads_both_views) total += s.size() + 1;
         // seg_start stores absolute positions in T as uint32_t (matching
         // SuffixArray's own storage decision, see sa_apsp.h) — guard against
         // the total exceeding that range up front, rather than silently
