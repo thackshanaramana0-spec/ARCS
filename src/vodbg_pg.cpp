@@ -248,7 +248,9 @@ ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* 
     // ARCS_FM_APSP selects the BWT + backward-search path (fm_apsp.cpp): same
     // answers, peak 6n instead of 11n because PLCP is never built and LCP is
     // never kept. Opt-in until it is measured on every dataset.
-    auto apsp = getenv("ARCS_ROPE_APSP")
+    auto apsp = getenv("ARCS_SWEEP_APSP")
+        ? build_apsp_candidates_sweep(both_views, (uint32_t)n, max_cands, (uint32_t)K0, search_cap)
+        : getenv("ARCS_ROPE_APSP")
         ? build_apsp_candidates_rope(both_views, (uint32_t)n, max_cands, (uint32_t)K0, search_cap)
         : getenv("ARCS_FM_APSP")
         ? build_apsp_candidates_fm(both_views, (uint32_t)n, max_cands, (uint32_t)K0, search_cap)

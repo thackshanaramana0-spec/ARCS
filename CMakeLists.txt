@@ -136,6 +136,7 @@ set(ARCS_SOURCES
     src/hash_apsp.cpp
     src/fm_apsp.cpp
     src/rope_apsp.cpp
+    src/sweep_apsp.cpp
     third_party/ropebwt/rope.c
     third_party/ropebwt/mrope.c
     third_party/ropebwt/rle.c

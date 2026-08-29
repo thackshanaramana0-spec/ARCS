@@ -101,3 +101,15 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates_fm(
 std::vector<std::vector<APSPCandidate>> build_apsp_candidates_rope(
     const std::vector<std::string_view>& reads_both_views,
     uint32_t n_reads, int max_cands, uint32_t min_overlap, uint32_t search_cap);
+
+// Same contract, PgRC2's method: no index at all. A descending sweep of the
+// overlap length, merge-joining entries ordered by prefix against entries
+// ordered by suffix-at-offset, with the suffix order advanced incrementally by
+// a k-way block merge. Allocates two uint32 index arrays over the entries --
+// ~14 MB where the suffix array needs 2,730 MB -- because it compares the
+// caller's sequences in place rather than copying them. Requires constant read
+// length; variable-length input falls back to the suffix array. Opt-in via
+// ARCS_SWEEP_APSP=1. See sweep_apsp.cpp.
+std::vector<std::vector<APSPCandidate>> build_apsp_candidates_sweep(
+    const std::vector<std::string_view>& reads_both_views,
+    uint32_t n_reads, int max_cands, uint32_t min_overlap, uint32_t search_cap);
