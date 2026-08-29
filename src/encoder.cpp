@@ -2725,6 +2725,13 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
         }
         _qmark("binned probe");
         const bool force_both_qual = (getenv("ARCS_QUAL_BOTH") != nullptr);
+        // ARCS_QUAL_NORANS — measurement only, default path unchanged. The
+        // static-rANS candidate below is a *candidate*: it is encoded in full and
+        // then thrown away whenever the adaptive-CM coder comes out smaller. On
+        // every dataset where it has actually run it has lost (ecoli -4.65%,
+        // eco2 -3.33%), so this flag exists to price what running the loser costs
+        // in time and in peak RSS before deciding whether to skip it by default.
+        const bool skip_rans = (getenv("ARCS_QUAL_NORANS") != nullptr);
 
         std::vector<uint8_t> best_data, best_model;
         size_t best_tot = SIZE_MAX;
@@ -2734,7 +2741,7 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
         // Winner prediction: if binned quality (ndist ≤ 24), adaptive-CM always wins
         // and static-rANS is never selected across all 8 benchmark datasets — skip it.
         // ARCS_QUAL_BOTH forces both candidates (for measurement/regression testing).
-        if (!var_len && !hi_phred && (!pre_binned || force_both_qual)) {
+        if (!var_len && !hi_phred && !skip_rans && (!pre_binned || force_both_qual)) {
             auto _c1 = std::chrono::steady_clock::now();
             auto qres_plain = mst_q.encode_quality_rans(
                 reads, result.chain_order, no_parents, dummy_shifts, orig_dev_sets, L, nullptr);
