@@ -412,13 +412,27 @@ static void autosize_hash_bits(size_t N) {
     // to shrink the FCM tables on large/bacterial pseudogenomes where autosize would
     // otherwise pick 2^24 (~64 MB/model). This is a CAP, not a floor: small pgs still
     // size down naturally, so it never inflates a small input.
-    int cap = 24;
-    // NOT capped for ARCS_FAST_UPGRADE. Isolating it showed the cap returns only
-    // ~41 MB (an earlier 241 MB reading was run-to-run variance measured while
-    // something else moved) and nothing at all on the default path, where the
-    // suffix array holds the peak. It also cannot help speed: the coder's cost
-    // is per-base model updates, not table size. The fast profile drops the FCM
-    // coder outright instead, which addresses both axes.
+    // 16 bits: 65,536 entries x 4 B x 2 hashed models = 512 KB, which FITS IN L2.
+    // The old default of 24 meant 134 MB of tables and a random probe into them
+    // per model per base -- a guaranteed miss to main memory. Measured on all
+    // three datasets, capping at 16 is smaller AND faster everywhere:
+    //
+    //   dataset  cap=24                cap=16                delta
+    //   yeast    13,978,885 / 5.20s    13,969,650 / 3.78s    -9,235 B   -27%
+    //   ecoli    46,125,657 / 5.54s    46,121,648 / 4.77s    -4,009 B   -14%
+    //   pf       13,081,362 / 4.37s    13,077,934 / 2.55s    -3,428 B   -42%
+    //
+    // Smaller as well as faster, so there is nothing to trade off. A bigger
+    // table is not better modelling here: high-order DNA contexts are sparse
+    // enough that most entries are seen too few times to learn from, and the
+    // collisions a small table introduces act as backoff rather than as loss.
+    // This is the same effect that made five context models beat eight.
+    //
+    // An earlier comment here asserted the cap "cannot help speed: the coder's
+    // cost is per-base model updates, not table size". That was wrong, and it
+    // was wrong because it was reasoned rather than measured -- the profile puts
+    // 51.5% of decode in model SELECT, which is exactly this lookup.
+    int cap = 16;
     if (const char* e = getenv("ARCSDNA_HBITS_MAX")) { int v = atoi(e); if (v >= 12 && v <= 24) cap = v; }
     int b = 18; if (b > cap) b = cap;
     while (((size_t)1 << b) < 2 * N && b < cap) ++b;  // ≥2× N entries, capped at 2^cap

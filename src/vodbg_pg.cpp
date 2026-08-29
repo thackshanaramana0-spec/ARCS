@@ -67,7 +67,16 @@ static size_t vodbg_rss_mb() {
 ChainEncodeResult build_vodbg_pg(const std::vector<Read>& orig_reads, CallData* call_out) {
     const size_t n_orig = orig_reads.size();
     const bool MEMDBG = getenv("ARCS_VODBG_MEM") != nullptr;
-    auto memmark = [&](const char* w){ if (MEMDBG) fprintf(stderr, "[VB-MEM] %-22s %zu MB\n", w, vodbg_rss_mb()); };
+    auto vb_t0 = std::chrono::steady_clock::now();
+    auto vb_prev = vb_t0;
+    auto memmark = [&](const char* w){
+        if (!MEMDBG) return;
+        const auto now = std::chrono::steady_clock::now();
+        fprintf(stderr, "[VB-MEM] %-22s %5zu MB   +%6.2fs  (t=%6.2fs)\n", w, vodbg_rss_mb(),
+                std::chrono::duration<double>(now - vb_prev).count(),
+                std::chrono::duration<double>(now - vb_t0).count());
+        vb_prev = now;
+    };
     memmark("entry");
 
     // ── Exact-duplicate read collapse (ARCS_VODBG_NODEDUP=1 disables) ─────────
