@@ -2725,12 +2725,17 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
         }
         _qmark("binned probe");
         const bool force_both_qual = (getenv("ARCS_QUAL_BOTH") != nullptr);
-        // ARCS_QUAL_NORANS — measurement only, default path unchanged. The
-        // static-rANS candidate below is a *candidate*: it is encoded in full and
-        // then thrown away whenever the adaptive-CM coder comes out smaller. On
-        // every dataset where it has actually run it has lost (ecoli -4.65%,
-        // eco2 -3.33%), so this flag exists to price what running the loser costs
-        // in time and in peak RSS before deciding whether to skip it by default.
+        // ARCS_QUAL_NORANS — measurement only, default path unchanged.
+        //
+        // The static-rANS candidate below is a *candidate*: encoded in full, then
+        // thrown away whenever adaptive-CM comes out smaller. It has lost every
+        // time it has actually run (ecoli -4.65%, eco2 -3.33%), so skipping it
+        // looked like 5.9 s of free time. MEASURED, it is not: with it skipped,
+        // ecoli went 33.04 s -> 33.55 s and peak RSS 5522 -> 5988 MB. The rANS
+        // encode was overlapping the async pg+names encode, which then took 0.04 s
+        // instead of 3.96 s. Removing the loser only uncovers the work it was
+        // hiding, and de-staggering the two allocations raises the peak. Kept as a
+        // flag so the next person does not re-derive this the expensive way.
         const bool skip_rans = (getenv("ARCS_QUAL_NORANS") != nullptr);
 
         std::vector<uint8_t> best_data, best_model;

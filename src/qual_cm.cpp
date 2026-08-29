@@ -169,6 +169,12 @@ struct FreqMap {
         if (count * 10 >= (mask + 1) * 7) grow();           // grow rehashes keys only; pi stays valid
         return poolref(pi);
     }
+    // Bytes this map actually holds: the two flat index arrays plus the Freq pool.
+    // ARCS_QCM_MEM prints it per block -- the quality model is the largest live
+    // allocation in the encoder and until now its size was inferred, not measured.
+    size_t bytes() const {
+        return keys.size()*8 + slot_idx.size()*4 + chunks.size()*CHUNK*sizeof(Freq);
+    }
     void grow() {
         size_t newcap = (mask + 1) << 1, nmask = newcap - 1;
         std::vector<uint64_t> nk(newcap, EMPTY);
@@ -387,6 +393,12 @@ static std::vector<uint8_t> encode_block(
     FreqMap tbl(15), lo(12);
     RangeEnc enc;
     uint32_t cf[QA];
+    struct MemReport {
+        const FreqMap &t, &l; bool on;
+        ~MemReport(){ if(on) fprintf(stderr,
+            "[QCM-MEM] block tbl=%zu ctx (%.1f MB)  lo=%zu ctx (%.1f MB)  sizeof(Freq)=%zu\n",
+            t.count, t.bytes()/1048576.0, l.count, l.bytes()/1048576.0, sizeof(Freq)); }
+    } _mr{tbl, lo, getenv("ARCS_QCM_MEM") != nullptr};
     // Track which R1 indices were processed before their R2 in this block.
     // Encoder and decoder make the identical decision (same order, same set) → lossless.
     std::unordered_set<uint32_t> seen;
