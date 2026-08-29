@@ -92,3 +92,12 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates_hash(
 std::vector<std::vector<APSPCandidate>> build_apsp_candidates_fm(
     const std::vector<std::string_view>& reads_both_views,
     uint32_t n_reads, int max_cands, uint32_t min_overlap, uint32_t search_cap);
+
+// Same contract, built on an incrementally-inserted rope BWT (ropebwt2's
+// B+-tree, vendored under MIT). The index is 113 MB where the suffix-array path
+// needs 2,730 MB, and builds no slower. Costs query speed: rank2a on a
+// run-length-compressed rope is ~342 ns against ~90 ns for a flat checkpoint
+// array. Opt-in via ARCS_ROPE_APSP=1. See rope_apsp.cpp.
+std::vector<std::vector<APSPCandidate>> build_apsp_candidates_rope(
+    const std::vector<std::string_view>& reads_both_views,
+    uint32_t n_reads, int max_cands, uint32_t min_overlap, uint32_t search_cap);

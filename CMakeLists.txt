@@ -135,6 +135,12 @@ set(ARCS_SOURCES
     src/sa_apsp.cpp
     src/hash_apsp.cpp
     src/fm_apsp.cpp
+    src/rope_apsp.cpp
+    third_party/ropebwt/rope.c
+    third_party/ropebwt/mrope.c
+    third_party/ropebwt/rle.c
+    third_party/ropebwt/rld0.c
+    third_party/ropebwt/kalloc.c
     src/vodbg_pg.cpp
     src/kmer_anchor_pg.cpp
     src/dna_coder.cpp
