@@ -62,6 +62,17 @@ inline int symcode(unsigned char c) {
     return 5;
 }
 
+// Compare two entries' suffixes starting at `o`, over `len` bytes.
+//
+// The first byte decides three quarters of DNA comparisons, so checking it
+// inline before falling into memcmp removes most of the call overhead -- and
+// this runs ~1.3 billion times over a full sweep, so the call overhead was the
+// dominant cost rather than the comparing.
+inline int suffix_cmp(const char* px, const char* py, uint32_t len) {
+    if (*px != *py) return (int)(unsigned char)*px - (int)(unsigned char)*py;
+    return len > 1 ? memcmp(px + 1, py + 1, len - 1) : 0;
+}
+
 } // namespace
 
 std::vector<std::vector<APSPCandidate>> build_apsp_candidates_sweep(
@@ -90,7 +101,7 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates_sweep(
     std::vector<uint32_t> byPrefix(m);
     std::iota(byPrefix.begin(), byPrefix.end(), 0u);
     auto cmp_full = [&](uint32_t a, uint32_t b) {
-        const int c = memcmp(views[a].data(), views[b].data(), L);
+        const int c = suffix_cmp(views[a].data(), views[b].data(), L);
         return c != 0 ? c < 0 : a < b;
     };
     std::sort(byPrefix.begin(), byPrefix.end(), cmp_full);
@@ -115,11 +126,11 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates_sweep(
         while (ia < m && ib < pfx_n) {
             const uint32_t A = order[ia];
             const char* pa = views[A].data() + off;
-            while (ib < pfx_n && memcmp(pa, views[pfx[ib]].data(), ov) > 0) ++ib;
+            while (ib < pfx_n && suffix_cmp(pa, views[pfx[ib]].data(), ov) > 0) ++ib;
             if (ib >= pfx_n) break;
             for (size_t j = ib; j < pfx_n; ++j) {
                 const uint32_t B = pfx[j];
-                if (memcmp(pa, views[B].data(), ov) != 0) break;
+                if (suffix_cmp(pa, views[B].data(), ov) != 0) break;
                 if ((A >> 1) == (B >> 1)) continue;          // self / own reverse complement
                 auto& v = out[B];
                 if ((int)v.size() >= max_cands) continue;
@@ -141,6 +152,8 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates_sweep(
         for (size_t i = 0; i < pfx_n; ++i)
             if ((int)out[pfx[i]].size() < max_cands) pfx[w++] = pfx[i];
         pfx_n = w;
+        if (getenv("ARCS_SWEEP_TRACE") && (off % 16 == 0 || pfx_n == 0))
+            fprintf(stderr, "[sweep] off=%u ov=%u prefix_live=%zu\n", off, ov, pfx_n);
         if (pfx_n == 0) break;
 
         if (off + 1 + min_overlap > L) break;
@@ -161,7 +174,7 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates_sweep(
             // any entries left over would mean order was not grouped as assumed
             if (i != m) {
                 std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-                    const int c = memcmp(views[a].data() + off + 1, views[b].data() + off + 1, L - off - 1);
+                    const int c = suffix_cmp(views[a].data() + off + 1, views[b].data() + off + 1, L - off - 1);
                     return c != 0 ? c < 0 : a < b;
                 });
                 continue;
@@ -177,7 +190,7 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates_sweep(
                 if (head[s] >= end[s]) continue;
                 if (best < 0) { best = s; continue; }
                 const uint32_t x = order[head[s]], y = order[head[best]];
-                const int c = memcmp(views[x].data() + noff, views[y].data() + noff, nlen);
+                const int c = suffix_cmp(views[x].data() + noff, views[y].data() + noff, nlen);
                 if (c < 0 || (c == 0 && x < y)) best = s;
             }
             next_order[k] = order[head[best]++];
