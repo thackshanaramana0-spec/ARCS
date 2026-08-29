@@ -1242,6 +1242,37 @@ void ARCSEncoder::encode_amplicon(const std::vector<Read>& reads,
     auto name_bytes = encode_names(reads);
     writer.add_blob(BlobType::NAMES, name_bytes);
 
+    // ── 4b. '+' line style ───────────────────────────────────────────────────
+    // 0 = bare "+", 1 = repeats the header, 2 = arbitrary text stored verbatim.
+    // The chain-pg route has always recorded this; the amplicon route never did,
+    // so everything it encoded came back with a bare '+'. All ten benchmark
+    // datasets repeat the header, so every amplicon-routed archive was lossy --
+    // while this same function printed "byte-exact-lossless". Absence of the blob
+    // still means style 0, so archives written before this stay readable.
+    int plus_style = 0;
+    {
+        bool all_bare = true, all_name = true;
+        for (const auto& r : reads) {
+            if (!r.plus.empty())   all_bare = false;
+            if (r.plus != r.name)  all_name = false;
+            if (!all_bare && !all_name) break;
+        }
+        plus_style = all_bare ? 0 : (all_name ? 1 : 2);
+    }
+    if (plus_style != 0) {
+        std::vector<uint8_t> pb;
+        pb.push_back((uint8_t)plus_style);
+        if (plus_style == 2) {
+            // Original input order -- the order the NAMES blob uses, so the decoder
+            // indexes it with whatever index it used for that read's name.
+            std::string joined;
+            for (const auto& r : reads) { joined += r.plus; joined.push_back('\n'); }
+            auto z = arcs_compress(std::vector<uint8_t>(joined.begin(), joined.end()), 9);
+            pb.insert(pb.end(), z.begin(), z.end());
+        }
+        writer.add_blob(BlobType::PLUS_LINES, pb);
+    }
+
 
     // ── 5. Count array (n_unique uint32_le values, LZMA-9) ───────────────────
     std::vector<uint8_t> count_raw(n_unique * 4);

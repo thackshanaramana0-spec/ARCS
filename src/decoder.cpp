@@ -583,6 +583,29 @@ void ARCSDecoder::decode_amplicon(const ARCSReader& rdr, FASTQWriter& out_writer
     bool   is_v7star = rdr.has_blob(BlobType::QUALITY_PERM);
     bool   is_v7     = rdr.has_blob(BlobType::COUNT_DATA);
 
+    // '+' line style, written by encode_amplicon. No blob = style 0 (bare '+'),
+    // which is what every archive predating the encoder-side fix carries, so those
+    // keep decoding exactly as they did.
+    int plus_style = 0;
+    std::vector<std::string> plus_txt;              // style 2 only, input order
+    if (rdr.has_blob(BlobType::PLUS_LINES)) {
+        auto pb = rdr.read_blob(BlobType::PLUS_LINES);
+        if (!pb.empty()) {
+            plus_style = (int)pb[0];
+            if (plus_style == 2 && pb.size() > 1) {
+                auto raw = arcs_decompress(pb.data() + 1, pb.size() - 1);
+                plus_txt.reserve(n_reads);
+                size_t pos = 0;
+                while (pos < raw.size()) {
+                    size_t nl = pos;
+                    while (nl < raw.size() && raw[nl] != '\n') ++nl;
+                    plus_txt.emplace_back((const char*)raw.data() + pos, nl - pos);
+                    pos = nl + 1;
+                }
+            }
+        }
+    }
+
     // ── Decompress unique sequences (BSC or LZMA-9, flagged) ─────────────────
     auto seq_blob = rdr.read_blob(BlobType::GENOME);
     std::vector<uint8_t> seq_raw;
@@ -731,6 +754,8 @@ void ARCSDecoder::decode_amplicon(const ARCSReader& rdr, FASTQWriter& out_writer
                 output[i].seq.assign(L > 0 ? L : 1, 'N');
                 output[i].qual.assign(L > 0 ? L : 1, '!');
             }
+            if      (plus_style == 1) output[i].plus = output[i].name;
+            else if (plus_style == 2 && i < plus_txt.size()) output[i].plus = plus_txt[i];
             out_writer.write(output[i]);
         }
         return;
@@ -787,6 +812,8 @@ void ARCSDecoder::decode_amplicon(const ARCSReader& rdr, FASTQWriter& out_writer
                 Read r;
                 r.name = (name_idx < names.size()) ? names[name_idx] :
                          ("read_" + std::to_string(name_idx));
+                if      (plus_style == 1) r.plus = r.name;
+                else if (plus_style == 2 && name_idx < plus_txt.size()) r.plus = plus_txt[name_idx];
                 ++name_idx;
                 r.seq = unique_seqs[i];
                 if (is_residual_fmt) {
