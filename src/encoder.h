@@ -123,8 +123,11 @@ private:
     // chain_order: if provided (chain-pg path), enables paired-end name dedup (format 0x06).
     //   chain_order[k] = original read index at SCS position k.
     // orig_reads: original reads before SCS reorder (needed for base-name extraction).
+    // `names` is a view (implicitly constructible from a vector<Read>, so the
+    // identity call sites are unchanged); pass {reads, chain_order} to encode a
+    // reordering without copying the names.
     std::vector<uint8_t> encode_names(
-        const std::vector<Read>& reads,
+        NameSeq names,
         const std::vector<uint32_t>* chain_order = nullptr,
         const std::vector<Read>*     orig_reads  = nullptr) const;
 

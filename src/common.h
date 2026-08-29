@@ -107,6 +107,23 @@ struct Read {
     bool        reverse_complemented = false; // set after mapping
 };
 
+// ── Read names addressed by position, without materialising them ─────────────
+// The chain-pg path needs names in chain order, and expressed that by copying
+// every name into a fresh std::vector<Read> -- 1.55M Read structs each with its
+// own heap-allocated name, 336 MB on E. coli, to say nothing but "apply this
+// permutation". The consumer only ever reads name[i], so a permutation and a
+// borrowed base array say the same thing for the cost of two pointers.
+struct NameSeq {
+    const std::vector<Read>*     reads = nullptr;
+    const std::vector<uint32_t>* order = nullptr;   // null = identity
+    NameSeq(const std::vector<Read>& r) : reads(&r) {}
+    NameSeq(const std::vector<Read>& r, const std::vector<uint32_t>& o) : reads(&r), order(&o) {}
+    size_t size() const { return order ? order->size() : reads->size(); }
+    const std::string& operator[](size_t i) const {
+        return (*reads)[order ? (size_t)(*order)[i] : i].name;
+    }
+};
+
 // ── Mapping result ────────────────────────────────────────────────────────────
 struct MapResult {
     pos_t  pos    = 0;

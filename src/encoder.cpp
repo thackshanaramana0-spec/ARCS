@@ -333,11 +333,11 @@ static int find_monotonic_name_index_column_best(const std::vector<Read>& reads)
     return find_monotonic_name_index_column(reads, arcs_tokenize2);
 }
 
-static std::vector<uint8_t> build_columnar_names(const std::vector<Read>& reads, TokenizeFn tokfn) {
-    size_t n = reads.size();
+static std::vector<uint8_t> build_columnar_names(NameSeq names, TokenizeFn tokfn) {
+    size_t n = names.size();
     if (n < 2) return {};
     std::vector<std::pair<bool,std::string>> t0;
-    tokfn(reads[0].name, t0);
+    tokfn(names[0], t0);
     size_t ncols = t0.size();
     if (ncols == 0 || ncols > 255) return {};
     std::vector<bool> isdig(ncols);
@@ -346,7 +346,7 @@ static std::vector<uint8_t> build_columnar_names(const std::vector<Read>& reads,
     for (size_t c = 0; c < ncols; ++c) col[c].reserve(n);
     std::vector<std::pair<bool,std::string>> tk;
     for (size_t i = 0; i < n; ++i) {
-        tokfn(reads[i].name, tk);
+        tokfn(names[i], tk);
         if (tk.size() != ncols) return {};                 // non-uniform → give up
         for (size_t c = 0; c < ncols; ++c) {
             if (tk[c].first != isdig[c]) return {};
@@ -495,9 +495,9 @@ static std::vector<uint8_t> build_columnar_names(const std::vector<Read>& reads,
 // Tries both tokenizers, keeps whichever produces the smaller valid result (or the
 // only valid one). The decoder is tokenizer-agnostic — it just concatenates stored
 // columns in order — so either encoding decodes identically; this can never regress.
-static std::vector<uint8_t> build_columnar_names_best(const std::vector<Read>& reads) {
-    auto a = build_columnar_names(reads, arcs_tokenize);
-    auto b = build_columnar_names(reads, arcs_tokenize2);
+static std::vector<uint8_t> build_columnar_names_best(NameSeq names) {
+    auto a = build_columnar_names(names, arcs_tokenize);
+    auto b = build_columnar_names(names, arcs_tokenize2);
     if (a.empty()) return b;
     if (b.empty()) return a;
     return (b.size() < a.size()) ? b : a;
@@ -505,10 +505,10 @@ static std::vector<uint8_t> build_columnar_names_best(const std::vector<Read>& r
 
 // ── Encode names ──────────────────────────────────────────────────────────────
 std::vector<uint8_t> ARCSEncoder::encode_names(
-        const std::vector<Read>& reads,
+        NameSeq names,
         const std::vector<uint32_t>* chain_order_ptr,
         const std::vector<Read>*     orig_reads_ptr) const {
-    size_t n = reads.size();
+    size_t n = names.size();
 
     // LZMA level for name streams; --call mode sets ARCS_NAMES_LZMA_LEVEL=7 to
     // trade 0.4% archive growth for ~2.5s less compress time (names = serial pole).
@@ -519,7 +519,7 @@ std::vector<uint8_t> ARCSEncoder::encode_names(
 
     // If all names are PREFIX.N for consecutive N, store 16 bytes instead of ~22 KB.
     if (n > 0) {
-        const std::string& first = reads[0].name;
+        const std::string& first = names[0];
         auto dot = first.rfind('.');
         if (dot != std::string::npos && dot > 0 && dot < 255) {
             std::string prefix = first.substr(0, dot);
@@ -528,7 +528,7 @@ std::vector<uint8_t> ARCSEncoder::encode_names(
             if (end && *end == '\0' && start_num > 0 && n <= UINT32_MAX) {
                 bool sequential = true;
                 for (size_t i = 1; i < n && sequential; ++i) {
-                    if (reads[i].name != prefix + '.' + std::to_string(start_num + (long)i))
+                    if (names[i] != prefix + '.' + std::to_string(start_num + (long)i))
                         sequential = false;
                 }
                 if (sequential) {
@@ -573,7 +573,7 @@ std::vector<uint8_t> ARCSEncoder::encode_names(
         };
         size_t samp = std::min(n, (size_t)100), hits = 0;
         for (size_t i = 0; i < samp; ++i) {
-            const std::string& nm = reads[i].name;
+            const std::string& nm = names[i];
             size_t ce = nm.size();
             if (ce >= 2 && nm[ce-2] == '/' && (nm[ce-1]=='1'||nm[ce-1]=='2')) ce -= 2;
             if (ce == 0) continue;
@@ -596,7 +596,7 @@ std::vector<uint8_t> ARCSEncoder::encode_names(
             return true;
         };
         for (size_t i = 0; i < n && tok_ok; ++i) {
-            const std::string& nm = reads[i].name;
+            const std::string& nm = names[i];
             size_t len = nm.size();
             // optional trailing "/1" or "/2"
             std::string mate;
@@ -640,7 +640,7 @@ std::vector<uint8_t> ARCSEncoder::encode_names(
         };
         auto build_plain = [&]() -> std::vector<uint8_t> {
             std::string plain; plain.reserve(n * 15);
-            for (const auto& r : reads) { plain += r.name; plain += '\n'; }
+            for (size_t i = 0; i < n; ++i) { plain += names[i]; plain += '\n'; }
             std::vector<uint8_t> praw(plain.begin(), plain.end());
             // Only a keep-smaller DECISION FLOOR — its bytes are NEVER returned (if a
             // tokenized candidate loses to it, the fallback below recomputes the actual
@@ -799,7 +799,7 @@ std::vector<uint8_t> ARCSEncoder::encode_names(
         if (NM_TIMING) {
             // Debug path: try all candidates sequentially for comparison.
             auto a=std::chrono::steady_clock::now(); tok03=build03(); _nt("0x03 template+XY", a);
-            a=std::chrono::steady_clock::now(); cand04=build_columnar_names_best(reads); _nt("columnar 0x04/0x05", a);
+            a=std::chrono::steady_clock::now(); cand04=build_columnar_names_best(names); _nt("columnar 0x04/0x05", a);
             a=std::chrono::steady_clock::now(); plain_lz=build_plain(); _nt("plain-LZMA floor", a);
             a=std::chrono::steady_clock::now(); cand06=build06(); _nt("0x06 paired-dedup", a);
             std::vector<uint8_t> best_tok = std::move(tok03);
@@ -823,7 +823,7 @@ std::vector<uint8_t> ARCSEncoder::encode_names(
             // delta/range-coding. Must keep-smaller against plain_lz explicitly now
             // that this path is no longer gated to Illumina-only data.
             tok03    = build03();
-            cand04   = build_columnar_names_best(reads);
+            cand04   = build_columnar_names_best(names);
             cand06   = build06();
             plain_lz = build_plain();
             std::vector<uint8_t> best_tok = std::move(tok03);
@@ -845,7 +845,7 @@ std::vector<uint8_t> ARCSEncoder::encode_names(
     // Fallback: LZMA-compressed newline-delimited names.
     std::string all_names;
     all_names.reserve(n * 15);
-    for (const auto& r : reads) { all_names += r.name; all_names += '\n'; }
+    for (size_t i = 0; i < n; ++i) { all_names += names[i]; all_names += '\n'; }
     std::vector<uint8_t> raw(all_names.begin(), all_names.end());
 
     // Names LZMA is the compress long-pole. Split into blocks scaled with cores so
@@ -2484,9 +2484,10 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
     // with the quality block below. Wall time drops from their sum to their max
     // with ZERO ratio cost. Disable with ARCS_ENC_NOPAR.
     const bool enc_par = (getenv("ARCS_ENC_NOPAR") == nullptr);
-    std::vector<Read> chain_name_reads((size_t)n);
-    for (int i = 0; i < n; ++i)
-        chain_name_reads[i].name = reads[result.chain_order[i]].name;
+    // Names in chain order, as a view over `reads` + the permutation. This used
+    // to be a materialised std::vector<Read> holding a copy of every name (336 MB
+    // on E. coli) that existed only to be read back in order.
+    const NameSeq chain_names{reads, result.chain_order};
     std::future<std::vector<uint8_t>> fut_pg, fut_names;
     std::future<void> fut_call;
     std::vector<uint8_t> pg_blob, name_blob;
@@ -2494,7 +2495,7 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
         fut_pg    = std::async(std::launch::async, [&]{
             return compress_pg(result.pg, reads, result.chain_order, result.pg_pos); });
         fut_names = std::async(std::launch::async, [&]{
-            return encode_names(chain_name_reads, &result.chain_order, &reads); });
+            return encode_names(chain_names, &result.chain_order, &reads); });
         // 3-way async: calling only needs placements (already captured above in
         // call_capture_) so it can overlap with quality+names encoding for free.
         if (post_assembly_call_hook_) {
@@ -2506,7 +2507,7 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
         auto _t0 = std::chrono::steady_clock::now();
         pg_blob   = compress_pg(result.pg, reads, result.chain_order, result.pg_pos);
         auto _t1 = std::chrono::steady_clock::now();
-        name_blob = encode_names(chain_name_reads, &result.chain_order, &reads);
+        name_blob = encode_names(chain_names, &result.chain_order, &reads);
         auto _t2 = std::chrono::steady_clock::now();
         if (ENC_TIMING) {
             fprintf(stderr, "[ENC]   pg_encode(serial):    %.2fs\n", std::chrono::duration<double>(_t1-_t0).count());
