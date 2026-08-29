@@ -49,6 +49,15 @@ static size_t cur_peak_rss_mb() {
     while (fgets(line, sizeof(line), f)) if (sscanf(line, "VmHWM: %zu kB", &kb) == 1) break;
     fclose(f); return kb / 1024;
 }
+// Current RSS (VmRSS). The peak is a high-water mark and so cannot show a
+// release; this can, which is what makes a trim measurable.
+static size_t cur_rss_mb() {
+    FILE* f = fopen("/proc/self/status", "r"); if (!f) return 0;
+    char line[256]; size_t kb = 0;
+    while (fgets(line, sizeof(line), f)) if (sscanf(line, "VmRSS: %zu kB", &kb) == 1) break;
+    fclose(f); return kb / 1024;
+}
+#include <malloc.h>
 #endif
 
 ARCSEncoder::ARCSEncoder(const ARCSParams& params) : params_(params) {}
@@ -333,6 +342,40 @@ static int find_monotonic_name_index_column_best(const std::vector<Read>& reads)
     return find_monotonic_name_index_column(reads, arcs_tokenize2);
 }
 
+// A tokenised name column that only materialises once it is seen to vary.
+//
+// Read names tokenise into far more columns than they have varying fields: on
+// E. coli, 25 columns of which nearly all are the same in every record -- the
+// accession, every separator, "length=", and the read length itself. The emitter
+// below already collapses a constant column to a single stored value; the column
+// store did not, so it first built n copies of each to throw them away. That was
+// 38.8M std::strings and 1,185 MB, allocated inside the names phase, which runs
+// concurrent with quality and pg encoding -- i.e. directly on top of the peak.
+//
+// A column stays a single string until a row disagrees with row 0, and only then
+// expands (back-filling the identical rows it skipped). Constant columns cost one
+// string instead of n, and the emitter's constant test becomes O(1) instead of a
+// scan. Same tokens, same emitted bytes.
+struct LazyColumn {
+    std::string              first;    // value of row 0
+    std::vector<std::string> var;      // populated only after the first difference
+    size_t rows = 0;
+    bool   constant = true;
+
+    void push(std::string&& s, size_t n_hint) {
+        if (constant) {
+            if (rows == 0) { first = std::move(s); ++rows; return; }
+            if (s == first) { ++rows; return; }
+            constant = false;                 // expand: back-fill the skipped rows
+            var.reserve(n_hint);
+            var.assign(rows, first);
+        }
+        var.push_back(std::move(s));
+        ++rows;
+    }
+    const std::string& operator[](size_t i) const { return constant ? first : var[i]; }
+};
+
 static std::vector<uint8_t> build_columnar_names(NameSeq names, TokenizeFn tokfn) {
     size_t n = names.size();
     if (n < 2) return {};
@@ -342,16 +385,26 @@ static std::vector<uint8_t> build_columnar_names(NameSeq names, TokenizeFn tokfn
     if (ncols == 0 || ncols > 255) return {};
     std::vector<bool> isdig(ncols);
     for (size_t c = 0; c < ncols; ++c) isdig[c] = t0[c].first;
-    std::vector<std::vector<std::string>> col(ncols);
-    for (size_t c = 0; c < ncols; ++c) col[c].reserve(n);
+    std::vector<LazyColumn> col(ncols);
     std::vector<std::pair<bool,std::string>> tk;
     for (size_t i = 0; i < n; ++i) {
         tokfn(names[i], tk);
         if (tk.size() != ncols) return {};                 // non-uniform → give up
         for (size_t c = 0; c < ncols; ++c) {
             if (tk[c].first != isdig[c]) return {};
-            col[c].push_back(std::move(tk[c].second));
+            col[c].push(std::move(tk[c].second), n);
         }
+    }
+    if (getenv("ARCS_NAMES_MEM")) {
+        size_t cells = 0, heap = 0, nconst = 0;
+        for (size_t c = 0; c < ncols; ++c) {
+            if (col[c].constant) { ++nconst; ++cells;
+                heap += sizeof(std::string) + (col[c].first.capacity() > 15 ? col[c].first.capacity() + 1 : 0);
+                continue; }
+            for (const auto& v : col[c].var) { ++cells; heap += sizeof(std::string) + (v.capacity() > 15 ? v.capacity() + 1 : 0); }
+        }
+        fprintf(stderr, "[NAMES-MEM] ncols=%zu (%zu constant) n=%zu cells=%zu col=%.1f MB\n",
+                ncols, nconst, n, cells, heap / 1048576.0);
     }
     // Pre-parse numeric columns once (needed for order-key detection + encoding).
     std::vector<bool> is_numeric(ncols, false);
@@ -359,7 +412,9 @@ static std::vector<uint8_t> build_columnar_names(NameSeq names, TokenizeFn tokfn
     for (size_t c = 0; c < ncols; ++c) {
         if (!isdig[c]) continue;
         bool ok = true;
-        for (auto& v : col[c]) if ((v.size() > 1 && v[0] == '0') || v.size() > 18) { ok = false; break; }
+        auto bad = [](const std::string& v){ return (v.size() > 1 && v[0] == '0') || v.size() > 18; };
+        if (col[c].constant) { if (bad(col[c].first)) ok = false; }
+        else for (auto& v : col[c].var) if (bad(v)) { ok = false; break; }
         if (!ok) continue;
         is_numeric[c] = true;
         num[c].resize(n);
@@ -395,8 +450,7 @@ static std::vector<uint8_t> build_columnar_names(NameSeq names, TokenizeFn tokfn
     // columns. `rc`==null reproduces the original 0x04 (varint + outer LZMA) exactly.
     auto emit_col = [&](std::vector<uint8_t>& raw, std::vector<uint8_t>* rc, size_t c) {
         auto pu32 = [&](uint32_t v){ raw.push_back(v&0xFF);raw.push_back((v>>8)&0xFF);raw.push_back((v>>16)&0xFF);raw.push_back((v>>24)&0xFF); };
-        bool constant = true;
-        for (size_t i = 1; i < n; ++i) if (col[c][i] != col[c][0]) { constant = false; break; }
+        const bool constant = col[c].constant;   // known during the build, not rescanned
         if (constant) {
             raw.push_back(0);
             pu32((uint32_t)col[c][0].size());
@@ -445,7 +499,7 @@ static std::vector<uint8_t> build_columnar_names(NameSeq names, TokenizeFn tokfn
             raw.insert(raw.end(), best->begin(), best->end());
         } else {
             raw.push_back(1);
-            for (auto& v : col[c]) { raw.insert(raw.end(), v.begin(), v.end()); raw.push_back(0); }
+            for (auto& v : col[c].var) { raw.insert(raw.end(), v.begin(), v.end()); raw.push_back(0); }
         }
     };
 
@@ -639,9 +693,17 @@ std::vector<uint8_t> ARCSEncoder::encode_names(
             return o;
         };
         auto build_plain = [&]() -> std::vector<uint8_t> {
-            std::string plain; plain.reserve(n * 15);
-            for (size_t i = 0; i < n; ++i) { plain += names[i]; plain += '\n'; }
-            std::vector<uint8_t> praw(plain.begin(), plain.end());
+            // Built straight into the byte vector the compressor wants. Going via
+            // a std::string first meant every name existed twice at once -- ~107 MB
+            // of duplicate on E. coli, inside the phase that runs concurrent with
+            // quality and pg encoding, which is exactly where peak RSS is decided.
+            std::vector<uint8_t> praw;
+            praw.reserve(n * 16);
+            for (size_t i = 0; i < n; ++i) {
+                const std::string& nm = names[i];
+                praw.insert(praw.end(), nm.begin(), nm.end());
+                praw.push_back('\n');
+            }
             // Only a keep-smaller DECISION FLOOR — its bytes are NEVER returned (if a
             // tokenized candidate loses to it, the fallback below recomputes the actual
             // block-parallel blob). So compress it at a FAST preset: a tokenized winner
@@ -1179,6 +1241,7 @@ void ARCSEncoder::encode_amplicon(const std::vector<Read>& reads,
     // ── 4. Names (original input order, LZMA-9) ───────────────────────────────
     auto name_bytes = encode_names(reads);
     writer.add_blob(BlobType::NAMES, name_bytes);
+
 
     // ── 5. Count array (n_unique uint32_le values, LZMA-9) ───────────────────
     std::vector<uint8_t> count_raw(n_unique * 4);
@@ -2478,6 +2541,19 @@ void ARCSEncoder::encode_wgs_chain_pg(const std::vector<Read>& reads,
     }
 
     _emark("assembly");
+    // Assembly frees a great deal at its end -- the suffix array, LCP/PLCP, the
+    // candidate lists -- but glibc keeps the arenas, and the encode phases below
+    // then allocate their own peak on top of a floor that is mostly already-dead
+    // memory. Hand it back before they start. Costs nothing and frees nothing
+    // that is live, so no output byte changes.
+#if defined(__GLIBC__)
+    {
+        const size_t before = cur_rss_mb();
+        malloc_trim(0);
+        if (ENC_TIMING) fprintf(stderr, "[ENC] malloc_trim after assembly: RSS %zu -> %zu MB\n",
+                                before, cur_rss_mb());
+    }
+#endif
     // ── Independent heavy phases run CONCURRENTLY ───────────────────────────
     // pg (sequence) compression and names compression share only read-only inputs
     // and produce separate blobs, so we launch them as async tasks that overlap

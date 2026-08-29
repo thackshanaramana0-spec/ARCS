@@ -114,48 +114,70 @@ static inline int seq3(const std::string_view* s, int j, int L) {
     return (p * 5 + c) * 5 + n;
 }
 
-struct Freq {
-    uint16_t f[QA];
-    uint32_t tot;
-    uint32_t obs;                // real observation count (drives interpolation λ)
-    Freq() { for (int i = 0; i < QA; ++i) f[i] = 1; tot = QA; obs = 0; }
+// A context's frequency record, addressed through the map's pools.
+//
+// The array is sized to the alphabet actually in use, not to the legal Phred
+// maximum. FASTQ may reach Phred 93, so QA is 94 -- but a real file uses far
+// fewer levels (E. coli: qmax 41), and the coder already zeroes every cf slot
+// above qmax, so those entries can never be coded. Holding all 94 anyway made
+// each record 196 bytes where 92 would do, over ~305k contexts x 12 blocks:
+// 809 MB of quality model, more than half of it unreachable slots, allocated in
+// the phase that decides peak RSS.
+//
+// qa is carried by the map and derived on both sides from the transmitted qmax,
+// so encoder and decoder build identical records.
+//
+// The dropped slots still have to be PAID FOR in the totals, though, and that is
+// not a rounding detail: sizing the array down and letting the total fall with it
+// cost 201 KB on E. coli, because the 94 unit priors were quietly acting as a
+// stronger smoothing prior than 42 of them do. They can be kept exactly, for
+// free. A dead slot starts at 1, is never the coded symbol so never incremented,
+// and survives the halving rescale unchanged ((1 >> 1) | 1 == 1). Its
+// contribution to `tot` is therefore exactly 1 for the whole life of the record,
+// so the QA - qa of them are a constant added to every total -- the same
+// arithmetic as before, without the storage.
+struct FreqRef {
+    uint16_t* f;        // qa counts
+    uint32_t* meta;     // meta[0] = tot, meta[1] = obs
+    int       qa;
+    inline uint32_t tot() const { return meta[0]; }
+    inline uint32_t obs() const { return meta[1]; }
     inline void update(int sym, int freq_inc) {
-        f[sym] = (uint16_t)(f[sym] + freq_inc); tot += freq_inc; ++obs;
-        if (tot >= FREQ_MAX) {
+        f[sym] = (uint16_t)(f[sym] + freq_inc); meta[0] += (uint32_t)freq_inc; ++meta[1];
+        if (meta[0] >= FREQ_MAX) {
             uint32_t t = 0;
-            for (int i = 0; i < QA; ++i) { f[i] = (uint16_t)((f[i] >> 1) | 1); t += f[i]; }
-            tot = t;
+            for (int i = 0; i < qa; ++i) { f[i] = (uint16_t)((f[i] >> 1) | 1); t += f[i]; }
+            meta[0] = t + (uint32_t)(QA - qa);   // the dead slots, still worth 1 apiece
         }
     }
 };
-
-// ── Flat open-addressing context table (drop-in for unordered_map<u64,Freq>) ──
-// The CM math depends only on which Freq a key maps to, not on the container, so
-// this is BIT-IDENTICAL to the unordered_map version (same Freq values, same
-// update order) — zero ratio change, faster. Keys live in a contiguous 8-byte
-// array (cache-friendly linear probing); the 196-byte Freq structs live in a
-// separate pool allocated only for contexts that actually occur, so this also uses
-// LESS memory than the node-based map (no per-node pointers, no empty 196 B slots).
 struct FreqMap {
-    static constexpr uint64_t EMPTY = ~0ULL;   // real keys are ≤ ~72M, never ~0ULL
-    static constexpr size_t   CHUNK = 8192;    // Freqs per pool chunk
+    static constexpr uint64_t EMPTY = ~0ULL;   // real keys are <= ~72M, never ~0ULL
+    static constexpr size_t   CHUNK = 8192;    // records per pool chunk
     std::vector<uint64_t> keys;
-    std::vector<uint32_t> slot_idx;                 // slot → pool index
-    std::vector<std::vector<Freq>> chunks;          // chunked pool: exactly count Freqs, no 2× slack
+    std::vector<uint32_t> slot_idx;                  // slot -> pool index
+    std::vector<std::vector<uint16_t>> fchunks;      // CHUNK * qa counts each
+    std::vector<std::vector<uint32_t>> mchunks;      // CHUNK * 2 (tot, obs) each
     size_t mask = 0, count = 0;
+    int    qa = QA;
 
-    explicit FreqMap(unsigned bits = 15) { init(bits); }
+    explicit FreqMap(unsigned bits = 15, int qa_ = QA) : qa(qa_ > 0 ? qa_ : QA) { init(bits); }
     void init(unsigned bits) {
         size_t cap = (size_t)1 << bits;
         keys.assign(cap, EMPTY);
         slot_idx.assign(cap, 0u);
-        chunks.clear();
+        fchunks.clear(); mchunks.clear();
         mask = cap - 1; count = 0;
     }
     static inline size_t mix(uint64_t k) { return (size_t)(((k + 1) * 0x9E3779B97F4A7C15ULL) >> 32); }
-    // pool index → Freq& (chunk buffers are heap-stable across chunks-vector growth).
-    inline Freq& poolref(uint32_t pi) { return chunks[pi / CHUNK][pi % CHUNK]; }
-    inline Freq& get(uint64_t k) {
+    // pool index -> record. Chunk buffers are heap-stable across chunk-vector
+    // growth, so a returned FreqRef stays valid exactly as the old reference did.
+    inline FreqRef poolref(uint32_t pi) {
+        return FreqRef{ fchunks[pi / CHUNK].data() + (size_t)(pi % CHUNK) * (size_t)qa,
+                        mchunks[pi / CHUNK].data() + (size_t)(pi % CHUNK) * 2,
+                        qa };
+    }
+    inline FreqRef get(uint64_t k) {
         size_t i = mix(k) & mask;
         while (keys[i] != EMPTY) {
             if (keys[i] == k) return poolref(slot_idx[i]);
@@ -163,27 +185,33 @@ struct FreqMap {
         }
         keys[i] = k;
         uint32_t pi = (uint32_t)count;
-        if (pi % CHUNK == 0) chunks.emplace_back(CHUNK);   // never reallocs existing Freqs
+        if (pi % CHUNK == 0) {                        // never reallocs existing records
+            fchunks.emplace_back((size_t)CHUNK * (size_t)qa, (uint16_t)1);
+            mchunks.emplace_back((size_t)CHUNK * 2, 0u);
+        }
         slot_idx[i] = pi;
         ++count;
-        if (count * 10 >= (mask + 1) * 7) grow();           // grow rehashes keys only; pi stays valid
-        return poolref(pi);
+        FreqRef r = poolref(pi);
+        r.meta[0] = (uint32_t)QA;                     // qa live unit priors + QA-qa dead ones
+        r.meta[1] = 0;                                // obs
+        if (count * 10 >= (mask + 1) * 7) grow();     // rehashes keys only; pi stays valid
+        return r;
     }
-    // Bytes this map actually holds: the two flat index arrays plus the Freq pool.
-    // ARCS_QCM_MEM prints it per block -- the quality model is the largest live
-    // allocation in the encoder and until now its size was inferred, not measured.
+    // Bytes this map actually holds: the two flat index arrays plus the record
+    // pools. ARCS_QCM_MEM prints it per block.
     size_t bytes() const {
-        return keys.size()*8 + slot_idx.size()*4 + chunks.size()*CHUNK*sizeof(Freq);
+        return keys.size()*8 + slot_idx.size()*4
+             + fchunks.size()*CHUNK*(size_t)qa*2 + mchunks.size()*CHUNK*8;
     }
     void grow() {
         size_t newcap = (mask + 1) << 1, nmask = newcap - 1;
         std::vector<uint64_t> nk(newcap, EMPTY);
         std::vector<uint32_t> ni(newcap, 0u);
-        for (size_t s = 0; s <= mask; ++s) {
-            if (keys[s] == EMPTY) continue;
-            size_t i = mix(keys[s]) & nmask;
+        for (size_t sI = 0; sI <= mask; ++sI) {
+            if (keys[sI] == EMPTY) continue;
+            size_t i = mix(keys[sI]) & nmask;
             while (nk[i] != EMPTY) i = (i + 1) & nmask;
-            nk[i] = keys[s]; ni[i] = slot_idx[s];
+            nk[i] = keys[sI]; ni[i] = slot_idx[sI];
         }
         keys.swap(nk); slot_idx.swap(ni); mask = nmask;
     }
@@ -226,10 +254,10 @@ struct U64Div {
     }
 };
 
-inline uint32_t build_cf(const Freq& child, const Freq& parent, int qmax,
+inline uint32_t build_cf(const FreqRef& child, const FreqRef& parent, int qmax,
                          uint32_t* cf, int qcm_k) {
-    const uint64_t nc = child.obs;
-    const uint64_t tp = parent.tot, tc = child.tot;
+    const uint64_t nc = child.obs();
+    const uint64_t tp = parent.tot(), tc = child.tot();
     const uint64_t A = nc * tp;                 // hoist constant products out of loop
     const uint64_t B = (uint64_t)qcm_k * tc;
     uint64_t w[QA]; uint64_t sum = 0;
@@ -390,14 +418,15 @@ static std::vector<uint8_t> encode_block(
     const std::vector<std::vector<bool>>& dev_sets, int L,
     const std::vector<std::string_view>* seqs, int qmax, QcmCfg cfg, bool is_pe,
     bool do_profile = false) {
-    FreqMap tbl(15), lo(12);
+    FreqMap tbl(15, qmax + 1), lo(12, qmax + 1);
     RangeEnc enc;
     uint32_t cf[QA];
     struct MemReport {
         const FreqMap &t, &l; bool on;
         ~MemReport(){ if(on) fprintf(stderr,
-            "[QCM-MEM] block tbl=%zu ctx (%.1f MB)  lo=%zu ctx (%.1f MB)  sizeof(Freq)=%zu\n",
-            t.count, t.bytes()/1048576.0, l.count, l.bytes()/1048576.0, sizeof(Freq)); }
+            "[QCM-MEM] block tbl=%zu ctx (%.1f MB)  lo=%zu ctx (%.1f MB)  qa=%d (QA=%d) rec=%zu B\n",
+            t.count, t.bytes()/1048576.0, l.count, l.bytes()/1048576.0,
+            t.qa, QA, (size_t)t.qa*2 + 8); }
     } _mr{tbl, lo, getenv("ARCS_QCM_MEM") != nullptr};
     // Track which R1 indices were processed before their R2 in this block.
     // Encoder and decoder make the identical decision (same order, same set) → lossless.
@@ -431,8 +460,8 @@ static std::vector<uint8_t> encode_block(
             if (!do_profile) {
                 // ── Production path (no timing overhead) ──────────────────
                 uint64_t pk, ck; keys(s, j, L, is_dev, qmax, seq, pk, ck, cfg.use_seq, qmb);
-                Freq& FP = lo.get(pk);
-                Freq& FC = tbl.get(ck);
+                FreqRef FP = lo.get(pk);
+                FreqRef FC = tbl.get(ck);
                 uint32_t tot = build_cf(FC, FP, qmax, cf, cfg.qcm_k);
                 uint32_t cum = 0; for (int i = 0; i < q; ++i) cum += cf[i];
                 enc.encode(cum, cf[q], tot);
@@ -445,8 +474,8 @@ static std::vector<uint8_t> encode_block(
                 uint64_t pk, ck; keys(s, j, L, is_dev, qmax, seq, pk, ck, cfg.use_seq, qmb);
                 uint64_t t1 = rdtsc_now(); b_ctx += t1 - t0;
 
-                Freq& FP = lo.get(pk);
-                Freq& FC = tbl.get(ck);
+                FreqRef FP = lo.get(pk);
+                FreqRef FC = tbl.get(ck);
                 uint64_t t2 = rdtsc_now(); b_fm += t2 - t1;
 
                 uint32_t tot = build_cf(FC, FP, qmax, cf, cfg.qcm_k);
@@ -485,7 +514,7 @@ static bool decode_block(
     std::vector<std::vector<uint8_t>>& rq_out,
     const std::vector<std::string_view>* seqs, const std::vector<int>* rlens, int qmax, QcmCfg cfg,
     bool is_pe) {
-    FreqMap tbl(15), lo(12);
+    FreqMap tbl(15, qmax + 1), lo(12, qmax + 1);
     RangeDec dec(p, e);
     uint32_t cf[QA];
     // Tracks which indices in this block have been fully decoded (for mate-context lookup).
@@ -511,8 +540,8 @@ static bool decode_block(
                 qmb = qm < 10 ? 0 : qm < 20 ? 1 : qm < 30 ? 2 : 3;
             }
             uint64_t pk, ck; keys(s, j, L, is_dev, qmax, seq, pk, ck, cfg.use_seq, qmb);
-            Freq& FP = lo.get(pk);
-            Freq& FC = tbl.get(ck);
+            FreqRef FP = lo.get(pk);
+            FreqRef FC = tbl.get(ck);
             uint32_t tot = build_cf(FC, FP, qmax, cf, cfg.qcm_k);
             uint32_t target = dec.getfreq(tot);
             uint32_t cum = 0; int q = 0;
@@ -610,8 +639,8 @@ static void prescan_block(
             }
             uint64_t pk, ck;
             keys(s, j, L, is_dev_v, qmax, seq, pk, ck, cfg.use_seq, qmb);
-            Freq& FP = lo.get(pk);
-            Freq& FC = tbl.get(ck);
+            FreqRef FP = lo.get(pk);
+            FreqRef FC = tbl.get(ck);
             ck_to_pk[ck] = pk;  // pk is uniquely determined by ck; safe to overwrite
             FP.update(q, cfg.freq_inc);
             FC.update(q, cfg.freq_inc);
@@ -632,8 +661,8 @@ static StaticModel build_precomputed_cdfs(
     uint32_t cf[QA];
     for (auto& kv : ck_to_pk) {
         uint64_t ck = kv.first, pk = kv.second;
-        Freq& FC = tbl.get(ck);
-        Freq& FP = lo.get(pk);
+        FreqRef FC = tbl.get(ck);
+        FreqRef FP = lo.get(pk);
         StaticCDFEntry& e = m[ck];
         e.tot = build_cf(FC, FP, qmax, cf, cfg.qcm_k);
         for (int q = 0; q <= qmax; ++q) e.cf[q] = cf[q];
@@ -995,7 +1024,7 @@ std::vector<uint8_t> qual_cm_encode(
     std::vector<uint8_t> smodel_lzma;  // stored in header if use_static
 
     if (use_static) {
-        FreqMap static_lo(12), static_tbl(15);
+        FreqMap static_lo(12, qmax + 1), static_tbl(15, qmax + 1);
         std::unordered_map<uint64_t, uint64_t> ck_to_pk;
         for (int b = 0; b < nb; ++b) {
             prescan_block(rq, order, bnd[b], bnd[b+1],
