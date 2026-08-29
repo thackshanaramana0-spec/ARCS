@@ -45,3 +45,10 @@ __pycache__/
 #   git clone https://github.com/kowallus/PgRC.git method_c
 #   cd method_c && mkdir build && cd build && cmake .. && make PgRC
 method_c/
+
+# Reimpl pipeline stream dumps (regenerable: DUMP_LIT=1 DUMP_PERM=1 ./best ...)
+mem_*.bin
+literal.txt
+literal.2bit
+perm.u32
+pg_full.txt
