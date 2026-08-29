@@ -47,6 +47,8 @@
 #include <vector>
 #include <numeric>
 #include <algorithm>
+#include <thread>
+#include <chrono>
 
 namespace {
 
@@ -96,6 +98,10 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates_sweep(
 
     const bool VERIFY = getenv("ARCS_SWEEP_VERIFY") != nullptr;
     size_t bad = 0, good = 0;
+    const int nthreads = VERIFY ? 1 : arcs_threads();   // counters are unsynchronised
+    double t_join = 0, t_merge = 0;
+    const bool TIMING = getenv("ARCS_SWEEP_TRACE") != nullptr;
+    auto now = [] { return std::chrono::steady_clock::now(); };
 
     // ── prefix side: entries ordered by their sequence ───────────────────────
     std::vector<uint32_t> byPrefix(m);
@@ -106,98 +112,183 @@ std::vector<std::vector<APSPCandidate>> build_apsp_candidates_sweep(
     };
     std::sort(byPrefix.begin(), byPrefix.end(), cmp_full);
 
-    // ── suffix side: same order at offset 0, advanced one symbol per step ────
-    std::vector<uint32_t> order(byPrefix);
+    // ── suffix side ──────────────────────────────────────────────────────────
+    //
+    // THE SWEEP RUNS FROM THE SHORTEST OVERLAP TO THE LONGEST, which is the
+    // opposite of PgRC2 and needs explaining.
+    //
+    // Sorting entries by suffix-at-off is, given them already sorted by
+    // suffix-at-(off+1), just a STABLE COUNTING SORT on the single symbol at
+    // position off -- O(m), no comparisons at all, since suffix-at-off is
+    // symbol[off] followed by suffix-at-(off+1). That only works while `off`
+    // DECREASES, i.e. while the overlap length increases.
+    //
+    // Sweeping the other way (longest overlap first, as PgRC2 does) means each
+    // step is a k-way merge of the symbol blocks instead. Measured, that merge
+    // was 41.7 s of a 42.9 s sweep and is inherently serial, so it, not the
+    // join, was the whole cost.
+    //
+    // What the descending direction bought was work-bounding: a target whose
+    // list was full could be dropped. Measured, that only shrank the prefix side
+    // from 1,703,834 to 1,096,941 across 112 of 126 offsets, so it was worth
+    // about 20% -- far less than the merge cost. Going upward instead needs an
+    // order-INDEPENDENT bounded insert (keep the max_cands largest under a total
+    // order) so a candidate arriving late can displace an earlier, shorter one.
+    // That also makes the result identical at any thread count.
+    const uint32_t off_max = L - min_overlap;
+    std::vector<uint32_t> order(m);
+    std::iota(order.begin(), order.end(), 0u);
+    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        const int c = suffix_cmp(views[a].data() + off_max, views[b].data() + off_max, min_overlap);
+        return c != 0 ? c < 0 : a < b;
+    });
     std::vector<uint32_t> next_order(m);
+    std::vector<uint8_t>  symbuf(m);       // symbol column, extracted once per step
 
-    size_t pfx_n = m;                       // live prefix entries (shrinks)
-    std::vector<uint32_t> pfx(byPrefix);    // compacted working copy
+    const size_t pfx_n = m;
+    std::vector<uint32_t>& pfx = byPrefix;
 
-    for (uint32_t off = 0; off + min_overlap <= L; ++off) {
-        const uint32_t ov = L - off;
+    // keep the max_cands largest under a TOTAL order, so arrival order cannot
+    // change the kept set
+    auto worse = [](const APSPCandidate& a, const APSPCandidate& b) {
+        if (a.overlap != b.overlap) return a.overlap < b.overlap;
+        if (a.rid     != b.rid)     return a.rid     > b.rid;
+        return a.view > b.view;
+    };
 
-        // merge-join: suffix(A, off, ov) == prefix(B, 0, ov)
+    for (uint32_t step = 0; step <= off_max; ++step) {
+        const uint32_t off = off_max - step;
+        const uint32_t ov  = L - off;
+
+        auto j0 = now();
+        // Merge-join: suffix(A, off, ov) == prefix(B, 0, ov).
         //
-        // Both sides carry duplicate keys, so this cannot be a plain two-pointer
-        // walk: advancing past a B that is already full would hide it from every
-        // later A sharing the key. The equal range is rescanned from a saved
-        // start, which is what PgRC2's curPreIt is for.
-        size_t ia = 0, ib = 0;
-        while (ia < m && ib < pfx_n) {
-            const uint32_t A = order[ia];
-            const char* pa = views[A].data() + off;
-            while (ib < pfx_n && suffix_cmp(pa, views[pfx[ib]].data(), ov) > 0) ++ib;
-            if (ib >= pfx_n) break;
-            for (size_t j = ib; j < pfx_n; ++j) {
-                const uint32_t B = pfx[j];
-                if (suffix_cmp(pa, views[B].data(), ov) != 0) break;
-                if ((A >> 1) == (B >> 1)) continue;          // self / own reverse complement
-                auto& v = out[B];
-                if ((int)v.size() >= max_cands) continue;
-                if (VERIFY) {
-                    // the claim: A's suffix of length ov IS B's prefix
-                    if (memcmp(views[A].data() + (L - ov), views[B].data(), ov) == 0) ++good; else ++bad;
+        // Threads partition the PREFIX side, so each writes only to targets in
+        // its own range -- no conflicting writes, no hit buffers, and no
+        // dependence on interleaving. The matching suffix range is found by
+        // binary search, both lists being sorted on the same key.
+        //
+        // Both sides carry duplicate keys, so the inner scan rescans the equal
+        // range from a saved start; a plain two-pointer walk would hide a B from
+        // every later A sharing its key (PgRC2's curPreIt serves the same role).
+        auto join_range = [&](size_t plo, size_t phi) {
+            if (plo >= phi) return;
+            auto first_suffix_ge = [&](size_t p) -> size_t {
+                if (p >= pfx_n) return m;
+                const char* key = views[pfx[p]].data();
+                size_t lo = 0, hi = m;
+                while (lo < hi) {
+                    const size_t mid = (lo + hi) / 2;
+                    if (suffix_cmp(views[order[mid]].data() + off, key, ov) < 0) lo = mid + 1;
+                    else hi = mid;
                 }
-                // descending sweep: this is already the best remaining overlap
-                // for B, so the list stays sorted with no final sort
-                v.push_back({(uint32_t)(A >> 1), (uint8_t)(A & 1), ov});
+                return lo;
+            };
+            size_t ia = first_suffix_ge(plo);
+            const size_t ia_end = first_suffix_ge(phi);
+            size_t ib = plo;
+            while (ia < ia_end && ib < phi) {
+                const uint32_t A = order[ia];
+                const char* pa = views[A].data() + off;
+                while (ib < phi && suffix_cmp(pa, views[pfx[ib]].data(), ov) > 0) ++ib;
+                if (ib >= phi) break;
+                for (size_t j = ib; j < phi; ++j) {
+                    const uint32_t B = pfx[j];
+                    if (suffix_cmp(pa, views[B].data(), ov) != 0) break;
+                    if ((A >> 1) == (B >> 1)) continue;      // self / own reverse complement
+                    if (VERIFY) {
+                        if (memcmp(views[A].data() + (L - ov), views[B].data(), ov) == 0) ++good; else ++bad;
+                    }
+                    const APSPCandidate cand{(uint32_t)(A >> 1), (uint8_t)(A & 1), ov};
+                    auto& v = out[B];
+                    if ((int)v.size() < max_cands) { v.push_back(cand); continue; }
+                    auto mn = std::min_element(v.begin(), v.end(), worse);
+                    if (worse(*mn, cand)) *mn = cand;
+                }
+                ++ia;
             }
-            ++ia;
+        };
+
+        if (nthreads <= 1 || pfx_n < 4096) {
+            join_range(0, pfx_n);
+        } else {
+            std::vector<std::thread> th;
+            th.reserve((size_t)nthreads);
+            for (int t = 0; t < nthreads; ++t) {
+                const size_t plo = pfx_n * (size_t)t / (size_t)nthreads;
+                const size_t phi = pfx_n * (size_t)(t + 1) / (size_t)nthreads;
+                th.emplace_back([&, plo, phi] { join_range(plo, phi); });
+            }
+            for (auto& t : th) t.join();
         }
+        if (TIMING) t_join += std::chrono::duration<double>(now() - j0).count();
 
-        // drop targets whose lists are full: they cannot be improved by any
-        // shorter overlap, and removing them shrinks the join for every later
-        // step (PgRC2's readsLeft)
-        size_t w = 0;
-        for (size_t i = 0; i < pfx_n; ++i)
-            if ((int)out[pfx[i]].size() < max_cands) pfx[w++] = pfx[i];
-        pfx_n = w;
-        if (getenv("ARCS_SWEEP_TRACE") && (off % 16 == 0 || pfx_n == 0))
-            fprintf(stderr, "[sweep] off=%u ov=%u prefix_live=%zu\n", off, ov, pfx_n);
-        if (pfx_n == 0) break;
+        if (off == 0) break;
 
-        if (off + 1 + min_overlap > L) break;
-
-        // ── advance the suffix order from `off` to `off+1` ───────────────────
-        // order is sorted by suffix-at-off, so it is grouped by symbol at `off`
-        // into contiguous blocks, and each block is internally in
-        // suffix-at-(off+1) order. A k-way merge of the blocks therefore yields
-        // suffix-at-(off+1) order in O(m) rather than O(m log m).
-        uint32_t bstart[NSYM + 1];
+        // ── advance to off-1: stable counting sort on the symbol at off-1 ────
+        //
+        // Two details matter for speed. The symbol is extracted once into a
+        // contiguous array rather than read again during the scatter: reading
+        // views[order[i]][off-1] is a random hop into scattered sequence
+        // storage, and doing it twice per element cost about half the sort.
+        // And the sort is parallel -- per-thread counts, prefix-summed by
+        // (symbol, thread) so each thread scatters into a disjoint range. That
+        // ordering keeps it stable, which the correctness of the whole sweep
+        // depends on: the entries within a symbol block must stay in
+        // suffix-at-off order.
+        auto m0 = now();
         {
-            size_t i = 0;
-            for (int s = 0; s < NSYM; ++s) {
-                bstart[s] = (uint32_t)i;
-                while (i < m && symcode((unsigned char)views[order[i]][off]) == s) ++i;
+            const uint32_t o = off - 1;
+            const int T = (nthreads > 1 && m >= 65536) ? nthreads : 1;
+            std::vector<uint32_t> cnt((size_t)T * NSYM, 0);
+            auto chunk_lo = [&](int t) { return m * (size_t)t / (size_t)T; };
+
+            auto count_chunk = [&](int t) {
+                uint32_t* c = &cnt[(size_t)t * NSYM];
+                for (size_t i = chunk_lo(t); i < chunk_lo(t + 1); ++i) {
+                    const uint8_t sc = (uint8_t)symcode((unsigned char)views[order[i]][o]);
+                    symbuf[i] = sc;
+                    ++c[sc];
+                }
+            };
+            if (T == 1) count_chunk(0);
+            else {
+                std::vector<std::thread> th; th.reserve((size_t)T);
+                for (int t = 0; t < T; ++t) th.emplace_back(count_chunk, t);
+                for (auto& x : th) x.join();
             }
-            bstart[NSYM] = (uint32_t)i;
-            // any entries left over would mean order was not grouped as assumed
-            if (i != m) {
-                std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-                    const int c = suffix_cmp(views[a].data() + off + 1, views[b].data() + off + 1, L - off - 1);
-                    return c != 0 ? c < 0 : a < b;
-                });
-                continue;
+            // prefix sum by (symbol, thread) -- symbol major keeps blocks
+            // contiguous, thread minor keeps the sort stable
+            std::vector<uint32_t> base((size_t)T * NSYM, 0);
+            uint32_t run = 0;
+            for (int c2 = 0; c2 < NSYM; ++c2)
+                for (int t = 0; t < T; ++t) {
+                    base[(size_t)t * NSYM + c2] = run;
+                    run += cnt[(size_t)t * NSYM + c2];
+                }
+            auto scatter_chunk = [&](int t) {
+                uint32_t* b = &base[(size_t)t * NSYM];
+                for (size_t i = chunk_lo(t); i < chunk_lo(t + 1); ++i)
+                    next_order[b[symbuf[i]]++] = order[i];
+            };
+            if (T == 1) scatter_chunk(0);
+            else {
+                std::vector<std::thread> th; th.reserve((size_t)T);
+                for (int t = 0; t < T; ++t) th.emplace_back(scatter_chunk, t);
+                for (auto& x : th) x.join();
             }
+            order.swap(next_order);
         }
-        uint32_t head[NSYM], end[NSYM];
-        for (int s = 0; s < NSYM; ++s) { head[s] = bstart[s]; end[s] = bstart[s + 1]; }
-        const uint32_t noff = off + 1;
-        const uint32_t nlen = L - noff;
-        for (size_t k = 0; k < m; ++k) {
-            int best = -1;
-            for (int s = 0; s < NSYM; ++s) {
-                if (head[s] >= end[s]) continue;
-                if (best < 0) { best = s; continue; }
-                const uint32_t x = order[head[s]], y = order[head[best]];
-                const int c = suffix_cmp(views[x].data() + noff, views[y].data() + noff, nlen);
-                if (c < 0 || (c == 0 && x < y)) best = s;
-            }
-            next_order[k] = order[head[best]++];
-        }
-        order.swap(next_order);
+        if (TIMING) t_merge += std::chrono::duration<double>(now() - m0).count();
     }
 
+    // the contract wants longest first
+    for (auto& v : out)
+        std::sort(v.begin(), v.end(), [](const APSPCandidate& a, const APSPCandidate& b) {
+            return a.overlap > b.overlap;
+        });
+
+    if (TIMING) fprintf(stderr, "[sweep] join %.1f s  countsort %.1f s  threads=%d\n", t_join, t_merge, nthreads);
     if (VERIFY) fprintf(stderr, "[sweep-verify] good=%zu bad=%zu\n", good, bad);
     return out;
 }
