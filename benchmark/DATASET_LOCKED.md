@@ -2,6 +2,10 @@
 
 **DO NOT CHANGE THIS FILE.** All accessions verified via NCBI SRA/DDBJ 2026-08-25.
 
+**2026-08-30 addendum: 7 datasets added, deliberately, per explicit user
+decision (not a silent change) — see "Extended Set" section below. The
+original 10 above and their banned-accession list are untouched.**
+
 ---
 
 ## The 10 Full Datasets (Claim 1 primary + Claim 3)
@@ -103,6 +107,45 @@ No command-line flags. `ARCS_AUTOCHUNK_MB=25000` is a server-side env var (set i
 - SRR1945765 — Arabidopsis thaliana 6.5× coverage (too low coverage, replaced by SRR870667)
 - SRR327342 — S. cerevisiae 3.4 GB _1 (replaced by DRR976266 higher coverage)
 - SRR1663585 — D. melanogaster 2.33 GB _1 (no published gold bpb, replaced by SRR36741279)
+
+## Extended Set — 7 Additional Datasets, added 2026-08-30
+
+All verified live via NCBI eutils (`esearch`/`efetch` against `db=sra`) on
+2026-08-30, not guessed. None overlap the banned-accession list above
+(different runs from the same-named banned D. melanogaster/Arabidopsis
+entries were considered and Arabidopsis was dropped for coverage reasons —
+see rationale column).
+
+Rationale for the group structure: real testing this session established
+that win/loss correlates with **coverage → overlap density**, not kingdom
+(see `benchmark/reimpl/LAYER_BY_LAYER_ANALYSIS.md` §3b and memory
+`reimpl_coverage_regime_factors`). These 7 were chosen to (a) cover a 4th
+"novel" domain — Archaea — untested by any FASTQ-compression paper found in
+literature search, alongside virus/fungi/protista, (b) fill the
+animal/plant imbalance in the overlap-win group, and (c) test whether
+P. aeruginosa's real, measured −6.1% loss (isolated to the order/position
+layer, cause still unresolved — NOT explained by coverage or kingdom)
+replicates on other small, high-coverage bacterial genomes.
+
+| # | Accession | Organism | Kingdom/Domain | Group | Coverage (est.) | Status |
+|---|-----------|----------|-----------------|-------|-----------------|--------|
+| 11 | SRR32429602 | Human betaherpesvirus 5 (HCMV) | Virus | Novel ×8 | genomic-source shotgun WGS (not amplicon like ERR5181310) | untested |
+| 12 | SRR39257532 | Aspergillus fumigatus | Fungi | Novel ×8 | ~20× | untested |
+| 13 | SRR29296997 | Halobacterium salinarum | Archaea | Novel ×8 | ~54×, GC~.68 | untested |
+| 14 | ERR12954017 | Sulfolobus acidocaldarius | Archaea | Novel ×8 | ~116×, GC~.37 | untested |
+| 15 | SRR40104876 | Drosophila melanogaster | Animalia | Overlap-win ×6 | ~19× | untested |
+| 16 | SRR40271341 | Helicobacter pylori | Bacteria | Mild-loss ×3 (candidate) | ~139× | **unverified — coverage argues WIN, not loss; see rationale** |
+| 17 | SRR40402583 | Campylobacter jejuni | Bacteria | Mild-loss ×3 (candidate) | ~162×, GC~.30 | **unverified — same caveat** |
+
+**Honest flag on #16/#17:** picked by genome-size similarity to P. aeruginosa,
+but their coverage (139×, 162×) is deeper than every current winner except
+S. aureus (160×) — the established coverage trend predicts these will WIN,
+not lose. They stay in "mild-loss (candidate)" only until actually measured
+in the locked seq+order scope; do not report them as loss cases in any
+paper table until real numbers exist.
+
+**Not yet done:** none of these 7 are downloaded or tested. This section
+records the deliberate selection only.
 
 ## Published SPRING bpb (PgRC2 2025, for cross-validation)
 
