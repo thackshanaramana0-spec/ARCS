@@ -68,3 +68,6 @@ n_cnt.bin
 
 # Compiled reimpl encoders (regenerate: benchmark/reimpl/build106.sh)
 benchmark/reimpl/best*
+
+# Standalone extracted repo (own git history, pushed separately)
+c_star_pg_advance/
