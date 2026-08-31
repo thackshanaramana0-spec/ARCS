@@ -52,3 +52,19 @@ literal.txt
 literal.2bit
 perm.u32
 pg_full.txt
+
+# Reimpl stream dumps written to the CWD of whichever dir the encoder runs in.
+# The rule above was `mem_*.bin`, which does not match `mm_*.bin` -- one letter
+# apart -- so 18 MB of regenerable dumps sat unignored at the repo root.
+mm_*.bin
+orig2uid.bin
+pos_abs.bin
+pos_strand.bin
+read_lengths.bin
+n_indices.bin
+n_reads.txt
+n_pos.bin
+n_cnt.bin
+
+# Compiled reimpl encoders (regenerate: benchmark/reimpl/build106.sh)
+benchmark/reimpl/best*
