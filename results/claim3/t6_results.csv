@@ -2,7 +2,8 @@ dataset,operation,capsule_s,conventional_tool,conventional_s,speedup,notes
 SRR2584863_ecoli,export,0.465,megahit,135.5,291x,PASS spec >=40x
 SRR2584863_ecoli,export,0.465,spades,258.15,555x,spec-exact baseline; peak RAM spades 5.20GB; PASS spec >=40x
 SRR2584863_ecoli,coverage,0.651,bwa+samtools+mosdepth,NA,NA,timing pending
-SRR2584863_ecoli,query,0.530,full_decompress,1.74,3.3x,returns 11103 reads vs 695MB fastq
+SRR2584863_ecoli,query,0.530,full_decompress,1.74,3.3x,SUPERSEDED 2026-09-03 -- full_decompress was measured via the cheap stream-dump path (no outreads arg), not real reconstruction; see corrected row below
+SRR2584863_ecoli,query,0.862,full_decompress,1.398,1.62x,corrected 2026-09-03: mean of 5 repeats each, true 3-arg reconstruction; returns 11802 of 1553259 reads (132x fewer reads, 112x fewer bytes) for range 0-100000 -- see docs/CLAIM3_LOCKED.md sec 6.4
 HG002_r2,export,0.032,megahit,8.14,254x,
 HG002_r2,coverage,0.040,bwa+samtools+mosdepth,1.33,33x,coverage optimised: no pg rebuild
 HG002_r2,query,0.039,NA,NA,NA,7044 reads in 0-100000
